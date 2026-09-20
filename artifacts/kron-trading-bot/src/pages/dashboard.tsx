@@ -1,6 +1,7 @@
 import { useGetUserBotDashboard, useLogoutWallet, getGetUserBotDashboardQueryKey } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { SquareTerminal, LogOut, Loader2 } from "lucide-react";
+import { Link } from "wouter";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
 
@@ -49,6 +50,12 @@ export default function Dashboard() {
             <SquareTerminal className="w-5 h-5 text-primary" />
             <h1 className="text-sm font-bold tracking-widest uppercase text-foreground">KasDistro Trading Bot Console</h1>
           </div>
+          <Link
+            href="/volume-bot"
+            className="inline-flex items-center justify-center whitespace-nowrap rounded-xl border border-primary/40 bg-primary/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-primary transition hover:bg-primary/20"
+          >
+            Volume Bot
+          </Link>
         </header>
         <main className="flex-1 p-6 flex flex-col items-center justify-center">
           <WalletConnect />
@@ -59,22 +66,28 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-[100dvh] bg-background flex flex-col font-sans selection:bg-primary/20">
-      <header className="px-6 py-6 flex items-center justify-between sticky top-0 z-10 bg-background/80 backdrop-blur-sm border-b border-border/50">
-        <div className="flex items-center gap-3">
-          <SquareTerminal className="w-5 h-5 text-primary" />
-          <h1 className="text-sm font-bold tracking-widest uppercase text-foreground">KasDistro Trading Bot Console</h1>
-        </div>
-        <div className="flex items-center gap-4">
-          <div className="hidden sm:block text-right">
-            <p className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">Connected Wallet</p>
-            <p className="text-sm font-medium font-mono text-foreground mt-0.5">{dashboard.walletAddress.slice(0, 8)}...{dashboard.walletAddress.slice(-6)}</p>
+        <header className="px-6 py-6 flex items-center justify-between sticky top-0 z-10 bg-background/80 backdrop-blur-sm border-b border-border/50">
+          <div className="flex items-center gap-3">
+            <SquareTerminal className="w-5 h-5 text-primary" />
+            <h1 className="text-sm font-bold tracking-widest uppercase text-foreground">KasDistro Trading Bot Console</h1>
           </div>
-          <Button variant="outline" size="sm" onClick={handleLogout} className="text-muted-foreground hover:text-foreground uppercase tracking-wider text-xs font-bold">
-            <LogOut className="w-3.5 h-3.5 sm:mr-2" />
-            <span className="hidden sm:inline">Disconnect</span>
-          </Button>
-        </div>
-      </header>
+          <div className="flex items-center gap-3">
+            <Link
+              href="/volume-bot"
+              className="inline-flex items-center justify-center whitespace-nowrap rounded-xl border border-primary/40 bg-primary/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-primary transition hover:bg-primary/20"
+            >
+              Volume Bot
+            </Link>
+            <div className="hidden sm:block text-right">
+              <p className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">Connected Wallet</p>
+              <p className="text-sm font-medium font-mono text-foreground mt-0.5">{dashboard.walletAddress.slice(0, 8)}...{dashboard.walletAddress.slice(-6)}</p>
+            </div>
+            <Button variant="outline" size="sm" onClick={handleLogout} className="text-muted-foreground hover:text-foreground uppercase tracking-wider text-xs font-bold">
+              <LogOut className="w-3.5 h-3.5 sm:mr-2" />
+              <span className="hidden sm:inline">Disconnect</span>
+            </Button>
+          </div>
+        </header>
 
       <main className="flex-1 p-4 sm:p-6 w-full max-w-6xl mx-auto">
         {!dashboard.bot ? (
