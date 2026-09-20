@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useGetUserBotDashboard, useLogoutWallet, getGetUserBotDashboardQueryKey } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { SquareTerminal, LogOut, Loader2 } from "lucide-react";
@@ -10,7 +11,16 @@ import { BotSetupForm } from "@/components/bot-setup-form";
 import { BotActivation } from "@/components/bot-activation";
 import { BotDashboardView } from "@/components/bot-dashboard-view";
 
+function isEmbeddedFrame() {
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
 export default function Dashboard() {
+  const [embedded] = useState(isEmbeddedFrame);
   const { data: dashboard, isLoading, error } = useGetUserBotDashboard({
     query: {
       refetchInterval: 60_000,
@@ -50,12 +60,14 @@ export default function Dashboard() {
             <SquareTerminal className="w-5 h-5 text-primary" />
             <h1 className="text-sm font-bold tracking-widest uppercase text-foreground">KasDistro Trading Bot Console</h1>
           </div>
-          <Link
-            href="/volume-bot"
-            className="inline-flex items-center justify-center whitespace-nowrap rounded-xl border border-primary/40 bg-primary/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-primary transition hover:bg-primary/20"
-          >
-            Volume Bot
-          </Link>
+          {embedded ? null : (
+            <Link
+              href="/volume-bot"
+              className="inline-flex items-center justify-center whitespace-nowrap rounded-xl border border-primary/40 bg-primary/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-primary transition hover:bg-primary/20"
+            >
+              Volume Bot
+            </Link>
+          )}
         </header>
         <main className="flex-1 p-6 flex flex-col items-center justify-center">
           <WalletConnect />
@@ -72,12 +84,14 @@ export default function Dashboard() {
             <h1 className="text-sm font-bold tracking-widest uppercase text-foreground">KasDistro Trading Bot Console</h1>
           </div>
           <div className="flex items-center gap-3">
-            <Link
-              href="/volume-bot"
-              className="inline-flex items-center justify-center whitespace-nowrap rounded-xl border border-primary/40 bg-primary/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-primary transition hover:bg-primary/20"
-            >
-              Volume Bot
-            </Link>
+            {embedded ? null : (
+              <Link
+                href="/volume-bot"
+                className="inline-flex items-center justify-center whitespace-nowrap rounded-xl border border-primary/40 bg-primary/10 px-4 py-2 text-xs font-bold uppercase tracking-wider text-primary transition hover:bg-primary/20"
+              >
+                Volume Bot
+              </Link>
+            )}
             <div className="hidden sm:block text-right">
               <p className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">Connected Wallet</p>
               <p className="text-sm font-medium font-mono text-foreground mt-0.5">{dashboard.walletAddress.slice(0, 8)}...{dashboard.walletAddress.slice(-6)}</p>
