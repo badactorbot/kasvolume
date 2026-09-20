@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "kasdistrotradingbot"
+description = "KasDistro automated KCC20 trading bot console with isolated user-funded bot wallets and fixed server-owned strategy controls."
+version = "1.0.0"
+id = "artifacts/kron-trading-bot"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23486
+
+[services.development]
+run = "pnpm --filter @workspace/kron-trading-bot run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/kron-trading-bot", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/kron-trading-bot/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23486"
+BASE_PATH = "/"

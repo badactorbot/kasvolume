@@ -1,0 +1,6 @@
+- [Live trade debit calculation](live-trade-debit.md) — derive maximum wallet debit from final assembly, not quote plus network fee.
+- [Kron live signing](kron-live-signing.md) — use native signing with covenant integrity checks and create the one-time lock before submission.
+- [Kron scheduler hosting](kron-scheduler-hosting.md) — production trading requires an always-running deployment; autoscale sleep pauses in-process scheduling.
+- [Interrupted trade recovery](interrupted-trade-recovery.md) — never clear a stale in-flight marker until chain history proves no outgoing transaction was accepted.
+- [Covenant changes](covenant-changes.md) — require all managed positions sold, preserve the bot wallet/history, and require a unique new activation payment.
+- [Bot KAS withdrawals](bot-kas-withdrawals.md) — withdraw only to the authenticated wallet, block active positions/trades, and fail closed after submission begins.
