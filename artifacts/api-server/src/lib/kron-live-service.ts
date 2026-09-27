@@ -19,6 +19,21 @@ export type LiveBotCredentials = {
   tokenId: string;
 };
 
+export class TradeSubmissionAttemptedError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message);
+    this.name = "TradeSubmissionAttemptedError";
+    (this as Error & { cause?: unknown }).cause = cause;
+  }
+}
+
+export class RetryableTradeStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RetryableTradeStateError";
+  }
+}
+
 const toBytes = (hex: string) => Uint8Array.from(Buffer.from(hex, "hex"));
 const toKas = (sompi: bigint) => Number(sompi) / Number(SOMPI_PER_KAS);
 
@@ -110,7 +125,9 @@ async function runLiveBuy(
     "https://seq.kron.technology",
   ).curveHead(entry.extensions.curveCovenantId);
   if (submit && sequence.ok && sequence.head) {
-    throw new Error("The curve has an in-flight sequenced trade; rebuild after it settles.");
+    throw new RetryableTradeStateError(
+      "The curve has an in-flight sequenced trade; waiting for it to settle.",
+    );
   }
   const tokenReserve = BigInt(token.cpState.tokenReserve);
   const state = { graduated: false, tokenCovid, tokenReserve };
@@ -142,7 +159,9 @@ async function runLiveBuy(
       indexer.balance(entry.symbol.toLowerCase(), walletAddress),
     ]);
     if (curveEntries.length !== 1 || inventoryEntries.length !== 1) {
-      throw new Error("Live curve state is ambiguous; refusing to prepare a transaction.");
+      throw new RetryableTradeStateError(
+        "Live curve state is temporarily ambiguous; waiting before retrying.",
+      );
     }
     if (!walletEntries.length) throw new Error("Bot wallet has no spendable KAS UTXOs.");
 
@@ -280,11 +299,18 @@ async function runLiveBuy(
         throw error;
       }
     } else if (submit) {
-      const result = await rpc.submitTransaction({
-        transaction: assembly.transaction,
-        allowOrphan: false,
-      });
-      transactionId = result.transactionId;
+      try {
+        const result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false,
+        });
+        transactionId = result.transactionId;
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Buy submission failed with an unknown result.",
+          error,
+        );
+      }
     }
 
     return {
@@ -315,7 +341,7 @@ async function runLiveBuy(
       ],
     };
   } finally {
-    await rpc.disconnect();
+    await rpc.disconnect().catch(() => undefined);
     key = undefined;
   }
 }
@@ -373,7 +399,9 @@ async function runAutomatedSell(lot: {
     "https://seq.kron.technology",
   ).curveHead(entry.extensions.curveCovenantId);
   if (sequence.ok && sequence.head) {
-    throw new Error("The curve is busy with an in-flight sequenced trade.");
+    throw new RetryableTradeStateError(
+      "The curve is busy with an in-flight sequenced trade; waiting before retrying.",
+    );
   }
 
   const templates = await kron.client.fetchCpTemplates({
@@ -429,7 +457,9 @@ async function runAutomatedSell(lot: {
       rpc.getUtxosByAddresses({ addresses: [walletAddress] }),
     ]);
     if (curveEntries.length !== 1 || inventoryEntries.length !== 1) {
-      throw new Error("Live curve state is ambiguous.");
+      throw new RetryableTradeStateError(
+        "Live curve state is temporarily ambiguous; waiting before retrying.",
+      );
     }
     const sellerEntry = sellerEntries.find(
       (item) =>
@@ -512,12 +542,20 @@ async function runAutomatedSell(lot: {
         throw new Error("Signer modified a covenant input.");
       }
     });
-    const result = submit
-      ? await rpc.submitTransaction({
+    let result = null;
+    if (submit) {
+      try {
+        result = await rpc.submitTransaction({
           transaction: assembly.transaction,
           allowOrphan: false,
-        })
-      : null;
+        });
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Sell submission failed with an unknown result.",
+          error,
+        );
+      }
+    }
     return {
       transactionId: result?.transactionId,
       tokenIn: Number(lot.amount),
@@ -529,6 +567,6 @@ async function runAutomatedSell(lot: {
       submitted: submit,
     };
   } finally {
-    await rpc.disconnect();
+    await rpc.disconnect().catch(() => undefined);
   }
 }

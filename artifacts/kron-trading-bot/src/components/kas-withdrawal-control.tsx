@@ -39,16 +39,24 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
     try {
       setError(null);
       const kasware = window.kasware;
-      if (!kasware?.signPskt) {
-        throw new Error('KasWare does not support transaction signing. Update the KasWare extension and try again.');
+      if (!kasware || (mode === 'amount' && !kasware.signPskt) || (mode === 'max' && !kasware.signMessage)) {
+        throw new Error('KasWare does not support the required wallet approval. Update KasWare and try again.');
       }
       const prepared = await prepareWithdrawal.mutateAsync({
         data: mode === 'max' ? { mode: 'max' } : { mode: 'amount', amountKas },
       });
-      const signedTransaction = await kasware.signPskt({
-        txJsonString: prepared.txJsonString,
-        options: { signInputs: prepared.signInputs },
-      });
+      if (prepared.signInputs.length === 0 && !prepared.approvalMessage) {
+        throw new Error('Withdrawal approval details are missing. Refresh and try again.');
+      }
+      const signedTransaction = prepared.signInputs.length === 0
+        ? JSON.stringify({
+          txJsonString: prepared.txJsonString,
+          approvalSignature: await kasware.signMessage(prepared.approvalMessage!, 'schnorr'),
+        })
+        : await kasware.signPskt({
+          txJsonString: prepared.txJsonString,
+          options: { signInputs: prepared.signInputs },
+        });
       const result = await submitWithdrawal.mutateAsync({ data: { signedTransaction } });
       setTransactionId(result.transactionId);
       setAmountKas('');
@@ -113,7 +121,8 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
         </Button>
       </div>
       <p className="mt-2 text-[9px] leading-relaxed text-muted-foreground/70">
-        The connected KasWare wallet signs and pays the network fee. Max empties the bot wallet.
+        Max empties the bot wallet, requires KasWare approval, and deducts the network fee from the amount received.
+        For a specific amount, the connected KasWare wallet signs and pays the fee.
       </p>
       {error && (
         <p className="mt-3 rounded-md border border-destructive/20 bg-destructive/10 p-3 text-xs text-destructive">
@@ -137,8 +146,10 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
           <DialogHeader>
             <DialogTitle>Confirm KAS Withdrawal</DialogTitle>
             <DialogDescription>
-              Send {amountKas} KAS from the isolated bot wallet to your authenticated connected wallet?
-              This transaction cannot be reversed.
+              {amount >= bot.botKasBalance
+                ? 'Empty the bot wallet to your authenticated connected wallet? The network fee is deducted from the displayed balance.'
+                : `Send ${amountKas} KAS from the isolated bot wallet to your authenticated connected wallet?`}
+              {' '}This transaction cannot be reversed.
             </DialogDescription>
           </DialogHeader>
           <div className="rounded-md border border-border bg-muted/30 p-3 font-mono text-xs break-all">
@@ -150,7 +161,7 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
               onClick={() => handleWithdraw(amount >= bot.botKasBalance ? 'max' : 'amount')}
               disabled={prepareWithdrawal.isPending || submitWithdrawal.isPending}
             >
-              {prepareWithdrawal.isPending || submitWithdrawal.isPending ? 'Signing...' : 'Confirm Withdrawal'}
+              {prepareWithdrawal.isPending || submitWithdrawal.isPending ? 'Submitting...' : 'Confirm Withdrawal'}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -846,6 +846,7 @@ export const PrepareUserBotKasWithdrawalBody = zod.object({
 
 export const PrepareUserBotKasWithdrawalResponse = zod.object({
   "txJsonString": zod.string(),
+  "approvalMessage": zod.string().optional().describe('Fresh wallet approval message for bot-funded Max withdrawals.'),
   "signInputs": zod.array(zod.object({
   "index": zod.number().int(),
   "sighashType": zod.number().int()

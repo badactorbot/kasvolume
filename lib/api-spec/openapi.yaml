@@ -721,6 +721,9 @@ components:
       properties:
         txJsonString:
           type: string
+        approvalMessage:
+          type: string
+          description: Fresh wallet approval message for bot-funded Max withdrawals.
         signInputs:
           type: array
           items:

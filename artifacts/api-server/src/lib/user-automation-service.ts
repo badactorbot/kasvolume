@@ -3,86 +3,34 @@ import { db, managedLotsTable, tradingBotsTable } from "@workspace/db";
 import {
   executeUserAutomatedBuy,
   executeUserAutomatedSell,
+  RetryableTradeStateError,
+  TradeSubmissionAttemptedError,
 } from "./kron-live-service";
 import { decryptPrivateKey } from "./user-app-service";
 import { logger } from "./logger";
+import { reconcileStaleInFlight } from "./interrupted-trade-service";
 
 const TRADE_INTERVAL_MS = 6 * 60_000;
-const STALE_IN_FLIGHT_MS = 10 * 60_000;
-const KASPA_REST_API = "https://api.kaspa.org";
+const TRANSIENT_RETRY_MS = 60_000;
 let schedulerBusy = false;
-
-type AddressTransaction = {
-  transaction_id?: string;
-  block_time?: number;
-  is_accepted?: boolean;
-  inputs?: Array<{ previous_outpoint_address?: string }>;
-};
-
-async function reconcileStaleInFlight(bot: typeof tradingBotsTable.$inferSelect) {
-  const marker = bot.inFlight;
-  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return;
-  const startedAtValue = "startedAt" in marker ? marker.startedAt : undefined;
-  if (typeof startedAtValue !== "string") return;
-
-  const startedAt = new Date(startedAtValue);
-  if (!Number.isFinite(startedAt.getTime()) || Date.now() - startedAt.getTime() < STALE_IN_FLIGHT_MS) {
-    return;
-  }
-
-  const url = new URL(
-    `/addresses/${encodeURIComponent(bot.botAddress)}/full-transactions-page`,
-    KASPA_REST_API,
-  );
-  url.searchParams.set("limit", "100");
-  url.searchParams.set("after", String(startedAt.getTime() - 60_000));
-  url.searchParams.set("resolve_previous_outpoints", "light");
-
-  const response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
-  if (!response.ok) {
-    throw new Error(`Kaspa history lookup failed with HTTP ${response.status}.`);
-  }
-  const transactions = await response.json() as AddressTransaction[];
-  const outgoing = transactions.find((transaction) =>
-    transaction.is_accepted === true &&
-    typeof transaction.block_time === "number" &&
-    transaction.block_time >= startedAt.getTime() &&
-    transaction.inputs?.some((input) => input.previous_outpoint_address === bot.botAddress),
-  );
-
-  if (outgoing) {
-    await db.update(tradingBotsTable).set({
-      status: "paused",
-      nextRunAt: null,
-      stopReason: `Safety pause: transaction ${outgoing.transaction_id ?? "unknown"} reached the chain during an interrupted trade and requires reconciliation.`,
-      updatedAt: new Date(),
-    }).where(eq(tradingBotsTable.id, bot.id));
-    logger.error(
-      { botId: bot.id, transactionId: outgoing.transaction_id },
-      "Interrupted user trade reached the chain; manual reconciliation required",
-    );
-    return;
-  }
-
-  await db.update(tradingBotsTable).set({
-    inFlight: null,
-    nextRunAt: new Date(),
-    stopReason: null,
-    updatedAt: new Date(),
-  }).where(eq(tradingBotsTable.id, bot.id));
-  logger.warn({ botId: bot.id }, "Cleared stale user trade after confirming no outgoing chain transaction");
-}
 
 async function runBot(bot: typeof tradingBotsTable.$inferSelect) {
   if (!bot.tokenId) return;
   const action = bot.phase === "buying" ? "buy" : "sell";
   const startedAt = new Date();
-  await db.update(tradingBotsTable).set({
-    inFlight: { action, startedAt: startedAt.toISOString() },
+  const inFlight = { action, startedAt: startedAt.toISOString() };
+  const [claim] = await db.update(tradingBotsTable).set({
+    inFlight,
     stopReason: null,
     updatedAt: startedAt,
-  }).where(and(eq(tradingBotsTable.id, bot.id), isNull(tradingBotsTable.inFlight)));
+  }).where(and(
+    eq(tradingBotsTable.id, bot.id),
+    eq(tradingBotsTable.status, "running"),
+    isNull(tradingBotsTable.inFlight),
+  )).returning({ id: tradingBotsTable.id });
+  if (!claim) return;
 
+  let submissionAttempted = false;
   try {
     const credentials = {
       privateKey: decryptPrivateKey(bot.encryptedPrivateKey),
@@ -90,6 +38,7 @@ async function runBot(bot: typeof tradingBotsTable.$inferSelect) {
     };
     if (action === "buy") {
       const result = await executeUserAutomatedBuy(credentials);
+      submissionAttempted = true;
       if (!result.transactionId) throw new Error("Buy submission returned no transaction ID.");
       await db.transaction(async (tx) => {
         await tx.insert(managedLotsTable).values({
@@ -102,7 +51,7 @@ async function runBot(bot: typeof tradingBotsTable.$inferSelect) {
           tokenSymbol: bot.tokenSymbol,
         });
         const completedBuys = bot.completedBuys + 1;
-        await tx.update(tradingBotsTable).set({
+        const [updated] = await tx.update(tradingBotsTable).set({
           phase: completedBuys >= 5 ? "selling" : "buying",
           completedBuys,
           completedSells: completedBuys >= 5 ? 0 : bot.completedSells,
@@ -112,7 +61,11 @@ async function runBot(bot: typeof tradingBotsTable.$inferSelect) {
           inFlight: null,
           stopReason: null,
           updatedAt: new Date(),
-        }).where(eq(tradingBotsTable.id, bot.id));
+        }).where(and(
+          eq(tradingBotsTable.id, bot.id),
+          eq(tradingBotsTable.inFlight, inFlight),
+        )).returning({ id: tradingBotsTable.id });
+        if (!updated) throw new Error("Buy bookkeeping lost ownership of the operation marker.");
       });
     } else {
       const [lot] = await db
@@ -127,6 +80,7 @@ async function runBot(bot: typeof tradingBotsTable.$inferSelect) {
         index: lot.outputIndex,
         amount: lot.tokenAmount.toString(),
       }, credentials);
+      submissionAttempted = true;
       if (!result.transactionId) throw new Error("Sell submission returned no transaction ID.");
       await db.transaction(async (tx) => {
         await tx.update(managedLotsTable).set({
@@ -135,7 +89,7 @@ async function runBot(bot: typeof tradingBotsTable.$inferSelect) {
         }).where(eq(managedLotsTable.id, lot.id));
         const completedSells = bot.completedSells + 1;
         const cycleComplete = completedSells >= 5;
-        await tx.update(tradingBotsTable).set({
+        const [updated] = await tx.update(tradingBotsTable).set({
           phase: cycleComplete ? "buying" : "selling",
           completedBuys: cycleComplete ? 0 : bot.completedBuys,
           completedSells: cycleComplete ? 0 : completedSells,
@@ -145,20 +99,47 @@ async function runBot(bot: typeof tradingBotsTable.$inferSelect) {
           inFlight: null,
           stopReason: null,
           updatedAt: new Date(),
-        }).where(eq(tradingBotsTable.id, bot.id));
+        }).where(and(
+          eq(tradingBotsTable.id, bot.id),
+          eq(tradingBotsTable.inFlight, inFlight),
+        )).returning({ id: tradingBotsTable.id });
+        if (!updated) throw new Error("Sell bookkeeping lost ownership of the operation marker.");
       });
     }
     logger.info({ botId: bot.id, action }, "User Kron trade accepted");
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown automation failure";
-    await db.update(tradingBotsTable).set({
-      status: "paused",
-      nextRunAt: null,
-      stopReason: `Safety pause: ${message}`,
-      // Retain inFlight as a fail-closed marker until an operator reconciles the outpoint.
+    submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
+    const retryable = !submissionAttempted && error instanceof RetryableTradeStateError;
+    const [transitioned] = await db.update(tradingBotsTable).set({
+      status: retryable ? "running" : "paused",
+      nextRunAt: retryable ? new Date(Date.now() + TRANSIENT_RETRY_MS) : null,
+      stopReason: retryable ? `Waiting to retry: ${message}` : `Safety pause: ${message}`,
+      inFlight: submissionAttempted ? inFlight : null,
       updatedAt: new Date(),
-    }).where(eq(tradingBotsTable.id, bot.id));
-    logger.error({ err: error, botId: bot.id, action }, "User Kron bot paused");
+    }).where(and(
+      eq(tradingBotsTable.id, bot.id),
+      eq(tradingBotsTable.status, "running"),
+      eq(tradingBotsTable.inFlight, inFlight),
+    )).returning({ id: tradingBotsTable.id });
+    if (!transitioned) {
+      await db.update(tradingBotsTable).set({
+        inFlight: submissionAttempted ? inFlight : null,
+        ...(submissionAttempted ? {
+          nextRunAt: null,
+          stopReason: `Safety pause: ${message}`,
+        } : {}),
+        updatedAt: new Date(),
+      }).where(and(
+        eq(tradingBotsTable.id, bot.id),
+        eq(tradingBotsTable.inFlight, inFlight),
+      ));
+    }
+    if (retryable) {
+      logger.warn({ err: error, botId: bot.id, action }, "User Kron trade deferred for retry");
+    } else {
+      logger.error({ err: error, botId: bot.id, action }, "User Kron bot paused");
+    }
   }
 }
 

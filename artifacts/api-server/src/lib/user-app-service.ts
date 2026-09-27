@@ -7,7 +7,7 @@ import {
   randomUUID,
   timingSafeEqual,
 } from "node:crypto";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, ne } from "drizzle-orm";
 import * as kron from "@kronsdk/kron-sdk";
 import { loadKaspa } from "@kronsdk/kron-sdk/wasm";
 import {
@@ -17,6 +17,7 @@ import {
   tradingBotsTable,
   walletUsersTable,
 } from "@workspace/db";
+import { reconcileStaleInFlight } from "./interrupted-trade-service";
 
 export const ACTIVATION_ADDRESS =
   "kaspa:qz6dltvkds80wf8raac504ze4nesgnk72n24jr7krum2m8dq34khvkevr88cc";
@@ -326,13 +327,44 @@ export async function verifyActivation(userId: string, transactionId: string) {
 
 export async function changeUserBotCovenant(userId: string, tokenId: string) {
   const normalized = tokenId.toLowerCase();
-  const [bot] = await db.select().from(tradingBotsTable)
+  let [bot] = await db.select().from(tradingBotsTable)
     .where(eq(tradingBotsTable.userId, userId))
     .limit(1);
   if (!bot?.tokenId) throw new Error("Set up the bot before changing its covenant.");
   if (bot.tokenId === normalized) throw new Error("Enter a different covenant ID.");
   if (bot.status === "running") throw new Error("Stop the bot before changing its covenant.");
-  if (bot.inFlight) throw new Error("Wait for the current trade to finish before changing the covenant.");
+  const originalTokenId = bot.tokenId;
+  const originalConfigurationVersion = bot.configurationVersion;
+  const pendingAction = (
+    bot.inFlight &&
+    typeof bot.inFlight === "object" &&
+    !Array.isArray(bot.inFlight) &&
+    "action" in bot.inFlight
+  ) ? bot.inFlight.action : undefined;
+  if (bot.inFlight) {
+    if (
+      pendingAction === "withdraw" &&
+      bot.stopReason !== "Withdrawal submission is awaiting reconciliation. Do not retry."
+    ) {
+      const [cleared] = await db.update(tradingBotsTable).set({
+        inFlight: null,
+        stopReason: null,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(tradingBotsTable.id, bot.id),
+        eq(tradingBotsTable.inFlight, bot.inFlight),
+      )).returning({ id: tradingBotsTable.id });
+      if (!cleared) throw new Error("The bot operation changed. Refresh and try again.");
+    } else {
+      await reconcileStaleInFlight(bot);
+    }
+    [bot] = await db.select().from(tradingBotsTable)
+      .where(eq(tradingBotsTable.id, bot.id))
+      .limit(1);
+    if (!bot || bot.inFlight) {
+      throw new Error("The interrupted operation requires reconciliation before changing the covenant.");
+    }
+  }
 
   const [openLot] = await db.select({ id: managedLotsTable.id })
     .from(managedLotsTable)
@@ -363,7 +395,7 @@ export async function changeUserBotCovenant(userId: string, tokenId: string) {
       tokenId: bot.tokenId,
       tokenSymbol: bot.tokenSymbol,
     }).where(and(eq(managedLotsTable.botId, bot.id), isNull(managedLotsTable.tokenId)));
-    await tx.update(tradingBotsTable).set({
+    const [updated] = await tx.update(tradingBotsTable).set({
       tokenId: normalized,
       tokenSymbol: entry.symbol,
       configurationVersion: bot.configurationVersion + 1,
@@ -377,15 +409,31 @@ export async function changeUserBotCovenant(userId: string, tokenId: string) {
       inFlight: null,
       stopReason: null,
       updatedAt: new Date(),
-    }).where(eq(tradingBotsTable.id, bot.id));
+    }).where(and(
+      eq(tradingBotsTable.id, bot.id),
+      ne(tradingBotsTable.status, "running"),
+      isNull(tradingBotsTable.inFlight),
+      eq(tradingBotsTable.configurationVersion, originalConfigurationVersion),
+      eq(tradingBotsTable.tokenId, originalTokenId),
+    )).returning({ id: tradingBotsTable.id });
+    if (!updated) throw new Error("The bot state changed. Refresh and try the covenant change again.");
   });
   return getUserDashboard(userId);
 }
 
 export async function setUserBotRunning(userId: string, running: boolean) {
-  const [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId)).limit(1);
+  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId)).limit(1);
   if (!bot?.activationVerifiedAt || !bot.tokenId) throw new Error("Complete setup and activation first.");
   if (running) {
+    if (bot.inFlight) {
+      await reconcileStaleInFlight(bot);
+      [bot] = await db.select().from(tradingBotsTable)
+        .where(eq(tradingBotsTable.id, bot.id))
+        .limit(1);
+      if (!bot || bot.inFlight) {
+        throw new Error("The interrupted trade requires reconciliation before the bot can restart.");
+      }
+    }
     const k = await loadKaspa();
     const rpc = new k.RpcClient({ url: NODE_URL, networkId: "mainnet", encoding: k.Encoding.Borsh });
     await rpc.connect();

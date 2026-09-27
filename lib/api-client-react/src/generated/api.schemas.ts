@@ -292,6 +292,8 @@ export type KasWithdrawalPreparationSignInputsItem = {
 
 export interface KasWithdrawalPreparation {
   txJsonString: string;
+  /** Fresh wallet approval message for bot-funded Max withdrawals. */
+  approvalMessage?: string;
   signInputs: KasWithdrawalPreparationSignInputsItem[];
   destinationAddress: string;
   amountKas: string;
