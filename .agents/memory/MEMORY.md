@@ -4,3 +4,4 @@
 - [Interrupted trade recovery](interrupted-trade-recovery.md) — never clear a stale in-flight marker until chain history proves no outgoing transaction was accepted.
 - [Covenant changes](covenant-changes.md) — require all managed positions sold, preserve the bot wallet/history, and require a unique new activation payment.
 - [Bot KAS withdrawals](bot-kas-withdrawals.md) — withdraw only to the authenticated wallet, block active positions/trades, and fail closed after submission begins.
+- [GitHub synchronization](github-sync.md) — direct Git push may lack authorization even when the connected GitHub API can update the repository.
