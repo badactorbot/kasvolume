@@ -35,6 +35,7 @@ export * from './kasWithdrawalSubmission';
 export * from './liveBuyPreview';
 export * from './marketSnapshot';
 export * from './safetyStatus';
+export * from './sellAllManagedPositionsResult';
 export * from './simulationInput';
 export * from './simulationResult';
 export * from './simulationResultStoppedReason';

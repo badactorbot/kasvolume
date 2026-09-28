@@ -66,7 +66,7 @@ export function CovenantChangeDialog({ bot }: { bot: ActiveBot }) {
           )}
           {hasOpenPositions && (
             <p className="rounded-md border border-warning/30 bg-warning/10 p-3 text-xs text-warning">
-              The bot still holds {bot.managedTokenAmount} managed tokens. Complete the sell cycle first.
+              The bot still holds {bot.managedTokenAmount} managed tokens. Use Sell All under Withdraw, then try again.
             </p>
           )}
           <div>

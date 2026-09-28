@@ -2,6 +2,7 @@ import { useState } from 'react';
 import {
   getGetUserBotDashboardQueryKey,
   usePrepareUserBotKasWithdrawal,
+  useSellAllUserBotManagedPositions,
   useSubmitUserBotKasWithdrawal,
   type UserBotDashboard,
 } from '@workspace/api-client-react';
@@ -24,16 +25,20 @@ type ActiveBot = NonNullable<UserBotDashboard['bot']>;
 export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; walletAddress: string }) {
   const [amountKas, setAmountKas] = useState('');
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [sellAllOpen, setSellAllOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [transactionId, setTransactionId] = useState<string | null>(null);
   const prepareWithdrawal = usePrepareUserBotKasWithdrawal();
   const submitWithdrawal = useSubmitUserBotKasWithdrawal();
+  const sellAll = useSellAllUserBotManagedPositions();
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const amount = Number(amountKas);
   const hasOpenPositions = bot.managedTokenAmount !== '0';
   const validAmount = Number.isFinite(amount) && amount >= 0.2 && amount <= bot.botKasBalance;
   const canWithdraw = bot.status !== 'running' && !hasOpenPositions && validAmount;
+  const canSellAll = bot.status !== 'running' && hasOpenPositions;
+  const busy = prepareWithdrawal.isPending || submitWithdrawal.isPending || sellAll.isPending;
 
   const handleWithdraw = async (mode: 'amount' | 'max' = 'amount') => {
     try {
@@ -72,6 +77,27 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
     }
   };
 
+  const handleSellAll = async () => {
+    try {
+      setError(null);
+      const result = await sellAll.mutateAsync();
+      await queryClient.invalidateQueries({ queryKey: getGetUserBotDashboardQueryKey() });
+      setSellAllOpen(false);
+      toast({
+        title: result.complete ? 'Positions sold' : 'Sell all incomplete',
+        description: result.message || `Sold ${result.soldCount} position(s).`,
+        variant: result.complete ? 'default' : 'destructive',
+      });
+      if (!result.complete && result.message) {
+        setError(result.message);
+      }
+    } catch (err: any) {
+      await queryClient.invalidateQueries({ queryKey: getGetUserBotDashboardQueryKey() });
+      setError(err.data?.error || err.response?.data?.error || err.message || 'Sell all failed');
+      setSellAllOpen(false);
+    }
+  };
+
   return (
     <div className="mt-6 border-t border-border/50 pt-6">
       <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
@@ -84,7 +110,26 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
         <p className="mb-3 text-[10px] text-warning">Stop trading before withdrawing.</p>
       )}
       {hasOpenPositions && (
-        <p className="mb-3 text-[10px] text-warning">Sell all managed token positions before withdrawing.</p>
+        <div className="mb-3 space-y-2">
+          <p className="text-[10px] text-warning">
+            Sell all managed token positions before withdrawing.
+          </p>
+          <Button
+            size="sm"
+            variant="secondary"
+            className="h-9 px-4 text-xs font-bold uppercase tracking-widest"
+            disabled={!canSellAll || busy}
+            onClick={() => {
+              setError(null);
+              setSellAllOpen(true);
+            }}
+          >
+            {sellAll.isPending ? 'Selling…' : 'Sell All'}
+          </Button>
+          <p className="text-[9px] leading-relaxed text-muted-foreground/70">
+            Sells remaining tokens from the bot wallet so you can withdraw KAS.
+          </p>
+        </div>
       )}
       <div className="flex gap-2">
         <Input
@@ -98,7 +143,7 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
           size="sm"
           variant="secondary"
           className="h-9 px-3 text-xs font-bold uppercase tracking-widest"
-          disabled={bot.status === 'running' || hasOpenPositions || bot.botKasBalance <= 0 || prepareWithdrawal.isPending || submitWithdrawal.isPending}
+          disabled={bot.status === 'running' || hasOpenPositions || bot.botKasBalance <= 0 || busy}
           onClick={() => {
             setAmountKas(bot.botKasBalance.toFixed(8).replace(/0+$/, '').replace(/\.$/, ''));
             setError(null);
@@ -111,7 +156,7 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
           size="sm"
           variant="outline"
           className="h-9 px-4 text-xs font-bold uppercase tracking-widest"
-          disabled={!canWithdraw || prepareWithdrawal.isPending || submitWithdrawal.isPending}
+          disabled={!canWithdraw || busy}
           onClick={() => {
             setError(null);
             setConfirmOpen(true);
@@ -159,9 +204,30 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
             <Button variant="outline" onClick={() => setConfirmOpen(false)}>Cancel</Button>
             <Button
               onClick={() => handleWithdraw(amount >= bot.botKasBalance ? 'max' : 'amount')}
-              disabled={prepareWithdrawal.isPending || submitWithdrawal.isPending}
+              disabled={busy}
             >
               {prepareWithdrawal.isPending || submitWithdrawal.isPending ? 'Submitting...' : 'Confirm Withdrawal'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={sellAllOpen} onOpenChange={setSellAllOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Sell All Managed Positions</DialogTitle>
+            <DialogDescription>
+              Sell every remaining managed token lot from the bot wallet
+              ({bot.managedTokenAmount} {bot.tokenSymbol || 'tokens'} on-chain)?
+              This uses the bot key and cannot be reversed. When finished, you can withdraw KAS.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSellAllOpen(false)} disabled={sellAll.isPending}>
+              Cancel
+            </Button>
+            <Button onClick={handleSellAll} disabled={sellAll.isPending}>
+              {sellAll.isPending ? 'Selling…' : 'Confirm Sell All'}
             </Button>
           </DialogFooter>
         </DialogContent>

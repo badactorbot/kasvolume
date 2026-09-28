@@ -15,6 +15,7 @@ import {
   ChangeUserBotCovenantResponse,
   PrepareUserBotKasWithdrawalBody,
   PrepareUserBotKasWithdrawalResponse,
+  SellAllUserBotManagedPositionsResponse,
   SubmitUserBotKasWithdrawalBody,
   SubmitUserBotKasWithdrawalResponse,
 } from "@workspace/api-zod";
@@ -34,6 +35,7 @@ import {
   prepareUserBotKasWithdrawal,
   submitUserBotKasWithdrawal,
 } from "../lib/bot-withdrawal-service";
+import { sellAllUserBotManagedPositions } from "../lib/bot-sell-all-service";
 
 const router: IRouter = Router();
 const cookie = (req: any) => req.cookies?.[sessionCookieName()] as string | undefined;
@@ -101,6 +103,12 @@ router.post("/app/bot/start", handler(async (req, res) => {
 
 router.post("/app/bot/stop", handler(async (req, res) => {
   res.json(StopUserBotResponse.parse(await setUserBotRunning(userId(req), false)));
+}));
+
+router.post("/app/bot/sell-all", handler(async (req, res) => {
+  res.json(SellAllUserBotManagedPositionsResponse.parse(
+    await sellAllUserBotManagedPositions(userId(req)),
+  ));
 }));
 
 router.post("/app/bot/withdraw", handler(async (req, res) => {
