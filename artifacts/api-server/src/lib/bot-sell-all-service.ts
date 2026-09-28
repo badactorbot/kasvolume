@@ -9,6 +9,8 @@ import { decryptPrivateKey } from "./user-app-service";
 import { reconcileStaleInFlight } from "./interrupted-trade-service";
 import { logger } from "./logger";
 
+const ACTIVE_SELL_ALL_MS = 2 * 60_000;
+
 type SellAllInFlight = {
   action: "sell-all";
   startedAt: string;
@@ -23,6 +25,23 @@ async function countOpenLots(botId: string) {
   return Number(row?.value ?? 0);
 }
 
+/** RPC rejections that did not land on-chain — safe to clear the sell-all lock. */
+function isDefinitiveSubmissionRejection(message: string) {
+  return /orphan|is an orphan|rejected transaction|double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i
+    .test(message);
+}
+
+async function clearSellAllMarker(botId: string, marker: unknown) {
+  await db.update(tradingBotsTable).set({
+    inFlight: null,
+    stopReason: null,
+    updatedAt: new Date(),
+  }).where(and(
+    eq(tradingBotsTable.id, botId),
+    eq(tradingBotsTable.inFlight, marker),
+  ));
+}
+
 export async function sellAllUserBotManagedPositions(userId: string) {
   let [bot] = await db.select().from(tradingBotsTable)
     .where(eq(tradingBotsTable.userId, userId))
@@ -35,21 +54,35 @@ export async function sellAllUserBotManagedPositions(userId: string) {
   }
 
   if (bot.inFlight) {
-    const legacy = bot.inFlight as { action?: string };
-    if (legacy.action === "sell-all") {
-      const startedAt = typeof (bot.inFlight as SellAllInFlight).startedAt === "string"
-        ? Date.parse((bot.inFlight as SellAllInFlight).startedAt)
+    const marker = bot.inFlight as { action?: string; startedAt?: string };
+    if (marker.action === "sell-all") {
+      const startedAt = typeof marker.startedAt === "string"
+        ? Date.parse(marker.startedAt)
         : Number.NaN;
-      if (Number.isFinite(startedAt) && Date.now() - startedAt < 10 * 60_000) {
+      const ageMs = Number.isFinite(startedAt) ? Date.now() - startedAt : Number.POSITIVE_INFINITY;
+      // Only block while a sell-all is actively running with no failure recorded.
+      // Once stopReason is set (or the marker is stale), open lots are source of truth — allow retry.
+      const activelyRunning = ageMs < ACTIVE_SELL_ALL_MS && !bot.stopReason;
+      if (activelyRunning) {
         throw new Error("A sell-all operation is already in progress. Wait a moment and try again.");
       }
-    }
-    await reconcileStaleInFlight(bot);
-    [bot] = await db.select().from(tradingBotsTable)
-      .where(eq(tradingBotsTable.id, bot.id))
-      .limit(1);
-    if (!bot || bot.inFlight) {
-      throw new Error("The interrupted trade requires reconciliation before selling positions.");
+      await clearSellAllMarker(bot.id, bot.inFlight);
+      logger.warn({ botId: bot.id, ageMs, stopReason: bot.stopReason }, "Cleared stalled sell-all marker for retry");
+      [bot] = await db.select().from(tradingBotsTable)
+        .where(eq(tradingBotsTable.id, bot.id))
+        .limit(1);
+      if (!bot) throw new Error("Bot wallet was not found.");
+      if (bot.inFlight) {
+        throw new Error("The bot operation changed. Refresh and try sell all again.");
+      }
+    } else {
+      await reconcileStaleInFlight(bot);
+      [bot] = await db.select().from(tradingBotsTable)
+        .where(eq(tradingBotsTable.id, bot.id))
+        .limit(1);
+      if (!bot || bot.inFlight) {
+        throw new Error("The interrupted trade requires reconciliation before selling positions.");
+      }
     }
   }
 
@@ -135,8 +168,9 @@ export async function sellAllUserBotManagedPositions(userId: string) {
       submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
       const message = error instanceof Error ? error.message : "Unknown sell failure";
       const remainingOpenLots = await countOpenLots(bot.id);
+      const definitiveReject = submissionAttempted && isDefinitiveSubmissionRejection(message);
 
-      if (submissionAttempted) {
+      if (submissionAttempted && !definitiveReject) {
         await db.update(tradingBotsTable).set({
           status: "paused",
           nextRunAt: null,
@@ -149,6 +183,8 @@ export async function sellAllUserBotManagedPositions(userId: string) {
         );
       }
 
+      // Clear lock on pre-submit failures and definitive RPC rejections (e.g. orphan)
+      // so the user can retry immediately. Unsold lots remain open in managed_lots.
       await db.update(tradingBotsTable).set({
         inFlight: null,
         stopReason: soldCount > 0
