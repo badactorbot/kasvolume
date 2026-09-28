@@ -26,7 +26,9 @@ export function CovenantChangeDialog({ bot }: { bot: ActiveBot }) {
   const [error, setError] = useState<string | null>(null);
   const changeCovenant = useChangeUserBotCovenant();
   const queryClient = useQueryClient();
-  const hasOpenPositions = bot.managedTokenAmount !== '0';
+  const openLotsFromHistory = bot.tradeHistory.filter((trade) => trade.action === 'buy').length
+    - bot.tradeHistory.filter((trade) => trade.action === 'sell').length;
+  const hasOpenPositions = bot.managedTokenAmount !== '0' || openLotsFromHistory > 0;
   const canChange = bot.status !== 'running' && !hasOpenPositions;
 
   const handleChange = async () => {

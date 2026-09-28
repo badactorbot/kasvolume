@@ -34,7 +34,9 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const amount = Number(amountKas);
-  const hasOpenPositions = bot.managedTokenAmount !== '0';
+  const openLotsFromHistory = bot.tradeHistory.filter((trade) => trade.action === 'buy').length
+    - bot.tradeHistory.filter((trade) => trade.action === 'sell').length;
+  const hasOpenPositions = bot.managedTokenAmount !== '0' || openLotsFromHistory > 0;
   const validAmount = Number.isFinite(amount) && amount >= 0.2 && amount <= bot.botKasBalance;
   const canWithdraw = bot.status !== 'running' && !hasOpenPositions && validAmount;
   const canSellAll = bot.status !== 'running' && hasOpenPositions;
