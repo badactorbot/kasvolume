@@ -221,7 +221,8 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
             <DialogDescription>
               Sell every remaining managed token lot from the bot wallet
               ({bot.managedTokenAmount} {bot.tokenSymbol || 'tokens'} on-chain)?
-              This uses the bot key and cannot be reversed. When finished, you can withdraw KAS.
+              This sells all open lots in one run (may take several minutes while the market settles between trades).
+              It uses the bot key and cannot be reversed. When finished, you can withdraw KAS.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
