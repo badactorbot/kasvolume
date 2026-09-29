@@ -221,12 +221,12 @@ export class Battle {
       this.shocks = this.shocks.filter((shock) => shock.life > 0);
     }
 
-    for (const pulse of this.pulses) pulse.x += step * 1.35;
+    for (const pulse of this.pulses) pulse.x += step * 0.72;
     if (this.pulses.some((pulse) => pulse.x > 1.15)) {
       this.pulses = this.pulses.filter((pulse) => pulse.x <= 1.15);
     }
 
-    this.thump *= Math.exp(-step / 0.35);
+    this.thump *= Math.exp(-step / 0.7);
     this.punch *= Math.exp(-step / 0.16);
 
     if (this.units.some((unit) => unit.state === "dead")) {

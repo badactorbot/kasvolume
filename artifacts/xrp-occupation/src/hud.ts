@@ -125,7 +125,7 @@ export class Hud {
         ? "—"
         : `#${Math.round(battle.ledgerIndex).toLocaleString("en-US")}`;
     setText(this.ledgerVal, ledger);
-    this.ledgerVal.classList.toggle("thump", battle.thump > 0.45);
+    this.ledgerVal.classList.toggle("thump", battle.thump > 0.18);
 
     const alive = battle.units.some((unit) => unit.state !== "dead");
     let note = "";

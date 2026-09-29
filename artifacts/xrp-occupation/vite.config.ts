@@ -12,6 +12,15 @@ const base =
     ? process.env.BASE_PATH
     : "/";
 
+const binanceProxy = {
+  "/__binance": {
+    target: "https://fapi.binance.com",
+    changeOrigin: true,
+    secure: true,
+    rewrite: (path: string) => path.replace(/^\/__binance/, ""),
+  },
+};
+
 export default defineConfig({
   base,
   server: {
@@ -19,21 +28,13 @@ export default defineConfig({
     port,
     strictPort: true,
     allowedHosts: true,
-    proxy: {
-      // Same public REST endpoint, fetched by the dev server when the browser
-      // cannot read fapi.binance.com directly (CORS or an opaque network error).
-      "/__binance": {
-        target: "https://fapi.binance.com",
-        changeOrigin: true,
-        secure: true,
-        rewrite: (path) => path.replace(/^\/__binance/, ""),
-      },
-    },
+    proxy: binanceProxy,
   },
   preview: {
     host: "0.0.0.0",
     port,
     strictPort: true,
     allowedHosts: true,
+    proxy: binanceProxy,
   },
 });

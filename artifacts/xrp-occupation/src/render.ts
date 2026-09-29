@@ -116,10 +116,10 @@ export class FieldView {
     this.paintUnits(battle, w, h);
     this.paintParticles(battle, w, h);
     this.paintShocks(battle, w, h);
-    this.paintPulses(battle, w, h);
     this.paintFront(battle, w, h);
     ctx.restore();
     this.paintVignette(w, h, battle);
+    this.paintPulses(battle, w, h);
   }
 
   private paintBackdrop(w: number, h: number, battle: Battle): void {
@@ -311,18 +311,22 @@ export class FieldView {
     const ctx = this.ctx;
     for (const pulse of battle.pulses) {
       const x = pulse.x * w;
-      const band = ctx.createLinearGradient(x - 90, 0, x + 90, 0);
-      band.addColorStop(0, "rgba(240, 226, 192, 0)");
-      band.addColorStop(0.5, "rgba(240, 226, 192, 0.22)");
-      band.addColorStop(1, "rgba(240, 226, 192, 0)");
+      const band = ctx.createLinearGradient(x - 160, 0, x + 160, 0);
+      band.addColorStop(0, "rgba(255, 236, 200, 0)");
+      band.addColorStop(0.5, "rgba(255, 236, 200, 0.42)");
+      band.addColorStop(1, "rgba(255, 236, 200, 0)");
       ctx.fillStyle = band;
-      ctx.fillRect(x - 90, 0, 180, h);
-      ctx.strokeStyle = "rgba(255, 248, 236, 0.85)";
-      ctx.lineWidth = 1.5;
+      ctx.fillRect(x - 160, 0, 320, h);
+      ctx.save();
+      ctx.shadowColor = "rgba(255, 244, 214, 0.95)";
+      ctx.shadowBlur = 22;
+      ctx.strokeStyle = "rgba(255, 252, 245, 0.98)";
+      ctx.lineWidth = 3;
       ctx.beginPath();
       ctx.moveTo(x, 0);
       ctx.lineTo(x, h);
       ctx.stroke();
+      ctx.restore();
     }
   }
 

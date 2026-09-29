@@ -67,7 +67,9 @@ async function readInterest(url: string): Promise<OpenInterestUpdate | "throw"> 
 }
 
 export async function fetchOpenInterest(): Promise<OpenInterestUpdate> {
-  const urls = [OPEN_INTEREST_URL, OPEN_INTEREST_DEV_PROXY];
+  // Dev/preview proxy first so a 451 from fapi.binance.com is readable.
+  // The proxy target is that same public URL. Direct fetch is the fallback.
+  const urls = [OPEN_INTEREST_DEV_PROXY, OPEN_INTEREST_URL];
   let last = "unreachable";
   for (const url of urls) {
     try {
