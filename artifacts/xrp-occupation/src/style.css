@@ -1,0 +1,349 @@
+:root {
+  color-scheme: dark;
+  --bone: #ebe6dc;
+  --muted: #9aa3b5;
+  --dim: #6e7688;
+  --long: #3ee0c5;
+  --short: #ff5b3d;
+  --amber: #ffb020;
+  --bg: #07080c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+#field {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+#hud {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  padding: 22px 28px 16px;
+  color: var(--bone);
+  font-family: "JetBrains Mono", "Cascadia Mono", ui-monospace, monospace;
+}
+
+.frame {
+  position: absolute;
+  inset: 12px;
+  background:
+    linear-gradient(var(--bone), var(--bone)) left 10px top 10px / 22px 1px no-repeat,
+    linear-gradient(var(--bone), var(--bone)) left 10px top 10px / 1px 22px no-repeat,
+    linear-gradient(var(--bone), var(--bone)) right 10px top 10px / 22px 1px no-repeat,
+    linear-gradient(var(--bone), var(--bone)) right 10px top 10px / 1px 22px no-repeat,
+    linear-gradient(var(--bone), var(--bone)) left 10px bottom 10px / 22px 1px no-repeat,
+    linear-gradient(var(--bone), var(--bone)) left 10px bottom 10px / 1px 22px no-repeat,
+    linear-gradient(var(--bone), var(--bone)) right 10px bottom 10px / 22px 1px no-repeat,
+    linear-gradient(var(--bone), var(--bone)) right 10px bottom 10px / 1px 22px no-repeat;
+  opacity: 0.55;
+}
+
+header,
+footer,
+.stage {
+  position: relative;
+  z-index: 1;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+}
+
+.kicker {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.24em;
+}
+
+h1 {
+  margin: 0;
+  font-family: Inter, "Liberation Sans", sans-serif;
+  font-weight: 600;
+  font-size: clamp(18px, 2.5vw, 30px);
+  letter-spacing: 0.34em;
+  line-height: 1;
+}
+
+.feeds {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.feed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+}
+
+.feed .name {
+  color: var(--muted);
+}
+
+.feed .state {
+  color: var(--bone);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dim);
+  box-shadow: none;
+}
+
+.feed[data-state="live"] .dot {
+  background: #8dffc0;
+  box-shadow: 0 0 8px #8dffc0;
+}
+
+.feed[data-state="live"] .state {
+  color: #d7ffe9;
+}
+
+.feed[data-state="connecting"] .dot {
+  background: var(--amber);
+  box-shadow: 0 0 8px var(--amber);
+  animation: blink 1s steps(2, end) infinite;
+}
+
+.feed[data-state="connecting"] .state {
+  color: var(--amber);
+}
+
+.feed[data-state="disconnected"] .dot,
+.feed[data-state="blocked"] .dot {
+  background: var(--short);
+  box-shadow: 0 0 8px var(--short);
+}
+
+.feed[data-state="disconnected"] .state,
+.feed[data-state="blocked"] .state {
+  color: #ffd0c6;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.stage {
+  min-height: 0;
+}
+
+.flank {
+  position: absolute;
+  top: 18%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 34vw;
+}
+
+.flank.left {
+  left: 8px;
+}
+
+.flank.right {
+  right: 8px;
+  text-align: right;
+  align-items: flex-end;
+}
+
+.eyebrow,
+.hint {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.flank strong {
+  font-family: Inter, "Liberation Sans", sans-serif;
+  font-weight: 600;
+  font-size: clamp(28px, 4vw, 52px);
+  letter-spacing: -0.04em;
+  line-height: 0.95;
+}
+
+.flank.left strong {
+  color: var(--long);
+  text-shadow: 0 0 18px rgba(62, 224, 197, 0.35);
+}
+
+.flank.right strong {
+  color: var(--short);
+  text-shadow: 0 0 18px rgba(255, 91, 61, 0.35);
+}
+
+#field-note {
+  position: absolute;
+  left: 50%;
+  bottom: 8px;
+  transform: translateX(-50%);
+  margin: 0;
+  width: min(720px, 70vw);
+  text-align: center;
+  color: var(--bone);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  line-height: 1.45;
+  text-wrap: balance;
+}
+
+#field-note:empty {
+  display: none;
+}
+
+#field-note[data-tone="alert"] {
+  color: #ffd0c6;
+}
+
+footer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px 18px;
+}
+
+.metrics span {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  margin-bottom: 3px;
+}
+
+.metrics strong {
+  font-family: Inter, "Liberation Sans", sans-serif;
+  font-weight: 600;
+  font-size: clamp(14px, 1.6vw, 18px);
+  letter-spacing: 0.01em;
+}
+
+.metrics em {
+  display: block;
+  margin-top: 2px;
+  font-style: normal;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+
+.metrics strong.thump {
+  color: #fff6df;
+  text-shadow: 0 0 12px rgba(255, 236, 200, 0.8);
+}
+
+.meter {
+  display: flex;
+  height: 3px;
+  width: 100%;
+  background: rgba(235, 230, 220, 0.08);
+}
+
+#meter-long {
+  width: 50%;
+  background: var(--long);
+  box-shadow: 0 0 10px rgba(62, 224, 197, 0.6);
+}
+
+#meter-short {
+  width: 50%;
+  background: var(--short);
+  box-shadow: 0 0 10px rgba(255, 91, 61, 0.55);
+}
+
+.proxy,
+.legend {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  line-height: 1.45;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sw {
+  width: 8px;
+  height: 8px;
+  display: inline-block;
+}
+
+.sw.long {
+  background: var(--long);
+  clip-path: polygon(100% 50%, 0 0, 28% 50%, 0 100%);
+}
+
+.sw.short {
+  background: var(--short);
+  clip-path: polygon(0 50%, 100% 0, 72% 50%, 100% 100%);
+}
+
+@media (max-width: 860px) {
+  #hud {
+    padding: 16px 14px 12px;
+  }
+
+  h1 {
+    letter-spacing: 0.18em;
+  }
+
+  .metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .flank {
+    top: 8%;
+  }
+
+  .flank strong {
+    font-size: 28px;
+  }
+
+  #field-note {
+    width: min(640px, 92vw);
+  }
+}
