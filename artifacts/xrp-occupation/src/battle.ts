@@ -1,384 +1,411 @@
-import { clamp } from "./format";
+import { clamp, formatUsd } from "./format";
+import type { LinkStatus } from "./net";
 import type { Side } from "./parse";
+
+export type UnitKind = "infantry" | "tank" | "artillery";
+export type StrikeTier = "burst" | "strike" | "bomb";
+
+export const TANK_USD = 2500;
+export const FEED_TRADE_USD = 8000;
+export const LIQ_STRIKE_USD = 5000;
+export const LIQ_BOMB_USD = 25000;
+const INFANTRY_USD = 350;
+const RANGE_FRAC = 0.0022;
 
 export interface Unit {
   side: Side;
+  kind: UnitKind;
   x: number;
-  y: number;
+  lane: number;
   health: number;
   notional: number;
-  leverage: number | null;
-  phase: number;
-  speed: number;
-  depth: number;
-  state: "march" | "hold" | "dying" | "dead";
+  state: "march" | "hold" | "dying";
   die: number;
+  flash: number;
+  age: number;
 }
 
-export interface Particle {
+export interface Strike {
+  side: Side;
+  tier: StrikeTier;
+  x: number;
+  life: number;
+  max: number;
+}
+
+export interface Bit {
   x: number;
   y: number;
   vx: number;
   vy: number;
   life: number;
   max: number;
-  size: number;
-  r: number;
-  g: number;
-  b: number;
+  tone: "long" | "short" | "gold" | "bone";
 }
 
-export interface Shock {
-  x: number;
-  y: number;
-  r: number;
-  max: number;
-  life: number;
-  maxLife: number;
+export interface BookColumn {
   side: Side;
+  t: number;
+  weight: number;
 }
 
-export interface Pulse {
-  x: number;
+export interface FeedLine {
+  text: string;
+  tone: "long" | "short" | "gold";
 }
 
-const MAX_UNITS = 380;
-const MAX_PARTICLES = 700;
-
-function maxLev(a: number | null, b: number | null): number | null {
-  if (a == null) return b;
-  if (b == null) return a;
-  return Math.max(a, b);
+export interface Round {
+  low: number;
+  high: number;
 }
+
+interface Sample {
+  t: number;
+  v: number;
+}
+
+const MAX_UNITS = 42;
 
 function opposite(side: Side): Side {
   return side === "long" ? "short" : "long";
 }
 
-function chunks(notional: number): number[] {
-  const cap = 100_000;
-  const parts: number[] = [];
-  let left = notional;
-  while (left > cap && parts.length < 3) {
-    parts.push(cap);
-    left -= cap;
-  }
-  if (left > 0) parts.push(left);
-  return parts;
+function strikeTier(notional: number): StrikeTier {
+  if (notional >= LIQ_BOMB_USD) return "bomb";
+  if (notional >= LIQ_STRIKE_USD) return "strike";
+  return "burst";
 }
 
 export class Battle {
   units: Unit[] = [];
-  particles: Particle[] = [];
-  shocks: Shock[] = [];
-  pulses: Pulse[] = [];
-  frontX = 0.5;
+  strikes: Strike[] = [];
+  bits: Bit[] = [];
+  columns: BookColumn[] = [];
+  feed: FeedLine[] = [];
   price: number | null = null;
   funding: number | null = null;
-  wind = 0;
-  punch = 0;
-  thump = 0;
+  oiUsd: number | null = null;
   pressureLong = 0;
   pressureShort = 0;
   sawFlow = false;
-  ledgerIndex: number | null = null;
+  round: Round | null = null;
+  banner: { text: string; side: Side; life: number } | null = null;
+  shake = 0;
+  pulse = -1;
+  link: LinkStatus = { state: "connecting", detail: "connecting", retryInMs: null };
+  winsLong = 0;
+  winsShort = 0;
 
-  private anchor: number | null = null;
-  private priceShift = 0;
-  private shove = 0;
-  private windTarget = 0;
-  private lane = 0;
-  private pend = {
-    long: 0,
-    short: 0,
-    longLev: null as number | null,
-    shortLev: null as number | null,
-    age: 0,
-  };
+  private bids = new Map<number, number>();
+  private asks = new Map<number, number>();
+  private bucket = { long: 0, short: 0, age: 0 };
+  private prices: Sample[] = [];
+  private liqs: Sample[] = [];
+  private artilleryAt = { long: -10, short: -10 };
+  private clock = 0;
+  private roundBorn = 0;
+  private bookDirty = true;
 
-  addTrade(side: Side, notional: number, leverage: number | null): void {
-    if (!(notional > 0)) return;
+  setLink(status: LinkStatus): void {
+    this.link = status;
+  }
+
+  addTrade(side: Side, notional: number, price: number): void {
+    if (!(notional > 0) || !(price > 0)) return;
     this.sawFlow = true;
+    this.notePrice(price, true);
     if (side === "long") this.pressureLong += notional;
     else this.pressureShort += notional;
     this.damage(opposite(side), notional);
-    if (notional >= 25_000) {
-      this.materialize(side, notional, leverage);
+    if (notional >= FEED_TRADE_USD) {
+      const label = side === "long" ? "BUY" : "SELL";
+      this.pushFeed(`${label} ${formatUsd(notional)}`, side);
+    }
+    if (notional >= TANK_USD) {
+      this.spawn(side, notional, this.kindFor(side, notional));
       return;
     }
-    if (side === "long") {
-      this.pend.long += notional;
-      this.pend.longLev = maxLev(this.pend.longLev, leverage);
-    } else {
-      this.pend.short += notional;
-      this.pend.shortLev = maxLev(this.pend.shortLev, leverage);
-    }
+    if (side === "long") this.bucket.long += notional;
+    else this.bucket.short += notional;
   }
 
-  setMark(price: number, funding: number): void {
-    if (!(price > 0) || !Number.isFinite(funding)) return;
-    this.price = price;
-    this.funding = funding;
-    if (this.anchor == null) this.anchor = price;
-    // Positive funding: longs pay. Wind blows against them, toward the left.
-    this.windTarget = clamp(funding / 0.0003, -1, 1);
-  }
-
-  liquidate(side: Side, notional: number, leverage: number | null): void {
+  addLiquidation(side: Side, notional: number): void {
     if (!(notional > 0)) return;
     this.sawFlow = true;
-    let best: Unit | null = null;
-    let bestScore = Infinity;
-    for (const unit of this.units) {
-      if (unit.side !== side || unit.state === "dead" || unit.state === "dying") {
-        continue;
-      }
-      const score = Math.abs(
-        Math.log(Math.max(unit.notional, 1)) - Math.log(notional),
-      );
-      if (score < bestScore) {
-        best = unit;
-        bestScore = score;
-      }
+    this.liqs.push({ t: this.clock, v: notional });
+    const tier = strikeTier(notional);
+    const x = this.strikeX(side);
+    const life = tier === "bomb" ? 0.85 : tier === "strike" ? 0.55 : 0.32;
+    this.strikes.push({ side, tier, x, life, max: life });
+    this.burstBits(x, side, tier);
+    this.shake = Math.max(this.shake, tier === "bomb" ? 0.4 : tier === "strike" ? 0.22 : 0.1);
+    if (tier !== "burst") {
+      const who = side === "long" ? "LONG" : "SHORT";
+      const tag = tier === "bomb" ? "BOMB" : "STRIKE";
+      this.pushFeed(`${tag} ${who} ${formatUsd(notional)}`, side);
     }
-    const x = best
-      ? best.x
-      : side === "long"
-        ? Math.max(0.05, this.frontX - 0.04)
-        : Math.min(0.95, this.frontX + 0.04);
-    const y = best ? best.y : 0.5;
-    if (best) {
-      best.state = "dead";
-      best.health = 0;
-      if (leverage != null) best.leverage = leverage;
-    }
-    this.burst(x, y, side, notional);
-    const mag = clamp(0.02 + Math.log10(Math.max(notional, 10)) * 0.016, 0.02, 0.11);
-    this.shove += side === "long" ? -mag : mag;
-    this.punch = Math.min(
-      1,
-      this.punch + 0.45 + Math.min(0.55, Math.log10(Math.max(notional, 10)) / 8),
-    );
+    if (this.hotLiq()) this.spawnArtillery(opposite(side), Math.max(notional, TANK_USD));
+    this.damage(side, notional);
   }
 
-  ledger(index: number): void {
-    if (!(index > 0)) return;
-    this.ledgerIndex = index;
-    this.thump = 1;
-    this.pulses.push({ x: -0.08 });
+  applyTicker(patch: {
+    lastPrice: number | null;
+    markPrice: number | null;
+    fundingRate: number | null;
+    openInterestValue: number | null;
+  }): void {
+    if (patch.fundingRate != null) this.funding = patch.fundingRate;
+    if (patch.openInterestValue != null && patch.openInterestValue > 0) {
+      this.oiUsd = patch.openInterestValue;
+    }
+    if (this.round == null) {
+      const seed = patch.lastPrice ?? patch.markPrice;
+      if (seed != null && seed > 0) this.price = seed;
+    }
+  }
+
+  applyBook(
+    type: "snapshot" | "delta",
+    bids: [number, number][],
+    asks: [number, number][],
+  ): void {
+    if (type === "snapshot") {
+      this.bids.clear();
+      this.asks.clear();
+    }
+    this.writeLevels(this.bids, bids);
+    this.writeLevels(this.asks, asks);
+    this.bookDirty = true;
+  }
+
+  pulseLedger(): void {
+    this.pulse = 0;
   }
 
   update(dt: number): void {
     if (!(dt > 0)) return;
     const step = Math.min(dt, 0.05);
-
-    this.wind += (this.windTarget - this.wind) * (1 - Math.exp(-step / 0.6));
-    if (this.anchor != null && this.price != null) {
-      const follow = 1 - Math.exp(-step / 40);
-      this.anchor += (this.price - this.anchor) * follow;
-      const rel = (this.price - this.anchor) / this.anchor;
-      this.priceShift = clamp((rel / 0.004) * 0.22, -0.26, 0.26);
-    }
-    this.shove *= Math.exp(-step / 2.4);
-    this.frontX = clamp(0.5 + this.priceShift + this.shove, 0.16, 0.84);
-
+    this.clock += step;
     const decay = Math.exp(-step / 14);
     this.pressureLong *= decay;
     this.pressureShort *= decay;
-
-    this.pend.age += step;
+    this.bucket.age += step;
     this.flush("long");
     this.flush("short");
-    if (this.pend.long <= 0 && this.pend.short <= 0) this.pend.age = 0;
+    if (this.bucket.long <= 0 && this.bucket.short <= 0) this.bucket.age = 0;
+    this.move(step);
+    this.trimDead();
+    this.strikes = this.strikes.filter((strike) => {
+      strike.life -= step;
+      return strike.life > 0;
+    });
+    for (const bit of this.bits) {
+      bit.life -= step;
+      bit.x += bit.vx * step;
+      bit.y += bit.vy * step;
+      bit.vy += 0.35 * step;
+    }
+    this.bits = this.bits.filter((bit) => bit.life > 0).slice(-240);
+    if (this.pulse >= 0) {
+      this.pulse += step * 0.85;
+      if (this.pulse > 1.05) this.pulse = -1;
+    }
+    this.shake = Math.max(0, this.shake - step);
+    if (this.banner) {
+      this.banner.life -= step;
+      if (this.banner.life <= 0) this.banner = null;
+    }
+    this.prices = this.prices.filter((sample) => this.clock - sample.t < 8);
+    this.liqs = this.liqs.filter((sample) => this.clock - sample.t < 10);
+    if (this.bookDirty) {
+      this.rebuildColumns();
+      this.bookDirty = false;
+    }
+  }
 
-    this.moveUnits(step);
-    this.separate();
-    for (const unit of this.units) {
-      unit.y = clamp(unit.y, 0.07, 0.93);
-      unit.x = clamp(unit.x, 0.01, 0.99);
-    }
+  readout(): string {
+    const price = this.price == null ? "PRICE --" : `PRICE ${this.price.toFixed(4)}`;
+    const latest = this.feed[0]?.text ?? "FEED EMPTY";
+    const banner = this.banner ? ` BANNER ${this.banner.text}` : "";
+    return `${this.statusText()} | ${price} | UNITS ${this.units.length} | ${latest}${banner}`;
+  }
 
-    for (const particle of this.particles) {
-      particle.life -= step;
-      particle.x += particle.vx * step;
-      particle.y += particle.vy * step;
-      particle.vx *= Math.exp(-step * 1.4);
-      particle.vy *= Math.exp(-step * 1.4);
-    }
-    if (this.particles.some((particle) => particle.life <= 0)) {
-      this.particles = this.particles.filter((particle) => particle.life > 0);
-    }
-    if (this.particles.length > MAX_PARTICLES) {
-      this.particles.splice(0, this.particles.length - MAX_PARTICLES);
-    }
+  statusText(): string {
+    const status = this.link;
+    if (status.state === "live") return "BYBIT LIVE";
+    if (status.state === "connecting") return "BYBIT CONNECTING";
+    if (status.state === "blocked") return "BYBIT BLOCKED";
+    const retry =
+      status.retryInMs == null ? "" : ` RETRY ${Math.ceil(status.retryInMs / 1000)}S`;
+    return `BYBIT DOWN${retry}`;
+  }
 
-    for (const shock of this.shocks) {
-      shock.life -= step;
-      const k = 1 - shock.life / shock.maxLife;
-      shock.r = shock.max * Math.max(0, k);
+  private notePrice(price: number, fromTrade: boolean): void {
+    this.price = price;
+    if (fromTrade) this.prices.push({ t: this.clock, v: price });
+    if (!this.round) {
+      this.openRound(price);
+      return;
     }
-    if (this.shocks.some((shock) => shock.life <= 0)) {
-      this.shocks = this.shocks.filter((shock) => shock.life > 0);
-    }
+    if (this.banner || this.clock - this.roundBorn < 2) return;
+    if (price >= this.round.high) this.win("long");
+    else if (price <= this.round.low) this.win("short");
+  }
 
-    for (const pulse of this.pulses) pulse.x += step * 0.72;
-    if (this.pulses.some((pulse) => pulse.x > 1.15)) {
-      this.pulses = this.pulses.filter((pulse) => pulse.x <= 1.15);
-    }
+  private openRound(price: number): void {
+    const pad = price * RANGE_FRAC;
+    this.round = { low: price - pad, high: price + pad };
+    this.roundBorn = this.clock;
+    this.bookDirty = true;
+  }
 
-    this.thump *= Math.exp(-step / 0.7);
-    this.punch *= Math.exp(-step / 0.16);
+  private win(side: Side): void {
+    if (!this.price) return;
+    const text = side === "long" ? "LONGS TAKE THE RANGE" : "SHORTS TAKE THE RANGE";
+    this.banner = { text, side, life: 3.2 };
+    this.pushFeed(text, side);
+    if (side === "long") this.winsLong += 1;
+    else this.winsShort += 1;
+    this.units = [];
+    this.strikes = [];
+    this.bits = [];
+    this.openRound(this.price);
+  }
 
-    if (this.units.some((unit) => unit.state === "dead")) {
-      this.units = this.units.filter((unit) => unit.state !== "dead");
+  frontT(): number {
+    if (!this.price || !this.round) return 0.5;
+    const span = this.round.high - this.round.low;
+    if (!(span > 0)) return 0.5;
+    return clamp((this.price - this.round.low) / span, 0, 1);
+  }
+
+  private kindFor(side: Side, notional: number): UnitKind {
+    if (notional >= TANK_USD && this.hotVol()) {
+      this.artilleryAt[side] = this.clock;
+      return "artillery";
     }
+    return "tank";
+  }
+
+  private hotVol(): boolean {
+    if (!this.price || this.prices.length < 2) return false;
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const sample of this.prices) {
+      if (sample.v < lo) lo = sample.v;
+      if (sample.v > hi) hi = sample.v;
+    }
+    return (hi - lo) / this.price >= 0.0008;
+  }
+
+  private hotLiq(): boolean {
+    let sum = 0;
+    for (const sample of this.liqs) sum += sample.v;
+    return sum >= 15000;
+  }
+
+  private spawnArtillery(side: Side, notional: number): void {
+    if (this.clock - this.artilleryAt[side] < 3) return;
+    this.artilleryAt[side] = this.clock;
+    this.spawn(side, notional, "artillery");
   }
 
   private flush(side: Side): void {
-    const amount = side === "long" ? this.pend.long : this.pend.short;
+    const amount = side === "long" ? this.bucket.long : this.bucket.short;
     if (amount <= 0) return;
-    const ready = amount >= 50 || this.pend.age >= 0.7;
+    const ready = amount >= INFANTRY_USD || this.bucket.age >= 0.45;
     if (!ready) return;
-    const leverage = side === "long" ? this.pend.longLev : this.pend.shortLev;
-    if (side === "long") {
-      this.pend.long = 0;
-      this.pend.longLev = null;
+    if (side === "long") this.bucket.long = 0;
+    else this.bucket.short = 0;
+    const kind: UnitKind = amount >= TANK_USD ? this.kindFor(side, amount) : "infantry";
+    this.spawn(side, amount, kind);
+  }
+
+  private spawn(side: Side, notional: number, kind: UnitKind): void {
+    const front = this.frontT();
+    const young = this.units.find(
+      (unit) =>
+        unit.side === side &&
+        unit.kind === kind &&
+        unit.age < 0.22 &&
+        unit.state === "march" &&
+        notional < FEED_TRADE_USD,
+    );
+    if (young) {
+      young.health += notional;
+      young.notional += notional;
+      young.flash = 0.15;
+      return;
+    }
+    const lane = Math.random();
+    let x = front;
+    if (kind === "artillery") {
+      x = side === "long" ? 0.08 + Math.random() * 0.08 : 0.84 + Math.random() * 0.08;
+    } else if (kind === "tank") {
+      const back = 0.08 + Math.random() * 0.08;
+      x = side === "long" ? Math.max(0.08, front - back) : Math.min(0.92, front + back);
     } else {
-      this.pend.short = 0;
-      this.pend.shortLev = null;
+      const back = 0.025 + Math.random() * 0.05;
+      x = side === "long" ? Math.max(0.1, front - back) : Math.min(0.9, front + back);
     }
-    this.materialize(side, amount, leverage);
-  }
-
-  private materialize(side: Side, notional: number, leverage: number | null): void {
-    for (const part of chunks(notional)) {
-      const host = this.countYoung(side) >= 6 ? this.youngestMarching(side) : null;
-      if (host) {
-        host.notional += part;
-        host.health += part;
-        host.leverage = maxLev(host.leverage, leverage);
-        continue;
-      }
-      this.units.push(this.makeUnit(side, part, leverage));
-    }
-    this.trim();
-  }
-
-  private makeUnit(side: Side, notional: number, leverage: number | null): Unit {
-    this.lane += 1;
-    const y = 0.1 + ((this.lane * 0.381966) % 1) * 0.8;
-    return {
+    this.units.push({
       side,
-      x: side === "long" ? 0.018 + Math.random() * 0.04 : 0.982 - Math.random() * 0.04,
-      y,
+      kind,
+      x,
+      lane,
       health: notional,
       notional,
-      leverage,
-      phase: Math.random() * Math.PI * 2,
-      speed: 0.055 + Math.random() * 0.035,
-      depth: 0.012 + Math.random() * 0.055,
-      state: "march",
+      state: kind === "artillery" ? "hold" : "march",
       die: 0,
-    };
-  }
-
-  private countYoung(side: Side): number {
-    let count = 0;
-    for (const unit of this.units) {
-      if (unit.side === side && unit.state === "march" && unit.x < 0.12) count += 1;
-      else if (unit.side === side && unit.state === "march" && unit.x > 0.88) count += 1;
+      flash: notional >= FEED_TRADE_USD ? 0.45 : 0.12,
+      age: 0,
+    });
+    if (this.units.length > MAX_UNITS) {
+      const ranked = [...this.units].sort((a, b) => a.health - b.health);
+      const drop = new Set(ranked.slice(0, this.units.length - MAX_UNITS));
+      this.units = this.units.filter((unit) => !drop.has(unit));
     }
-    return count;
   }
 
-  private youngestMarching(side: Side): Unit | null {
-    let host: Unit | null = null;
+  private move(dt: number): void {
+    const front = this.frontT();
     for (const unit of this.units) {
-      if (unit.side !== side || unit.state !== "march") continue;
-      const nearEdge =
-        side === "long" ? unit.x < 0.2 : unit.x > 0.8;
-      if (!nearEdge) continue;
-      host = unit;
-    }
-    return host;
-  }
-
-  private moveUnits(dt: number): void {
-    for (const unit of this.units) {
+      unit.age += dt;
+      unit.flash = Math.max(0, unit.flash - dt);
       if (unit.state === "dying") {
         unit.die -= dt;
-        if (unit.die <= 0) unit.state = "dead";
         continue;
       }
-      if (unit.state === "dead") continue;
-
-      const head =
-        unit.side === "long" ? Math.max(this.wind, 0) : Math.max(-this.wind, 0);
-      const speed = unit.speed * (1 - head * 0.75);
-      const dir = unit.side === "long" ? 1 : -1;
-      if (unit.state === "march") {
-        unit.x += dir * speed * dt;
-        unit.phase += dt * 7;
+      if (unit.kind === "artillery") {
+        const park = unit.side === "long" ? 0.12 : 0.88;
+        unit.x += (park - unit.x) * Math.min(1, dt * 2);
+        continue;
       }
-
-      const limit =
-        unit.side === "long" ? this.frontX - unit.depth : this.frontX + unit.depth;
-      const reached = unit.side === "long" ? unit.x >= limit : unit.x <= limit;
+      const speed = (unit.kind === "tank" ? 0.07 : 0.11) * dt;
+      if (unit.side === "long") unit.x += speed;
+      else unit.x -= speed;
+      const holdAt = unit.side === "long" ? front - 0.02 : front + 0.02;
+      const reached = unit.side === "long" ? unit.x >= holdAt : unit.x <= holdAt;
       if (reached) {
-        unit.x = limit;
+        unit.x = holdAt;
         unit.state = "hold";
+      } else if (unit.state === "hold") {
+        const gap = unit.side === "long" ? front - unit.x : unit.x - front;
+        if (gap > 0.08) unit.state = "march";
       }
-
-      if (unit.state === "hold") {
-        const target =
-          unit.side === "long" ? this.frontX - unit.depth : this.frontX + unit.depth;
-        unit.x += (target - unit.x) * Math.min(1, dt * 3);
-        const push =
-          unit.side === "long" ? -Math.max(this.wind, 0) : Math.max(-this.wind, 0);
-        unit.x += push * 0.02 * dt;
-        const gap = unit.side === "long" ? this.frontX - unit.x : unit.x - this.frontX;
-        if (gap > unit.depth + 0.08) unit.state = "march";
-      }
-
-      unit.y = clamp(unit.y, 0.07, 0.93);
-      unit.x = clamp(unit.x, 0.01, 0.99);
-    }
-  }
-
-  private separate(): void {
-    const held = this.units.filter((unit) => unit.state === "hold");
-    const min = 0.02;
-    for (let i = 0; i < held.length; i += 1) {
-      const a = held[i];
-      if (!a) continue;
-      for (let j = i + 1; j < held.length; j += 1) {
-        const b = held[j];
-        if (!b || a.side !== b.side) continue;
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 <= 0 || d2 >= min * min) continue;
-        const d = Math.sqrt(d2);
-        const push = (min - d) * 0.3;
-        const uy = (dy / d) * push;
-        a.y += uy;
-        b.y -= uy;
-      }
+      unit.x = clamp(unit.x, 0.04, 0.96);
     }
   }
 
   private damage(side: Side, amount: number): void {
     const foes = this.units.filter(
-      (unit) =>
-        unit.side === side &&
-        (unit.state === "march" || unit.state === "hold") &&
-        unit.health > 0,
+      (unit) => unit.side === side && unit.state !== "dying" && unit.health > 0,
     );
-    if (!foes.length) return;
+    if (!foes.length || !(amount > 0)) return;
+    const front = this.frontT();
     let sum = 0;
     const weights = foes.map((unit) => {
-      const dist = Math.abs(unit.x - this.frontX);
-      const weight = Math.max(unit.health, 1) / (0.03 + dist);
+      const weight = Math.max(unit.health, 1) / (0.03 + Math.abs(unit.x - front));
       sum += weight;
       return weight;
     });
@@ -387,76 +414,122 @@ export class Battle {
       const weight = weights[i];
       if (!foe || weight == null || sum <= 0) continue;
       foe.health -= amount * (weight / sum);
-      if (foe.health <= 0) this.wearOut(foe);
+      if (foe.health <= 0) {
+        foe.health = 0;
+        foe.state = "dying";
+        foe.die = 0.25;
+        this.puff(foe.x, foe.side);
+      }
     }
   }
 
-  private wearOut(unit: Unit): void {
-    if (unit.state === "dying" || unit.state === "dead") return;
-    unit.health = 0;
-    unit.state = "dying";
-    unit.die = 0.45;
-    this.puff(unit.x, unit.y, unit.side, 7);
+  private strikeX(side: Side): number {
+    const front = this.frontT();
+    const mates = this.units.filter((unit) => unit.side === side && unit.state !== "dying");
+    if (mates.length) {
+      const pick = mates[Math.floor(Math.random() * mates.length)];
+      if (pick) return pick.x;
+    }
+    return side === "long" ? Math.max(0.08, front - 0.06) : Math.min(0.92, front + 0.06);
   }
 
-  private puff(x: number, y: number, side: Side, count: number): void {
-    const color = side === "long" ? [62, 224, 197] : [255, 91, 61];
+  private burstBits(x: number, side: Side, tier: StrikeTier): void {
+    const count = tier === "bomb" ? 28 : tier === "strike" ? 14 : 7;
     for (let i = 0; i < count; i += 1) {
-      const angle = Math.random() * Math.PI * 2;
-      const speed = 0.02 + Math.random() * 0.06;
-      const life = 0.25 + Math.random() * 0.35;
-      this.particles.push({
+      const life = 0.25 + Math.random() * 0.45;
+      this.bits.push({
         x,
-        y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
+        y: 0.62 + Math.random() * 0.08,
+        vx: (Math.random() - 0.5) * (tier === "bomb" ? 0.45 : 0.22),
+        vy: -0.05 - Math.random() * 0.2,
         life,
         max: life,
-        size: 1.2 + Math.random() * 1.8,
-        r: color[0] ?? 255,
-        g: color[1] ?? 255,
-        b: color[2] ?? 255,
+        tone: i % 3 === 0 ? "gold" : i % 3 === 1 ? "bone" : side,
       });
     }
   }
 
-  private burst(x: number, y: number, side: Side, notional: number): void {
-    const count = clamp(Math.round(24 + Math.log10(notional) * 18), 22, 96);
-    const color = side === "long" ? [62, 224, 197] : [255, 91, 61];
-    for (let i = 0; i < count; i += 1) {
-      const angle = Math.random() * Math.PI * 2;
-      const speed = 0.08 + Math.random() * 0.42;
-      const life = 0.35 + Math.random() * 0.75;
-      const hot = i % 4 === 0;
-      this.particles.push({
+  private puff(x: number, side: Side): void {
+    for (let i = 0; i < 4; i += 1) {
+      const life = 0.2;
+      this.bits.push({
         x,
-        y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
+        y: 0.66,
+        vx: (Math.random() - 0.5) * 0.08,
+        vy: -0.04,
         life,
         max: life,
-        size: 1.6 + Math.random() * 3.4,
-        r: hot ? 255 : (color[0] ?? 255),
-        g: hot ? 244 : (color[1] ?? 255),
-        b: hot ? 226 : (color[2] ?? 255),
+        tone: side,
       });
     }
-    const maxLife = 0.55;
-    this.shocks.push({
-      x,
-      y,
-      r: 0,
-      max: 0.18 + Math.min(0.32, Math.log10(Math.max(notional, 10)) / 14),
-      life: maxLife,
-      maxLife,
-      side,
-    });
   }
 
-  private trim(): void {
-    if (this.units.length <= MAX_UNITS) return;
-    const ranked = [...this.units].sort((a, b) => a.health - b.health);
-    const drop = new Set(ranked.slice(0, this.units.length - MAX_UNITS));
-    this.units = this.units.filter((unit) => !drop.has(unit));
+  private trimDead(): void {
+    if (!this.units.some((unit) => unit.state === "dying" && unit.die <= 0)) return;
+    this.units = this.units.filter((unit) => !(unit.state === "dying" && unit.die <= 0));
+  }
+
+  private writeLevels(book: Map<number, number>, rows: [number, number][]): void {
+    for (const [price, size] of rows) {
+      if (size <= 0) book.delete(price);
+      else book.set(price, size);
+    }
+  }
+
+  private rebuildColumns(): void {
+    const round = this.round;
+    const price = this.price;
+    if (!round || price == null) {
+      this.columns = [];
+      return;
+    }
+    const bins = 12;
+    const bidBins = new Array<number>(bins).fill(0);
+    const askBins = new Array<number>(bins).fill(0);
+    const bidSpan = Math.max(price - round.low, price * 0.0001);
+    const askSpan = Math.max(round.high - price, price * 0.0001);
+    for (const [level, qty] of this.bids) {
+      if (level < round.low || level > price) continue;
+      const t = (level - round.low) / bidSpan;
+      const index = Math.min(bins - 1, Math.max(0, Math.floor(t * bins)));
+      const bin = bidBins[index] ?? 0;
+      bidBins[index] = bin + level * qty;
+    }
+    for (const [level, qty] of this.asks) {
+      if (level < price || level > round.high) continue;
+      const t = (level - price) / askSpan;
+      const index = Math.min(bins - 1, Math.max(0, Math.floor(t * bins)));
+      const bin = askBins[index] ?? 0;
+      askBins[index] = bin + level * qty;
+    }
+    let max = 1;
+    for (const value of bidBins) if (value > max) max = value;
+    for (const value of askBins) if (value > max) max = value;
+    const columns: BookColumn[] = [];
+    const front = this.frontT();
+    for (let i = 0; i < bins; i += 1) {
+      const bid = bidBins[i] ?? 0;
+      const ask = askBins[i] ?? 0;
+      if (bid > 0) {
+        columns.push({
+          side: "long",
+          t: (front * i) / bins,
+          weight: Math.log10(bid + 10) / Math.log10(max + 10),
+        });
+      }
+      if (ask > 0) {
+        columns.push({
+          side: "short",
+          t: front + ((1 - front) * (i + 1)) / bins,
+          weight: Math.log10(ask + 10) / Math.log10(max + 10),
+        });
+      }
+    }
+    this.columns = columns;
+  }
+
+  private pushFeed(text: string, tone: FeedLine["tone"]): void {
+    this.feed.unshift({ text, tone });
+    if (this.feed.length > 4) this.feed.length = 4;
   }
 }

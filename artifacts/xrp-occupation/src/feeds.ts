@@ -1,124 +1,57 @@
-import {
-  binanceRestricted,
-  isLedgerSubscribeAck,
-  parseBinanceMessage,
-  parseLedgerClose,
-  readOpenInterest,
-  type MarketEvent,
-} from "./parse";
 import { startSocket, type LinkStatus } from "./net";
+import {
+  isLedgerSubscribeAck,
+  parseBybit,
+  parseLedgerClose,
+  type BybitEvent,
+} from "./parse";
 
-const BINANCE_WS =
-  "wss://fstream.binance.com/stream?streams=xrpusdt@aggTrade/xrpusdt@markPrice@1s/xrpusdt@forceOrder";
+const BYBIT_URL = "wss://stream.bybit.com/v5/public/linear";
+const BYBIT_TOPICS = [
+  "publicTrade.XRPUSDT",
+  "orderbook.50.XRPUSDT",
+  "allLiquidation.XRPUSDT",
+  "tickers.XRPUSDT",
+];
 
-const OPEN_INTEREST_URL =
-  "https://fapi.binance.com/fapi/v1/openInterest?symbol=XRPUSDT";
-
-const OPEN_INTEREST_DEV_PROXY =
-  "/__binance/fapi/v1/openInterest?symbol=XRPUSDT";
-
-const XRPL_URLS = ["wss://xrplcluster.com", "wss://s2.ripple.com"] as const;
-
-export interface OpenInterestUpdate {
-  xrp: number | null;
-  ok: boolean;
-  blocked: boolean;
-  detail: string;
-}
-
-async function readInterest(url: string): Promise<OpenInterestUpdate | "throw"> {
-  const res = await fetch(url, {
-    cache: "no-store",
-    signal: AbortSignal.timeout(8000),
-  });
-  const text = await res.text();
-  let body: unknown = null;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    body = null;
-  }
-  if (res.status === 451 || binanceRestricted(body, text)) {
-    return {
-      xrp: null,
-      ok: false,
-      blocked: true,
-      detail: "restricted location",
-    };
-  }
-  if (!res.ok) {
-    return {
-      xrp: null,
-      ok: false,
-      blocked: false,
-      detail: `HTTP ${res.status}`,
-    };
-  }
-  const xrp = readOpenInterest(body);
-  if (xrp == null) {
-    return {
-      xrp: null,
-      ok: false,
-      blocked: false,
-      detail: "unexpected payload",
-    };
-  }
-  return { xrp, ok: true, blocked: false, detail: "live" };
-}
-
-export async function fetchOpenInterest(): Promise<OpenInterestUpdate> {
-  // Dev/preview proxy first so a 451 from fapi.binance.com is readable.
-  // The proxy target is that same public URL. Direct fetch is the fallback.
-  const urls = [OPEN_INTEREST_DEV_PROXY, OPEN_INTEREST_URL];
-  let last = "unreachable";
-  for (const url of urls) {
-    try {
-      const result = await readInterest(url);
-      if (result === "throw") continue;
-      if (result.blocked || result.ok) return result;
-      last = result.detail;
-    } catch {
-      last = "unreachable";
-    }
-  }
-  return { xrp: null, ok: false, blocked: false, detail: last };
-}
-
-export function startBinance(handlers: {
-  onEvent: (event: MarketEvent) => void;
-  onOpenInterest: (update: OpenInterestUpdate) => void;
+export function startBybit(handlers: {
+  onEvent: (event: BybitEvent) => void;
   onStatus: (status: LinkStatus) => void;
 }): { stop: () => void } {
+  let ping = 0;
   const socket = startSocket({
-    urls: [BINANCE_WS],
+    urls: [BYBIT_URL],
     timeoutMs: 8000,
-    staleMs: 12000,
-    onOpen: () => {},
+    staleMs: 20000,
+    onOpen: (ws) => {
+      window.clearInterval(ping);
+      ws.send(JSON.stringify({ op: "subscribe", args: BYBIT_TOPICS }));
+      ping = window.setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ op: "ping" }));
+        }
+      }, 15000);
+    },
     onMessage: (raw) => {
-      const event = parseBinanceMessage(raw);
-      if (!event) return false;
-      handlers.onEvent(event);
+      const events = parseBybit(raw);
+      if (!events.length) {
+        try {
+          const msg = JSON.parse(raw) as { op?: string; success?: boolean };
+          if (msg.op === "pong" || msg.op === "ping") return true;
+          if (msg.op === "subscribe") return msg.success !== false;
+        } catch {
+          return false;
+        }
+        return false;
+      }
+      for (const event of events) handlers.onEvent(event);
       return true;
     },
     onStatus: handlers.onStatus,
   });
-
-  let stopped = false;
-  const poll = async () => {
-    while (!stopped) {
-      const update = await fetchOpenInterest();
-      if (stopped) return;
-      if (update.ok) socket.clearBlocked();
-      else if (update.blocked) socket.markBlocked(update.detail);
-      handlers.onOpenInterest(update);
-      await new Promise((resolve) => window.setTimeout(resolve, 5000));
-    }
-  };
-  void poll();
-
   return {
     stop() {
-      stopped = true;
+      window.clearInterval(ping);
       socket.stop();
     },
   };
@@ -126,10 +59,9 @@ export function startBinance(handlers: {
 
 export function startXrpl(handlers: {
   onLedger: (index: number) => void;
-  onStatus: (status: LinkStatus) => void;
 }): { stop: () => void } {
   const socket = startSocket({
-    urls: XRPL_URLS,
+    urls: ["wss://xrplcluster.com", "wss://s2.ripple.com"],
     timeoutMs: 8000,
     staleMs: 20000,
     onOpen: (ws) => {
@@ -143,7 +75,7 @@ export function startXrpl(handlers: {
       }
       return isLedgerSubscribeAck(raw);
     },
-    onStatus: handlers.onStatus,
+    onStatus: () => {},
   });
   return { stop: () => socket.stop() };
 }

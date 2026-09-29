@@ -1,21 +1,26 @@
 export type Side = "long" | "short";
 
-export type MarketEvent =
+export type BybitEvent =
+  | { kind: "trade"; side: Side; notional: number; price: number }
+  | { kind: "liq"; side: Side; notional: number }
   | {
-      type: "trade";
-      side: Side;
-      notional: number;
-      price: number;
-      leverage: number | null;
+      kind: "ticker";
+      lastPrice: number | null;
+      markPrice: number | null;
+      fundingRate: number | null;
+      openInterest: number | null;
+      openInterestValue: number | null;
     }
-  | { type: "mark"; price: number; funding: number }
   | {
-      type: "liquidation";
-      side: Side;
-      notional: number;
-      price: number;
-      leverage: number | null;
+      kind: "book";
+      type: "snapshot" | "delta";
+      bids: [number, number][];
+      asks: [number, number][];
     };
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
 
 function num(v: unknown): number | null {
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -26,86 +31,94 @@ function num(v: unknown): number | null {
   return null;
 }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
-}
-
-function isXrp(v: unknown): boolean {
-  return typeof v === "string" && v.toUpperCase() === "XRPUSDT";
-}
-
-function leverageOf(obj: Record<string, unknown>): number | null {
-  for (const key of ["leverage", "lvg"]) {
-    const n = num(obj[key]);
-    if (n != null && n > 0 && n <= 200) return n;
+function levels(v: unknown): [number, number][] {
+  if (!Array.isArray(v)) return [];
+  const out: [number, number][] = [];
+  for (const row of v) {
+    if (!Array.isArray(row) || row.length < 2) continue;
+    const price = num(row[0]);
+    const size = num(row[1]);
+    if (price == null || size == null || price <= 0 || size < 0) continue;
+    out.push([price, size]);
   }
+  return out;
+}
+
+function tradeSide(v: unknown): Side | null {
+  if (v === "Buy") return "long";
+  if (v === "Sell") return "short";
   return null;
 }
 
-function unwrap(msg: unknown): Record<string, unknown> | null {
-  if (!isRecord(msg)) return null;
-  if (isRecord(msg.data)) return msg.data;
-  if (typeof msg.e === "string") return msg;
-  return null;
-}
-
-function parseTrade(data: Record<string, unknown>): MarketEvent | null {
-  if (!isXrp(data.s)) return null;
-  const price = num(data.p);
-  const qty = num(data.q);
-  if (price == null || qty == null || price <= 0 || qty <= 0) return null;
-  if (typeof data.m !== "boolean") return null;
-  // m: buyer is the market maker. True means the taker sold.
-  const side: Side = data.m ? "short" : "long";
-  return {
-    type: "trade",
-    side,
-    notional: price * qty,
-    price,
-    leverage: leverageOf(data),
-  };
-}
-
-function parseMark(data: Record<string, unknown>): MarketEvent | null {
-  if (!isXrp(data.s)) return null;
-  const price = num(data.p);
-  const funding = num(data.r);
-  if (price == null || price <= 0 || funding == null) return null;
-  return { type: "mark", price, funding };
-}
-
-function parseLiquidation(data: Record<string, unknown>): MarketEvent | null {
-  if (!isRecord(data.o)) return null;
-  const order = data.o;
-  if (!isXrp(order.s)) return null;
-  if (order.S !== "BUY" && order.S !== "SELL") return null;
-  // SELL is a forced close of a long. BUY is a forced close of a short.
-  const side: Side = order.S === "SELL" ? "long" : "short";
-  const price = num(order.ap) ?? num(order.p);
-  const qty = num(order.z) ?? num(order.q);
-  if (price == null || qty == null || price <= 0 || qty <= 0) return null;
-  return {
-    type: "liquidation",
-    side,
-    notional: price * qty,
-    price,
-    leverage: leverageOf(order) ?? leverageOf(data),
-  };
-}
-
-export function parseBinanceMessage(raw: string): MarketEvent | null {
+export function parseBybit(raw: string): BybitEvent[] {
   let msg: unknown;
   try {
     msg = JSON.parse(raw);
   } catch {
-    return null;
+    return [];
   }
-  const data = unwrap(msg);
-  if (!data || typeof data.e !== "string") return null;
-  if (data.e === "aggTrade") return parseTrade(data);
-  if (data.e === "markPriceUpdate") return parseMark(data);
-  if (data.e === "forceOrder") return parseLiquidation(data);
-  return null;
+  if (!isRecord(msg)) return [];
+  if (msg.op === "pong" || msg.op === "ping" || msg.op === "subscribe") return [];
+  if (typeof msg.topic !== "string") return [];
+
+  if (msg.topic === "publicTrade.XRPUSDT" && Array.isArray(msg.data)) {
+    const events: BybitEvent[] = [];
+    for (const row of msg.data) {
+      if (!isRecord(row)) continue;
+      const side = tradeSide(row.S);
+      const price = num(row.p);
+      const qty = num(row.v);
+      if (!side || price == null || qty == null || price <= 0 || qty <= 0) continue;
+      events.push({ kind: "trade", side, notional: price * qty, price });
+    }
+    return events;
+  }
+
+  if (msg.topic === "allLiquidation.XRPUSDT" && Array.isArray(msg.data)) {
+    const events: BybitEvent[] = [];
+    for (const row of msg.data) {
+      if (!isRecord(row) || row.s !== "XRPUSDT") continue;
+      // Bybit position side: Buy means a long was liquidated.
+      const side: Side | null =
+        row.S === "Buy" ? "long" : row.S === "Sell" ? "short" : null;
+      const price = num(row.p);
+      const qty = num(row.v);
+      if (!side || price == null || qty == null || price <= 0 || qty <= 0) continue;
+      events.push({ kind: "liq", side, notional: price * qty });
+    }
+    return events;
+  }
+
+  if (msg.topic === "tickers.XRPUSDT" && isRecord(msg.data)) {
+    const data = msg.data;
+    if (data.symbol != null && data.symbol !== "XRPUSDT") return [];
+    return [
+      {
+        kind: "ticker",
+        lastPrice: num(data.lastPrice),
+        markPrice: num(data.markPrice),
+        fundingRate: num(data.fundingRate),
+        openInterest: num(data.openInterest),
+        openInterestValue: num(data.openInterestValue),
+      },
+    ];
+  }
+
+  if (msg.topic === "orderbook.50.XRPUSDT" && isRecord(msg.data)) {
+    const data = msg.data;
+    if (data.s != null && data.s !== "XRPUSDT") return [];
+    const type = msg.type === "snapshot" ? "snapshot" : "delta";
+    return [
+      {
+        kind: "book",
+        type,
+        bids: levels(data.b),
+        asks: levels(data.a),
+      },
+    ];
+  }
+
+  return [];
 }
 
 export function parseLedgerClose(raw: string): number | null {
@@ -132,18 +145,4 @@ export function isLedgerSubscribeAck(raw: string): boolean {
     return false;
   }
   return isRecord(msg.result) && "ledger_index" in msg.result;
-}
-
-export function binanceRestricted(body: unknown, text: string): boolean {
-  if (/restricted location/i.test(text)) return true;
-  if (!isRecord(body)) return false;
-  return typeof body.msg === "string" && /restricted location/i.test(body.msg);
-}
-
-export function readOpenInterest(body: unknown): number | null {
-  if (!isRecord(body)) return null;
-  if (body.symbol != null && !isXrp(body.symbol)) return null;
-  const oi = num(body.openInterest);
-  if (oi == null || oi < 0) return null;
-  return oi;
 }

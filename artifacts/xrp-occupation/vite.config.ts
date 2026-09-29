@@ -12,15 +12,6 @@ const base =
     ? process.env.BASE_PATH
     : "/";
 
-const binanceProxy = {
-  "/__binance": {
-    target: "https://fapi.binance.com",
-    changeOrigin: true,
-    secure: true,
-    rewrite: (path: string) => path.replace(/^\/__binance/, ""),
-  },
-};
-
 export default defineConfig({
   base,
   server: {
@@ -28,13 +19,11 @@ export default defineConfig({
     port,
     strictPort: true,
     allowedHosts: true,
-    proxy: binanceProxy,
   },
   preview: {
     host: "0.0.0.0",
     port,
     strictPort: true,
     allowedHosts: true,
-    proxy: binanceProxy,
   },
 });

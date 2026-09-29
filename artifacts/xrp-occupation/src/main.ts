@@ -1,44 +1,46 @@
 import "./style.css";
 import { Battle } from "./battle";
-import { startBinance, startXrpl } from "./feeds";
-import { Hud } from "./hud";
+import { startBybit, startXrpl } from "./feeds";
 import { FieldView } from "./render";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#field");
-const hudRoot = document.getElementById("hud");
-if (!canvas || !hudRoot) throw new Error("Occupation markup is missing");
+const live = document.getElementById("live");
+if (!canvas || !live) throw new Error("Occupation markup is missing");
 
 const battle = new Battle();
 const view = new FieldView(canvas);
-const hud = new Hud();
 
-const binance = startBinance({
+const bybit = startBybit({
   onEvent: (event) => {
-    if (event.type === "trade") battle.addTrade(event.side, event.notional, event.leverage);
-    else if (event.type === "mark") battle.setMark(event.price, event.funding);
-    else battle.liquidate(event.side, event.notional, event.leverage);
+    if (event.kind === "trade") battle.addTrade(event.side, event.notional, event.price);
+    else if (event.kind === "liq") battle.addLiquidation(event.side, event.notional);
+    else if (event.kind === "ticker") battle.applyTicker(event);
+    else battle.applyBook(event.type, event.bids, event.asks);
   },
-  onOpenInterest: (update) => hud.setOi(update),
-  onStatus: (status) => hud.setBinance(status),
+  onStatus: (status) => battle.setLink(status),
 });
 
 const xrpl = startXrpl({
-  onLedger: (index) => battle.ledger(index),
-  onStatus: (status) => hud.setXrpl(status),
+  onLedger: () => battle.pulseLedger(),
 });
 
 let last = performance.now();
+let readout = "";
 const frame = (now: number) => {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
   battle.update(dt);
   view.draw(battle, dt);
-  hud.sync(battle);
+  const next = battle.readout();
+  if (next !== readout) {
+    readout = next;
+    live.textContent = next;
+  }
   requestAnimationFrame(frame);
 };
 requestAnimationFrame(frame);
 
 window.addEventListener("pagehide", () => {
-  binance.stop();
+  bybit.stop();
   xrpl.stop();
 });
