@@ -123,9 +123,10 @@ export class FieldView {
     drawText(ctx, shorts, 470 - textWidth(shorts), 48, "#e4453a");
     drawText(ctx, "WIN", 452, 58, "#e4453a");
     if (battle.round) {
-      drawText(ctx, formatPrice(battle.round.low), 8, 180, "#8d8678");
       const high = formatPrice(battle.round.high);
-      drawText(ctx, high, 472 - textWidth(high), 180, "#8d8678");
+      const low = formatPrice(battle.round.low);
+      drawText(ctx, high, 8, 180, "#8d8678");
+      drawText(ctx, low, 472 - textWidth(low), 180, "#8d8678");
     }
   }
 

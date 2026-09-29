@@ -276,7 +276,7 @@ export class Battle {
     if (!this.price || !this.round) return 0.5;
     const span = this.round.high - this.round.low;
     if (!(span > 0)) return 0.5;
-    return clamp((this.price - this.round.low) / span, 0, 1);
+    return clamp((this.round.high - this.price) / span, 0, 1);
   }
 
   private kindFor(side: Side, notional: number): UnitKind {
