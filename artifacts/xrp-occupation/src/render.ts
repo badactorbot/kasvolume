@@ -117,10 +117,11 @@ export class FieldView {
     ctx.fillRect(8, 40, 40, 128);
     ctx.fillStyle = front > 0.92 ? "#4a201c" : "#241212";
     ctx.fillRect(432, 40, 40, 128);
-    drawText(ctx, "SHORTS", 10, 48, "#e4453a");
-    drawText(ctx, "WIN", 16, 58, "#8d8678");
-    drawText(ctx, "LONGS", 434, 48, "#3ecf4a");
-    drawText(ctx, "WIN", 442, 58, "#8d8678");
+    drawText(ctx, "LONGS", 10, 48, "#3ecf4a");
+    drawText(ctx, "WIN", 16, 58, "#3ecf4a");
+    const shorts = "SHORTS";
+    drawText(ctx, shorts, 470 - textWidth(shorts), 48, "#e4453a");
+    drawText(ctx, "WIN", 452, 58, "#e4453a");
     if (battle.round) {
       drawText(ctx, formatPrice(battle.round.low), 8, 180, "#8d8678");
       const high = formatPrice(battle.round.high);
@@ -293,6 +294,8 @@ export class FieldView {
       drawText(ctx, line.text, 6, 212 + index * 8, color);
     });
     drawText(ctx, "INF FLOW   TANK HEAVY   ROCKET VOL/LIQ", 6, 246, "#8d8678");
+    drawText(ctx, "LONGS", 292, 246, "#3ecf4a");
+    drawText(ctx, "SHORTS", 470 - textWidth("SHORTS"), 246, "#e4453a");
     drawText(ctx, "BURST UNDER 5K   STRIKE UNDER 25K   BOMB OVER 25K", 6, 254, "#8d8678");
     drawText(
       ctx,
