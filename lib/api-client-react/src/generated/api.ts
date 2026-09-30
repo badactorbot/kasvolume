@@ -36,6 +36,7 @@ import type {
   KasWithdrawalSubmission,
   LiveBuyPreview,
   MarketSnapshot,
+  SellAllManagedPositionsResult,
   SimulationInput,
   SimulationResult,
   UserBotDashboard,
@@ -1596,6 +1597,81 @@ export const useStopUserBot = <TError = ErrorType<unknown>,
         TContext
       > => {
       return useMutation(getStopUserBotMutationOptions(options));
+    }
+
+export const getSellAllUserBotManagedPositionsUrl = () => {
+
+
+
+
+  return `/api/app/bot/sell-all`
+}
+
+/**
+ * Stops leftover inventory from blocking KAS withdrawal. Requires trading to be stopped and no in-flight operation. Sells open managed lots FIFO using the bot wallet key.
+ * @summary Sell all remaining managed token lots held by the bot wallet
+ */
+export const sellAllUserBotManagedPositions = async ( options?: Parameters<typeof customFetch>[1]): Promise<SellAllManagedPositionsResult> => {
+
+  return customFetch<SellAllManagedPositionsResult>(getSellAllUserBotManagedPositionsUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getSellAllUserBotManagedPositionsMutationKey = () => ['sellAllUserBotManagedPositions'] as const;
+
+export const getSellAllUserBotManagedPositionsMutationOptions = <TError = ErrorType<unknown>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof sellAllUserBotManagedPositions>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof sellAllUserBotManagedPositions>>, TError,void, TContext> => {
+
+const mutationKey = getSellAllUserBotManagedPositionsMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof sellAllUserBotManagedPositions>>, void> = () => {
+
+
+          return  sellAllUserBotManagedPositions(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type SellAllUserBotManagedPositionsMutationResult = NonNullable<Awaited<ReturnType<typeof sellAllUserBotManagedPositions>>>
+
+    export type SellAllUserBotManagedPositionsMutationError = ErrorType<unknown>
+
+
+    /**
+ * @summary Sell all remaining managed token lots held by the bot wallet
+ */
+export const useSellAllUserBotManagedPositions = <TError = ErrorType<unknown>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof sellAllUserBotManagedPositions>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof sellAllUserBotManagedPositions>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getSellAllUserBotManagedPositionsMutationOptions(options));
     }
 
 export const getPrepareUserBotKasWithdrawalUrl = () => {
