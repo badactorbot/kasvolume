@@ -1,5 +1,6 @@
 import type { BotConfig } from "../config.js";
 import type { Candle, MarketSnapshot, PositionView, Side } from "../types.js";
+import { BinanceCandleFeed } from "./candles.js";
 
 /**
  * Thin HTTP client for Jupiter Perps public API (verified against
@@ -214,11 +215,29 @@ export function normalizePositions(payload: unknown): PositionView[] {
 }
 
 /**
- * Market data: price from GET /market-stats; optional borrow from /pool-info.
- * Candle history is stubbed — plug Birdeye/Pyth/CEX later for EMA/ATR.
+ * Market data: Jupiter oracle/mark via /market-stats; 1h OHLCV via Binance
+ * public klines (SOLUSDT) for trend+regime. No candle API key required.
  */
 export class MarketDataService {
-  constructor(private readonly client: JupiterPerpsClient) {}
+  private readonly candles: BinanceCandleFeed;
+
+  constructor(
+    private readonly client: JupiterPerpsClient,
+    cfg?: Pick<
+      BotConfig,
+      | "candleBaseUrl"
+      | "candleSymbol"
+      | "candleInterval"
+      | "candleLimit"
+    >,
+  ) {
+    this.candles = new BinanceCandleFeed({
+      baseUrl: cfg?.candleBaseUrl,
+      symbol: cfg?.candleSymbol,
+      interval: cfg?.candleInterval,
+      limit: cfg?.candleLimit,
+    });
+  }
 
   async fetchSnapshot(): Promise<MarketSnapshot> {
     try {
@@ -269,11 +288,8 @@ export class MarketDataService {
     };
   }
 
-  /**
-   * Placeholder OHLCV. Strategy will often emit "hold" until real candles exist.
-   * TODO: wire 1h candles (Birdeye / Pyth / exchange proxy).
-   */
-  async fetchCandles(_limit = 120): Promise<Candle[]> {
-    return [];
+  /** 1h OHLCV for SOL (CEX proxy). Throws on hard failure so the loop can alert. */
+  async fetchCandles(limit?: number): Promise<Candle[]> {
+    return this.candles.fetchCandles(limit);
   }
 }

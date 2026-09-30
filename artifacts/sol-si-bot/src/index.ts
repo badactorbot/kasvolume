@@ -44,8 +44,11 @@ async function main(): Promise<void> {
   }
 
   const client = JupiterPerpsClient.fromConfig(cfg);
-  const market = new MarketDataService(client);
+  const market = new MarketDataService(client, cfg);
   const strategy = new TrendRegimeStrategy(cfg);
+  console.log(
+    `Candles: ${cfg.candleSource} ${cfg.candleSymbol} ${cfg.candleInterval} via ${cfg.candleBaseUrl}`,
+  );
   const risk = new RiskManager(cfg);
   const connection = new Connection(cfg.rpcUrl, "confirmed");
   const execution = new ExecutionService(cfg, client, connection, keypair);
@@ -66,7 +69,7 @@ async function main(): Promise<void> {
       lastDay = day;
 
       const snapshot = await market.fetchSnapshot();
-      const candles = await market.fetchCandles(120);
+      const candles = await market.fetchCandles(cfg.candleLimit);
 
       let positions =
         wallet !== null ? await execution.listPositions(wallet) : [];
@@ -89,8 +92,9 @@ async function main(): Promise<void> {
       }
 
       const signal = strategy.evaluate({ candles, snapshot, position });
+      const lastClose = candles.at(-1)?.close;
       console.log(
-        `[tick] price=${snapshot.price} signal=${signal.action} (${signal.reason}) paused=${status.paused} pos=${position ? position.side : "flat"}`,
+        `[tick] price=${snapshot.price} candles=${candles.length} lastClose=${lastClose ?? "n/a"} signal=${signal.action} (${signal.reason}) paused=${status.paused} pos=${position ? position.side : "flat"}`,
       );
 
       const intent = risk.plan({ signal, position, equityUsd });

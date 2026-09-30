@@ -29,6 +29,12 @@ const schema = z.object({
   emaSlow: z.number().int().positive(),
   atrPeriod: z.number().int().positive(),
   regimeAtrPctFloor: z.number().positive(),
+  /** Public OHLCV source for trend/regime (default: binance market-data API). */
+  candleSource: z.enum(["binance"]),
+  candleBaseUrl: z.string().url(),
+  candleSymbol: z.string().min(1),
+  candleInterval: z.string().min(1),
+  candleLimit: z.number().int().positive().max(1000),
 });
 
 export type BotConfig = z.infer<typeof schema>;
@@ -58,6 +64,13 @@ export function loadConfig(): BotConfig {
     emaSlow: Number(process.env.EMA_SLOW ?? 50),
     atrPeriod: Number(process.env.ATR_PERIOD ?? 14),
     regimeAtrPctFloor: Number(process.env.REGIME_ATR_PCT_FLOOR ?? 0.8),
+    candleSource: (process.env.CANDLE_SOURCE ?? "binance") as "binance",
+    // Prefer data-api.binance.vision (market-data only, no API key; geo-friendlier than api.binance.com)
+    candleBaseUrl:
+      process.env.CANDLE_BASE_URL ?? "https://data-api.binance.vision",
+    candleSymbol: process.env.CANDLE_SYMBOL ?? "SOLUSDT",
+    candleInterval: process.env.CANDLE_INTERVAL ?? "1h",
+    candleLimit: Number(process.env.CANDLE_LIMIT ?? 120),
   });
 
   if (cfg.emaFast >= cfg.emaSlow) {

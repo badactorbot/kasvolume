@@ -10,8 +10,9 @@ Default **`DRY_RUN=true`** — first boot logs intents and does **not** place or
 | Module | Role |
 | --- | --- |
 | `src/config.ts` | Env-driven config (`DRY_RUN`, `MAX_LEVERAGE=10`, daily kill %, etc.) |
-| `src/market/jupiter.ts` | Jupiter Perps HTTP client + market snapshot stub |
-| `src/strategy/trend-regime.ts` | EMA trend + ATR% regime skeleton |
+| `src/market/jupiter.ts` | Jupiter Perps HTTP client + market snapshot |
+| `src/market/candles.ts` | **1h OHLCV** via Binance public klines (`SOLUSDT`) |
+| `src/strategy/trend-regime.ts` | EMA trend + ATR% regime on those candles |
 | `src/risk/manager.ts` | 10× cap, daily loss kill, drawdown pause, flatten |
 | `src/execution/jupiter-perps.ts` | increase / close-all via Perps API; DRY_RUN logs only |
 | `src/alerts/discord.ts` | Discord webhook alerts |
@@ -54,8 +55,23 @@ Fill in:
 | `MAX_LEVERAGE` | Locked default `10` |
 | `COLLATERAL_USDC` | Size per new entry (start tiny) |
 | `DAILY_LOSS_KILL_PCT` | Flatten + pause (default 5) |
+| `CANDLE_*` | Optional overrides for 1h feed (see below) |
 
 **Never commit `.env` or key files.**
+
+## Candle feed (trend + regime)
+
+Strategy EMAs / ATR use **public Binance 1h klines** for `SOLUSDT` — no API key.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `CANDLE_SOURCE` | `binance` | Only source wired today |
+| `CANDLE_BASE_URL` | `https://data-api.binance.vision` | Market-data-only host (no key). Avoid `api.binance.com` if your region blocks it. |
+| `CANDLE_SYMBOL` | `SOLUSDT` | SOL-only proxy for regime |
+| `CANDLE_INTERVAL` | `1h` | Decision bar |
+| `CANDLE_LIMIT` | `120` | Bars fetched each poll (need ≥ `EMA_SLOW` + ATR warm-up) |
+
+This is a **CEX price proxy**, not Jupiter’s oracle. Marks/liquidation still come from Jupiter; candles drive signal direction only.
 
 ## Install & run
 
@@ -90,11 +106,26 @@ Send `SIGUSR1` to the process (`kill -USR1 <pid>`). Risk manager sets emergency 
 - Live paths used here: `GET /market-stats`, `GET /positions`, `POST /positions/increase|decrease|close-all`, `POST /transaction/execute` (see [OpenAPI](https://perps-api.jup.ag/v1/docs)).
 - Flow: API builds unsigned tx → bot signs → `/transaction/execute` → **keeper** fulfills (not instant).
 - Amounts: USDC raw ×1e6; leverage as string; slippage in bps; new positions need ~**$10** min collateral.
-- Candle history is stubbed with a **TODO** — wire a real 1h candle source before trusting signals.
 
 ## Honest limits of this scaffold
 
 - No guaranteed fills, PnL, or uptime.
-- Candle history is empty until you plug a feed — strategy will mostly `hold`.
+- Candles are Binance spot `SOLUSDT`, not on-chain Jupiter marks — basis can diverge.
 - Position/equity parsing is best-effort against evolving API shapes.
 - 10× can zero the wallet; only fund what you can lose.
+
+## Local verify (DRY_RUN)
+
+```bash
+cd artifacts/sol-si-bot
+cp .env.example .env   # leave DRY_RUN=true; no keys needed for candle smoke
+pnpm install
+pnpm start
+```
+
+Expect logs like:
+
+- `Candles: binance SOLUSDT 1h via https://data-api.binance.vision`
+- `[tick] ... candles=120 lastClose=... signal=long|short|flat|hold (...not "insufficient candle...")`
+
+`hold` from chop/borrow is fine; **empty-candle hold** is not. Ctrl+C to stop.
