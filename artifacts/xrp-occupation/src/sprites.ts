@@ -64,6 +64,81 @@ export const ROCKET = [
   ".dd......dd.",
 ];
 
+export const BULL_STEP = [
+  "h....h..",
+  "hh..hh..",
+  ".hhhhh..",
+  "hhwwwhh.",
+  ".hhhhhh.",
+  "..hhhh..",
+  ".h....h.",
+  "h......h",
+];
+
+export const BEAR_STEP = [
+  ".hh..hh.",
+  "hhhhhhhh",
+  "hhwwwwhh",
+  ".hhhhnh.",
+  "..hhhh..",
+  ".h....h.",
+  "h......h",
+  "........",
+];
+
+export const TANK_STEP = [
+  "........dddd....",
+  "......ddhhhhdd..",
+  "....ddhhhhhhhhdd",
+  "ddddhhhhhhhhhhhh",
+  "ddhhhhhhhhhhhhdd",
+  "dddddddddddddddd",
+  "dd..dd....dd..dd",
+  "dd..dd....dd..dd",
+];
+
+export const ROCKET_FIRE = [
+  ".........d..",
+  "........dd..",
+  ".......dh...",
+  ".....ddhh...",
+  "...ddhhhh...",
+  "ddhhhhhhdd..",
+  "dddddddddd..",
+  ".dd....dd...",
+  ".dd....dd...",
+];
+
+export const BULL_CHEER = [
+  "h.h..h.h",
+  "h.h..h.h",
+  ".hhhhh..",
+  "hhwwwhh.",
+  ".hhhhhh.",
+  "..hhhh..",
+  "..h..h..",
+  "..h..h..",
+];
+
+export const BEAR_CHEER = [
+  "h.hh.hh.",
+  "hhhhhhhh",
+  "hhwwwwhh",
+  ".hhhhnh.",
+  "..hhhh..",
+  "..h..h..",
+  "..h..h..",
+  "........",
+];
+
+export const PLANE = [
+  "....hh....",
+  "..hhhhhh..",
+  "hhhhhhhhhh",
+  "..hhddhh..",
+  "....dd....",
+];
+
 export function blit(
   ctx: CanvasRenderingContext2D,
   rows: readonly string[],

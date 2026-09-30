@@ -1,22 +1,30 @@
-import type { Battle, Bit, BookColumn, Strike, Unit } from "./battle";
+import type { Battle, Fx, Rank, Squad } from "./battle";
 import { formatFunding, formatPrice, formatUsd } from "./format";
 import { drawText, textWidth } from "./font";
 import {
   BEAR,
+  BEAR_CHEER,
+  BEAR_STEP,
   BULL,
+  BULL_CHEER,
+  BULL_STEP,
   LONG_PALETTE,
+  PLANE,
   ROCKET,
+  ROCKET_FIRE,
   SHORT_PALETTE,
   TANK,
+  TANK_STEP,
   blit,
   type Palette,
 } from "./sprites";
 
 const W = 480;
 const H = 270;
+const GROUND = 92;
 
 function xt(t: number): number {
-  return Math.round(48 + t * (432 - 48));
+  return Math.round(36 + t * (444 - 36));
 }
 
 function hash(n: number): number {
@@ -26,11 +34,12 @@ function hash(n: number): number {
   return (x ^ (x >>> 16)) >>> 0;
 }
 
-function toneColor(tone: Bit["tone"]): string {
-  if (tone === "long") return "#3ecf4a";
-  if (tone === "short") return "#e4453a";
-  if (tone === "gold") return "#f0c84a";
-  return "#f3ead4";
+function rowsFor(rank: Rank, frame: number): readonly string[] {
+  if (rank.kind === "rocket") return rank.fire > 0 ? ROCKET_FIRE : ROCKET;
+  if (rank.kind === "tank") return frame === 1 ? TANK_STEP : TANK;
+  if (rank.cheer) return rank.side === "long" ? BULL_CHEER : BEAR_CHEER;
+  if (rank.side === "long") return frame === 1 ? BULL_STEP : BULL;
+  return frame === 1 ? BEAR_STEP : BEAR;
 }
 
 export class FieldView {
@@ -73,25 +82,26 @@ export class FieldView {
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = "#10141f";
     ctx.fillRect(0, 0, W, H);
-    const mag = battle.shake > 0.25 ? 2 : battle.shake > 0.04 ? 1 : 0;
-    const phase = Math.floor(this.time * 30);
-    const ox = mag === 0 ? 0 : (phase % 2 === 0 ? mag : -mag);
+    const mag = battle.shake > 0.4 ? 3 : battle.shake > 0.2 ? 2 : battle.shake > 0.04 ? 1 : 0;
+    const phase = Math.floor(this.time * 28);
+    const ox = mag === 0 ? 0 : phase % 2 === 0 ? mag : -mag;
     const oy = mag > 1 && phase % 3 === 0 ? 1 : 0;
     ctx.save();
     ctx.translate(ox, oy);
     this.sky(ctx);
-    this.zones(ctx, battle);
-    this.ground(ctx);
-    this.ranks(ctx, battle.columns);
-    this.units(ctx, battle.units);
-    this.strikes(ctx, battle.strikes);
-    this.bits(ctx, battle.bits);
-    this.pulse(ctx, battle.pulse);
+    this.stars(ctx);
+    this.ground(ctx, battle);
+    this.wind(ctx, battle);
+    this.forts(ctx, battle);
+    this.army(ctx, battle.ranks);
+    this.squads(ctx, battle.squads);
     this.front(ctx, battle);
+    this.fx(ctx, battle.fx);
+    this.pulse(ctx, battle.pulse);
     ctx.restore();
-    this.hud(ctx, battle);
-    this.panel(ctx, battle);
     this.banner(ctx, battle);
+    this.hud(ctx, battle);
+    this.footer(ctx, battle);
     this.ctx.imageSmoothingEnabled = false;
     this.ctx.fillStyle = "#05060a";
     this.ctx.fillRect(0, 0, this.cssW, this.cssH);
@@ -100,211 +110,235 @@ export class FieldView {
 
   private sky(ctx: CanvasRenderingContext2D): void {
     ctx.fillStyle = "#10141f";
-    ctx.fillRect(0, 36, W, 70);
+    ctx.fillRect(0, 0, W, 78);
     ctx.fillStyle = "#171d2c";
-    ctx.fillRect(0, 106, W, 62);
-    for (let i = 0; i < 26; i += 1) {
-      const x = (hash(i * 17) % 450) + 12;
-      const y = (hash(i * 29) % 100) + 42;
-      ctx.fillStyle = i % 5 === 0 ? "#d5dbed" : "#3c4662";
+    ctx.fillRect(0, 78, W, GROUND - 78);
+  }
+
+  private stars(ctx: CanvasRenderingContext2D): void {
+    const blink = Math.floor(this.time * 2);
+    for (let i = 0; i < 22; i += 1) {
+      const on = (hash(i * 13 + blink) & 3) !== 0;
+      if (!on) continue;
+      const x = (hash(i * 17) % 450) + 14;
+      const y = (hash(i * 29) % 58) + 18;
+      ctx.fillStyle = i % 5 === 0 ? "#f3ead4" : "#3c4662";
       ctx.fillRect(x, y, 1, 1);
     }
   }
 
-  private zones(ctx: CanvasRenderingContext2D, battle: Battle): void {
-    const front = battle.frontT();
-    ctx.fillStyle = front < 0.08 ? "#1e3a28" : "#122018";
-    ctx.fillRect(8, 40, 40, 128);
-    ctx.fillStyle = front > 0.92 ? "#4a201c" : "#241212";
-    ctx.fillRect(432, 40, 40, 128);
-    drawText(ctx, "LONGS", 10, 48, "#3ecf4a");
-    drawText(ctx, "WIN", 16, 58, "#3ecf4a");
-    const shorts = "SHORTS";
-    drawText(ctx, shorts, 470 - textWidth(shorts), 48, "#e4453a");
-    drawText(ctx, "WIN", 452, 58, "#e4453a");
-    if (battle.round) {
-      const high = formatPrice(battle.round.high);
-      const low = formatPrice(battle.round.low);
-      drawText(ctx, high, 8, 180, "#8d8678");
-      drawText(ctx, low, 472 - textWidth(low), 180, "#8d8678");
+  private wind(ctx: CanvasRenderingContext2D, battle: Battle): void {
+    const rate = battle.funding;
+    if (rate == null || Math.abs(rate) < 0.0000005) return;
+    const againstLong = rate > 0;
+    const mag = Math.max(0.25, Math.min(1, Math.abs(rate) / 0.0003));
+    const count = 4 + Math.round(mag * 8);
+    const dir = againstLong ? -1 : 1;
+    ctx.fillStyle = againstLong ? "#1f7a32" : "#9a2a24";
+    for (let i = 0; i < count; i += 1) {
+      const span = againstLong ? 200 : 200;
+      const origin = againstLong ? 16 : 264;
+      const speed = dir * (30 + mag * 90);
+      const travel = (hash(i * 41) + this.time * speed) % span;
+      const x = origin + (travel < 0 ? travel + span : travel);
+      const y = 100 + (hash(i * 19) % 120);
+      const len = 3 + (hash(i * 7) % 4);
+      ctx.fillRect(Math.round(x), y, len, 1);
     }
   }
 
-  private ground(ctx: CanvasRenderingContext2D): void {
+  private ground(ctx: CanvasRenderingContext2D, battle: Battle): void {
+    ctx.fillStyle = "#24180f";
+    ctx.fillRect(0, GROUND, W, 46);
     ctx.fillStyle = "#1c140e";
-    ctx.fillRect(0, 168, W, 30);
+    ctx.fillRect(0, GROUND + 46, W, H - GROUND - 46);
     ctx.fillStyle = "#3a2818";
-    ctx.fillRect(0, 168, W, 1);
-    for (let x = 4; x < W; x += 5) {
-      const y = 172 + (hash(x) % 18);
-      if ((hash(x + 3) & 3) === 0) {
-        ctx.fillStyle = "#2c1e14";
-        ctx.fillRect(x, y, 2, 1);
+    ctx.fillRect(0, GROUND, W, 1);
+    for (let x = 4; x < W; x += 6) {
+      if ((hash(x) & 3) !== 0) continue;
+      ctx.fillStyle = "#2c1e14";
+      ctx.fillRect(x, GROUND + 8 + (hash(x + 3) % 130), 2, 1);
+    }
+    const front = battle.shown;
+    if (front < 0.12) {
+      ctx.fillStyle = "#4a201c";
+      ctx.fillRect(30, GROUND, 28, 150);
+    }
+    if (front > 0.88) {
+      ctx.fillStyle = "#1e3a28";
+      ctx.fillRect(422, GROUND, 28, 150);
+    }
+    if (battle.round) {
+      for (const mark of [0, 0.25, 0.5, 0.75, 1]) {
+        const x = xt(mark);
+        ctx.fillStyle = mark === 0 || mark === 1 ? "#6a5038" : "#3a2818";
+        ctx.fillRect(x, GROUND + 2, 1, 148);
+      }
+      const low = formatPrice(battle.round.low);
+      const high = formatPrice(battle.round.high);
+      drawText(ctx, low, 36, 232, "#8d8678");
+      drawText(ctx, high, 444 - textWidth(high), 232, "#8d8678");
+    }
+  }
+
+  private forts(ctx: CanvasRenderingContext2D, battle: Battle): void {
+    this.fort(ctx, "long", 4);
+    this.fort(ctx, "short", 448);
+    drawText(ctx, "LONGS", 4, 18, "#3ecf4a");
+    drawText(ctx, `BULLS ${battle.winsLong}`, 4, 28, "#3ecf4a");
+    const shorts = "SHORTS";
+    const bears = `BEARS ${battle.winsShort}`;
+    drawText(ctx, shorts, W - 4 - textWidth(shorts), 18, "#e4453a");
+    drawText(ctx, bears, W - 4 - textWidth(bears), 28, "#e4453a");
+  }
+
+  private fort(ctx: CanvasRenderingContext2D, side: Rank["side"], x: number): void {
+    const h = side === "long" ? "#3ecf4a" : "#e4453a";
+    const d = side === "long" ? "#145c22" : "#6e1612";
+    const n = side === "long" ? "#0c3a14" : "#3a0c0a";
+    ctx.fillStyle = d;
+    ctx.fillRect(x, 156, 28, 80);
+    ctx.fillStyle = h;
+    ctx.fillRect(x + 2, 148, 24, 10);
+    for (let i = 0; i < 4; i += 1) ctx.fillRect(x + 2 + i * 7, 138, 4, 12);
+    ctx.fillStyle = n;
+    ctx.fillRect(x + 10, 198, 8, 26);
+    ctx.fillStyle = "#c8b48a";
+    ctx.fillRect(x + 20, 116, 1, 24);
+    ctx.fillStyle = h;
+    ctx.fillRect(x + 21, 116, 8, 5);
+  }
+
+  private army(ctx: CanvasRenderingContext2D, ranks: readonly Rank[]): void {
+    const ordered = [...ranks].sort((a, b) => a.lane - b.lane);
+    for (const rank of ordered) this.sprite(ctx, rank, false);
+  }
+
+  private squads(ctx: CanvasRenderingContext2D, squads: readonly Squad[]): void {
+    for (const squad of squads) {
+      for (let i = 0; i < squad.count; i += 1) {
+        const rank: Rank = {
+          key: "",
+          side: squad.side,
+          kind: squad.kind,
+          x: squad.x,
+          target: squad.x + (squad.side === "long" ? 0.05 : -0.05),
+          lane: 1 + (i % 3),
+          step: this.time * 10 + i,
+          knock: 0,
+          fire: 0,
+          cheer: false,
+          retreating: false,
+        };
+        const ox = (i - (squad.count - 1) / 2) * (squad.kind === "tank" ? 10 : 7);
+        this.sprite(ctx, rank, squad.hitting > 0.08, ox);
       }
     }
   }
 
-  private ranks(ctx: CanvasRenderingContext2D, columns: readonly BookColumn[]): void {
-    for (const column of columns) {
-      const count = 1 + Math.round(column.weight * 6);
-      const x = xt(column.t) - 1;
-      const wall = column.weight > 0.82;
-      ctx.fillStyle =
-        column.side === "long" ? (wall ? "#9dff96" : "#1f7a32") : wall ? "#ffb0a4" : "#9a2a24";
-      for (let i = 0; i < count; i += 1) {
-        ctx.fillRect(x, 164 - i * 4, 3, 3);
-      }
-    }
-  }
-
-  private units(ctx: CanvasRenderingContext2D, units: readonly Unit[]): void {
-    const ordered = [...units].sort((a, b) => a.lane - b.lane);
-    for (const unit of ordered) {
-      if (unit.state === "dying" && unit.die < 0.08) continue;
-      const rows = unit.kind === "tank" ? TANK : unit.kind === "artillery" ? ROCKET : unit.side === "long" ? BULL : BEAR;
-      const base = unit.side === "long" ? LONG_PALETTE : SHORT_PALETTE;
-      const palette: Palette =
-        unit.flash > 0.08
-          ? { h: "#f7f3ea", d: base.d, w: "#ffffff", n: base.n }
-          : base;
-      const flip = unit.side === "short";
-      const height = rows.length;
-      const y = 176 - height - Math.round(unit.lane * 5);
-      blit(ctx, rows, xt(unit.x) - Math.floor((rows[0]?.length ?? 0) / 2), y, palette, flip);
-    }
-  }
-
-  private strikes(ctx: CanvasRenderingContext2D, strikes: readonly Strike[]): void {
-    for (const strike of strikes) {
-      const k = strike.max > 0 ? strike.life / strike.max : 0;
-      const radius = (strike.tier === "bomb" ? 16 : strike.tier === "strike" ? 9 : 4) * (0.45 + k);
-      const x = xt(strike.x);
-      const y = 158;
-      this.ring(ctx, x, y, radius, strike.tier === "burst" ? "#f0c84a" : "#f7f3ea");
-      if (strike.tier !== "burst") {
-        this.ring(ctx, x, y, Math.max(2, radius * 0.45), strike.side === "long" ? "#3ecf4a" : "#e4453a");
-      }
-      if (strike.tier === "bomb") this.ring(ctx, x, y - 6, radius * 0.7, "#f0c84a");
-    }
-  }
-
-  private ring(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number, color: string): void {
-    const r = Math.max(1, Math.round(radius));
-    ctx.fillStyle = color;
-    for (let iy = -r; iy <= r; iy += 1) {
-      for (let ix = -r; ix <= r; ix += 1) {
-        const d2 = ix * ix + iy * iy;
-        if (d2 <= r * r && d2 >= (r - 1) * (r - 1)) ctx.fillRect(x + ix, y + iy, 1, 1);
-      }
-    }
-  }
-
-  private bits(ctx: CanvasRenderingContext2D, bits: readonly Bit[]): void {
-    for (const bit of bits) {
-      ctx.fillStyle = toneColor(bit.tone);
-      ctx.fillRect(xt(bit.x), Math.round(bit.y * H), 2, 2);
-    }
-  }
-
-  private pulse(ctx: CanvasRenderingContext2D, pulse: number): void {
-    if (pulse < 0 || pulse > 1) return;
-    ctx.fillStyle = "#6a6248";
-    ctx.fillRect(xt(pulse), 174, 2, 1);
+  private sprite(ctx: CanvasRenderingContext2D, rank: Rank, flash: boolean, ox = 0): void {
+    const moving = Math.abs(rank.target - rank.x) > 0.008;
+    const frame = moving ? Math.floor(rank.step) % 2 : 0;
+    const bob = moving ? 0 : Math.floor(this.time * 3 + rank.lane * 1.7) % 2;
+    const rows = rowsFor(rank, frame);
+    const base = rank.side === "long" ? LONG_PALETTE : SHORT_PALETTE;
+    const palette: Palette = flash ? { h: "#f7f3ea", d: base.d, w: "#ffffff", n: base.n } : base;
+    const height = rows.length;
+    const width = rows[0]?.length ?? 0;
+    const stepPx = moving && frame === 1 ? (rank.side === "long" ? 1 : -1) : 0;
+    const knockPx = Math.round(rank.knock * (rank.side === "long" ? -8 : 8));
+    const y = 124 + rank.lane * 22 - height + bob;
+    const x = xt(rank.x) - Math.floor(width / 2) + stepPx + knockPx + ox;
+    blit(ctx, rows, x, y, palette, rank.side === "short");
   }
 
   private front(ctx: CanvasRenderingContext2D, battle: Battle): void {
-    const x = xt(battle.frontT());
+    const x = xt(battle.shown);
     ctx.fillStyle = "#1a120c";
-    ctx.fillRect(x - 1, 78, 3, 90);
+    ctx.fillRect(x - 1, 86, 3, 150);
     ctx.fillStyle = "#f3ead4";
-    ctx.fillRect(x, 78, 1, 90);
+    ctx.fillRect(x, 86, 1, 150);
     ctx.fillStyle = "#f0c84a";
-    ctx.fillRect(x - 2, 78, 5, 3);
+    ctx.fillRect(x - 2, 86, 5, 3);
     const label = battle.price == null ? "----" : formatPrice(battle.price);
     const width = textWidth(label, 2);
     let lx = x - Math.round(width / 2);
     lx = Math.max(52, Math.min(lx, 428 - width));
     ctx.fillStyle = "#0a0c10";
-    ctx.fillRect(lx - 3, 60, width + 6, 16);
-    drawText(ctx, label, lx, 62, "#f3ead4", 2);
-    if (battle.round) {
-      for (const mark of [0, 0.25, 0.5, 0.75, 1]) {
-        const mx = xt(mark);
-        ctx.fillStyle = "#8d8678";
-        ctx.fillRect(mx, 166, 1, 4);
+    ctx.fillRect(lx - 2, 68, width + 4, 16);
+    drawText(ctx, label, lx, 70, "#f3ead4", 2);
+  }
+
+  private fx(ctx: CanvasRenderingContext2D, effects: readonly Fx[]): void {
+    for (const fx of effects) {
+      if (fx.kind === "craft") this.craft(ctx, fx);
+      else if (fx.kind === "arc") this.missile(ctx, fx);
+      else if (fx.kind === "burst") this.burst(ctx, fx);
+      else if (fx.kind === "spark") this.spark(ctx, fx);
+      else if (fx.kind === "smoke") {
+        ctx.fillStyle = "#6a6458";
+        ctx.fillRect(xt(fx.x), Math.round(fx.y), 2, 2);
+      } else {
+        ctx.fillStyle = "#6a5038";
+        ctx.fillRect(xt(fx.x), Math.round(fx.y), 2, 1);
       }
     }
   }
 
-  private hud(ctx: CanvasRenderingContext2D, battle: Battle): void {
-    ctx.fillStyle = "#0c0e14";
-    ctx.fillRect(0, 0, W, 36);
-    ctx.fillStyle = "#3a3428";
-    ctx.fillRect(0, 35, W, 1);
-    drawText(ctx, "OCCUPATION", 6, 4, "#f3ead4");
-    const status = battle.statusText();
-    const statusColor =
-      battle.link.state === "live"
-        ? "#3ecf4a"
-        : battle.link.state === "connecting"
-          ? "#f0c84a"
-          : "#e4453a";
-    drawText(ctx, status, W - 6 - textWidth(status), 4, statusColor);
-    const price = battle.price == null ? "PRICE ----" : `PRICE ${formatPrice(battle.price)}`;
-    drawText(ctx, price, 6, 14, "#f3ead4");
-    let fund = "FUND ----";
-    if (battle.funding != null) {
-      const who =
-        battle.funding > 0.0000005 ? " LONGS PAY" : battle.funding < -0.0000005 ? " SHORTS PAY" : "";
-      fund = `FUND ${formatFunding(battle.funding)}${who}`;
-    }
-    drawText(ctx, fund, 132, 14, "#f0c84a");
-    const oi = battle.oiUsd == null ? "OI ----" : `OI ${formatUsd(battle.oiUsd)}`;
-    drawText(ctx, oi, 330, 14, "#f3ead4");
-    const longText = battle.sawFlow ? formatUsd(battle.pressureLong) : "----";
-    const shortText = battle.sawFlow ? formatUsd(battle.pressureShort) : "----";
-    drawText(ctx, longText, 6, 24, "#3ecf4a");
-    drawText(ctx, shortText, W - 6 - textWidth(shortText), 24, "#e4453a");
-    const barX = 78;
-    const barW = 324;
-    const total = battle.pressureLong + battle.pressureShort;
-    const share = total > 0 ? battle.pressureLong / total : 0.5;
-    ctx.fillStyle = "#241812";
-    ctx.fillRect(barX, 26, barW, 5);
-    ctx.fillStyle = "#3ecf4a";
-    ctx.fillRect(barX, 26, Math.round(barW * share), 5);
-    ctx.fillStyle = "#e4453a";
-    ctx.fillRect(barX + Math.round(barW * share), 26, barW - Math.round(barW * share), 5);
+  private craft(ctx: CanvasRenderingContext2D, fx: Fx): void {
+    const palette = fx.side === "long" ? SHORT_PALETTE : LONG_PALETTE;
+    blit(ctx, PLANE, xt(fx.x) - 5, fx.y, palette, fx.vx < 0);
   }
 
-  private panel(ctx: CanvasRenderingContext2D, battle: Battle): void {
-    ctx.fillStyle = "#0c0e14";
-    ctx.fillRect(0, 198, W, H - 198);
-    ctx.fillStyle = "#3a3428";
-    ctx.fillRect(0, 198, W, 1);
-    drawText(ctx, "FEED", 6, 202, "#8d8678");
-    if (!battle.sawFlow && battle.units.length === 0) {
-      const note =
-        battle.link.state === "live"
-          ? "AWAITING FLOW"
-          : "FIELD EMPTY UNTIL BYBIT CONNECTS";
-      drawText(ctx, note, 42, 202, "#f3ead4");
+  private missile(ctx: CanvasRenderingContext2D, fx: Fx): void {
+    const x = xt(fx.x);
+    const y = Math.round(fx.y);
+    ctx.fillStyle = "#f0c84a";
+    ctx.fillRect(x, y, 2, 4);
+    ctx.fillStyle = fx.side === "long" ? "#e4453a" : "#3ecf4a";
+    ctx.fillRect(x, y - 2, 2, 2);
+  }
+
+  private burst(ctx: CanvasRenderingContext2D, fx: Fx): void {
+    const frame = Math.min(3, Math.floor((1 - fx.life / fx.max) * 4));
+    const x = xt(fx.x);
+    const y = Math.round(fx.y);
+    const big = fx.extra >= 2;
+    const color = frame === 3 ? "#f0c84a" : "#f7f3ea";
+    ctx.fillStyle = color;
+    const r = (big ? 5 : 2) + frame * (big ? 3 : 2);
+    if (frame < 3) {
+      ctx.fillRect(x - r, y, r * 2 + 1, 1);
+      ctx.fillRect(x, y - r, 1, r * 2 + 1);
+      if (frame > 0) {
+        ctx.fillRect(x - r + 1, y - 1, 1, 1);
+        ctx.fillRect(x + r - 1, y + 1, 1, 1);
+      }
     }
-    battle.feed.forEach((line, index) => {
-      const color = line.tone === "long" ? "#3ecf4a" : line.tone === "short" ? "#e4453a" : "#f0c84a";
-      drawText(ctx, line.text, 6, 212 + index * 8, color);
-    });
-    drawText(ctx, "INF FLOW   TANK HEAVY   ROCKET VOL/LIQ", 6, 246, "#8d8678");
-    drawText(ctx, "LONGS", 292, 246, "#3ecf4a");
-    drawText(ctx, "SHORTS", 470 - textWidth("SHORTS"), 246, "#e4453a");
-    drawText(ctx, "BURST UNDER 5K   STRIKE UNDER 25K   BOMB OVER 25K", 6, 254, "#8d8678");
-    drawText(
-      ctx,
-      "VISUAL PROXY: FLOW + BOOK DEPTH + LIQUIDATIONS. NOT ACCOUNT POSITIONS.",
-      6,
-      262,
-      "#f3ead4",
-    );
+    ctx.fillStyle = fx.side === "long" ? "#3ecf4a" : "#e4453a";
+    ctx.fillRect(x - 1, y, 3, 1);
+    if (big && frame >= 1) {
+      ctx.fillStyle = "#f0c84a";
+      ctx.fillRect(x - 2, y - 6, 2, 2);
+      ctx.fillRect(x + 3, y - 4, 2, 2);
+    }
+  }
+
+  private spark(ctx: CanvasRenderingContext2D, fx: Fx): void {
+    const x = xt(fx.x);
+    const y = Math.round(fx.y);
+    ctx.fillStyle = "#f7f3ea";
+    ctx.fillRect(x - 2, y, 5, 1);
+    ctx.fillRect(x, y - 2, 1, 5);
+    ctx.fillStyle = fx.side === "long" ? "#3ecf4a" : "#e4453a";
+    ctx.fillRect(x - 1, y - 1, 1, 1);
+    ctx.fillRect(x + 1, y + 1, 1, 1);
+  }
+
+  private pulse(ctx: CanvasRenderingContext2D, pulse: number): void {
+    if (pulse < 0 || pulse > 1) return;
+    ctx.fillStyle = "#6a6248";
+    ctx.fillRect(xt(pulse), GROUND + 6, 2, 1);
   }
 
   private banner(ctx: CanvasRenderingContext2D, battle: Battle): void {
@@ -312,12 +346,61 @@ export class FieldView {
     const text = battle.banner.text;
     const width = textWidth(text, 2);
     const x = Math.round((W - width) / 2);
-    const y = 86;
+    const slam = Math.min(1, battle.banner.age / 0.16);
+    const eased = 1 - (1 - slam) * (1 - slam);
+    const y = Math.round(-20 + eased * 78);
     ctx.fillStyle = "#0a0c10";
     ctx.fillRect(x - 8, y - 6, width + 16, 28);
     ctx.fillStyle = battle.banner.side === "long" ? "#3ecf4a" : "#e4453a";
     ctx.fillRect(x - 8, y - 6, width + 16, 2);
     ctx.fillRect(x - 8, y + 20, width + 16, 2);
     drawText(ctx, text, x, y, "#f3ead4", 2);
+  }
+
+  private hud(ctx: CanvasRenderingContext2D, battle: Battle): void {
+    ctx.fillStyle = "#0c0e14";
+    ctx.fillRect(0, 0, W, 16);
+    const price = battle.price == null ? "----" : formatPrice(battle.price);
+    drawText(ctx, price, 4, 2, "#f3ead4");
+    let fund = "FUND ----";
+    if (battle.funding != null) {
+      const who =
+        battle.funding > 0.0000005 ? " L PAY" : battle.funding < -0.0000005 ? " S PAY" : "";
+      fund = `FUND ${formatFunding(battle.funding)}${who}`;
+    }
+    drawText(ctx, fund, 78, 2, "#f0c84a");
+    const oi = battle.oiUsd == null ? "OI ----" : `OI ${formatUsd(battle.oiUsd)}`;
+    drawText(ctx, oi, 250, 2, "#f3ead4");
+    const status = battle.statusText();
+    const statusColor =
+      battle.link.state === "live"
+        ? "#3ecf4a"
+        : battle.link.state === "connecting"
+          ? "#f0c84a"
+          : "#e4453a";
+    drawText(ctx, status, W - 4 - textWidth(status), 2, statusColor);
+    const total = battle.pressureLong + battle.pressureShort;
+    const share = total > 0 ? battle.pressureLong / total : 0.5;
+    ctx.fillStyle = "#3ecf4a";
+    ctx.fillRect(0, 14, Math.round(W * share), 2);
+    ctx.fillStyle = "#e4453a";
+    ctx.fillRect(Math.round(W * share), 14, W - Math.round(W * share), 2);
+  }
+
+  private footer(ctx: CanvasRenderingContext2D, battle: Battle): void {
+    ctx.fillStyle = "#0c0e14";
+    ctx.fillRect(0, 248, W, H - 248);
+    ctx.fillStyle = "#3a3428";
+    ctx.fillRect(0, 248, W, 1);
+    const latest = battle.feed[0];
+    if (latest) {
+      const color = latest.tone === "long" ? "#3ecf4a" : latest.tone === "short" ? "#e4453a" : "#f0c84a";
+      drawText(ctx, latest.text, 4, 252, color);
+    } else {
+      const note = battle.link.state === "live" ? "AWAITING FLOW" : "FIELD EMPTY UNTIL BYBIT CONNECTS";
+      drawText(ctx, note, 4, 252, "#8d8678");
+    }
+    drawText(ctx, "PROXY: FLOW + BOOK + LIQS. NOT POSITIONS.", 4, 261, "#8d8678");
+    drawText(ctx, "BURST 5K  ROCKET 25K  BOMB 25K+", 278, 261, "#8d8678");
   }
 }
