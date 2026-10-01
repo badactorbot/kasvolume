@@ -63,8 +63,11 @@ router.post("/app/auth/verify", handler(async (req, res) => {
   const result = await verifyWalletChallenge(input);
   res.cookie(sessionCookieName(), result.token, {
     httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    // Cross-site UI→API needs SameSite=None; same-origin /api keeps Lax.
+    sameSite: process.env.COOKIE_SAME_SITE === "none" ? "none" : "lax",
+    secure:
+      process.env.COOKIE_SAME_SITE === "none" ||
+      process.env.NODE_ENV === "production",
     maxAge: 7 * 24 * 60 * 60_000,
   });
   res.json(VerifyWalletChallengeResponse.parse(await getUserDashboard(result.userId)));
