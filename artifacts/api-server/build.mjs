@@ -17,6 +17,7 @@ async function buildAll() {
   await esbuild({
     entryPoints: {
       index: path.resolve(artifactDir, "src/index.ts"),
+      app: path.resolve(artifactDir, "src/app.ts"),
       "live-buy-cli": path.resolve(artifactDir, "src/live-buy-cli.ts"),
       "automation-cli": path.resolve(artifactDir, "src/automation-cli.ts"),
     },
