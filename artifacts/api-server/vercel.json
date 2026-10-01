@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
-  "installCommand": "cp package.vercel.json package.json && npm install --omit=dev",
+  "installCommand": "cp package.vercel.json package.json && npm install --omit=dev --legacy-peer-deps",
   "buildCommand": "npm run build",
   "functions": {
     "api/index.js": {
