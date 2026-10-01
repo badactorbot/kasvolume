@@ -3,6 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "build": "echo \"using committed deploy/ bundle\""
+  },
   "dependencies": {
     "@kronsdk/kron-sdk": "0.18.2"
   }
