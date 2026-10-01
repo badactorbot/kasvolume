@@ -22,9 +22,9 @@ Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/ver
 
 ## Production (Vercel)
 
-`kasvolume-api-server` is **self-contained**: committed `artifacts/api-server/deploy/` + `npm install --omit=dev` (no monorepo root required). Set env: `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`. Do **not** require `KRON_TOKEN_ID` — users enter the covenant/token ID in the console after wallet connect.
+`kasvolume-api-server` is **self-contained**: committed `artifacts/api-server/deploy/` + `package.vercel.json` (so `npm install` is not broken by pnpm `catalog:`/`workspace:*`). Set env: `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`. Do **not** require `KRON_TOKEN_ID` — users enter the covenant/token ID in the console after wallet connect.
 
-**UI host:** Root Directory `artifacts/kron-trading-bot` (colocated `/api` via committed `server/` bundle) with the same env vars — enable **Include source files outside Root Directory** so the Vite monorepo install works. Or one project with Root Directory `.`. Leave `VITE_API_BASE_URL` unset.
+**Connect needs `/api` on the UI origin.** Prefer one project with Root Directory `.` (root `vercel.json`). Or Root Directory `artifacts/kron-trading-bot` with **Include source files outside Root Directory** enabled. Or UI-only + rewrite / `VITE_API_BASE_URL` to the Ready API host. Leave `VITE_API_BASE_URL` unset when API is colocated.
 
 After API source changes: `pnpm --filter @workspace/api-server run build` and commit refreshed `deploy/` + `server/` bundles.
 

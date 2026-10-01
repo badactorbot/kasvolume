@@ -3,12 +3,30 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build as esbuild } from "esbuild";
 import esbuildPluginPino from "esbuild-plugin-pino";
-import { cp, mkdir, readdir, rm } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 
 // Plugins (e.g. 'esbuild-plugin-pino') may use `require` to resolve dependencies
 globalThis.require = createRequire(import.meta.url);
 
 const artifactDir = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * esbuild-plugin-pino embeds an absolute build-machine `outputDir` (…/dist).
+ * Rewrite it to runtime `__dirname` so committed deploy/ + Vercel checkouts work.
+ */
+async function patchPinoWorkerPaths(appPath) {
+  const source = await readFile(appPath, "utf8");
+  const patched = source.replace(
+    /const outputDir = "[^"]*";/,
+    "const outputDir = globalThis.__dirname;",
+  );
+  if (patched === source) {
+    throw new Error(
+      "deploy staging failed: esbuild-plugin-pino outputDir string not found in app.mjs",
+    );
+  }
+  await writeFile(appPath, patched);
+}
 
 /** Commit-friendly runtime bundle for Vercel (Root Directory = artifacts/api-server). */
 async function stageDeployBundle(distDir) {
@@ -29,6 +47,8 @@ async function stageDeployBundle(distDir) {
   if (!staged.includes("app.mjs")) {
     throw new Error("deploy staging failed: dist/app.mjs missing");
   }
+
+  await patchPinoWorkerPaths(path.join(deployDir, "app.mjs"));
   console.log(`Staged deploy bundle: ${staged.join(", ")}`);
 
   // Keep frontend colocated /api in sync when building from the monorepo.

@@ -1,8 +1,14 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
-  "installCommand": "npm install --omit=dev",
+  "installCommand": "cp package.vercel.json package.json && npm install --omit=dev",
   "buildCommand": "echo \"using committed deploy/ bundle\"",
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60,
+      "includeFiles": "deploy/**"
+    }
+  },
   "rewrites": [
     {
       "source": "/(.*)",
