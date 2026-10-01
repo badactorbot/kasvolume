@@ -8,6 +8,12 @@ out-tsc
 .expo
 .expo-shared
 
+# Vercel-staged Express bundles (produced by api-server / frontend build)
+artifacts/api-server/api/*
+!artifacts/api-server/api/index.js
+artifacts/kron-trading-bot/api/*
+!artifacts/kron-trading-bot/api/index.js
+
 # dependencies
 node_modules
 

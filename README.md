@@ -22,34 +22,36 @@ Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/ver
 
 ## Production (Vercel)
 
-Two projects (already used by this repo’s team):
+**Recommended: one project** with **Root Directory = `.` (repository root)**. That serves the Vite UI and Express `/api` from the same deployment (see root `vercel.json`). Connect Wallet then hits same-origin `/api/app/auth/challenge` and `/api/app/auth/verify` — no dashboard rewrite and no `VITE_API_BASE_URL`.
 
-| Project root directory | Role |
+| Setting | Value |
 | --- | --- |
-| `artifacts/api-server` | API (`vercel.json` builds + serverless `api/index.ts`) |
-| `artifacts/kron-trading-bot` | Static UI |
+| Root Directory | `.` (leave empty / repo root) |
+| Framework Preset | Other |
+| Install / Build / Output | From root `vercel.json` (do not override) |
 
-**Preferred:** keep the browser on same-origin `/api` by adding a Vercel rewrite on the **frontend** project:
-
-- Source: `/api/:path*`
-- Destination: `https://<your-api-deployment>/api/:path*`
-
-Leave `VITE_API_BASE_URL` unset.
-
-**Alternative:** set frontend build env `VITE_API_BASE_URL=https://<your-api-deployment>` and on the API set `CORS_ORIGIN=https://<your-frontend>` plus `COOKIE_SAME_SITE=none`.
-
-### API env (Vercel → kasvolume-api-server)
+### Env on that project
 
 - `DATABASE_URL`
 - `SESSION_SECRET`
 - `KRON_TOKEN_ID` (value in `.env.example`)
 - `NODE_ENV=production`
-- Optional: `CORS_ORIGIN`, `COOKIE_SAME_SITE` (only if UI uses absolute `VITE_API_BASE_URL`)
+- `BASE_PATH=/` (build, if you override the UI build)
+- Leave `VITE_API_BASE_URL` unset
 
-### Frontend env (Vercel → UI project)
+### Existing split projects (optional)
 
-- `BASE_PATH=/` (build)
-- Optional: `VITE_API_BASE_URL` only if not using a same-origin `/api` rewrite
+| Project root directory | Role |
+| --- | --- |
+| `artifacts/api-server` | API only (`api/index.js` + staged `app.mjs`) |
+| `artifacts/kron-trading-bot` | UI **and** colocated `/api` serverless (preferred over rewrite) |
+
+If you keep a **UI-only** project without the colocated function, add a rewrite:
+
+- Source: `/api/:path*`
+- Destination: `https://<your-api-deployment>/api/:path*`
+
+**Alternative:** set frontend build env `VITE_API_BASE_URL=https://<your-api-deployment>` and on the API set `CORS_ORIGIN=https://<your-frontend>` plus `COOKIE_SAME_SITE=none`.
 
 Do not point any env at Replit.
 
