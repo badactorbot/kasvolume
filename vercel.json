@@ -2,13 +2,8 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
   "installCommand": "npx pnpm@10.33.3 install --frozen-lockfile",
-  "buildCommand": "npx pnpm@10.33.3 --filter @workspace/api-server run build && BASE_PATH=/ npx pnpm@10.33.3 --filter @workspace/kron-trading-bot run build",
+  "buildCommand": "BASE_PATH=/ npx pnpm@10.33.3 --filter @workspace/kron-trading-bot run build",
   "outputDirectory": "artifacts/kron-trading-bot/dist/public",
-  "functions": {
-    "api/index.js": {
-      "includeFiles": "artifacts/api-server/dist/**"
-    }
-  },
   "rewrites": [
     {
       "source": "/api/(.*)",

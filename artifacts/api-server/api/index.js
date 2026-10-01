@@ -1,3 +1,2 @@
-// Vercel serverless entry. Bundle lives in ../dist (created by buildCommand).
-// includeFiles in vercel.json forces dist/** into the function (dist is gitignored).
-export { default } from "../dist/app.mjs";
+// Vercel serverless entry — uses the committed deploy/ bundle (no monorepo root required).
+export { default } from "../deploy/app.mjs";

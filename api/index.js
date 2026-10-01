@@ -1,2 +1,2 @@
-// Repo-root Vercel entry (Root Directory = `.`).
-export { default } from "../artifacts/api-server/dist/app.mjs";
+// Repo-root Vercel entry — uses committed api-server deploy bundle.
+export { default } from "../artifacts/api-server/deploy/app.mjs";

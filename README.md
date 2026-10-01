@@ -22,36 +22,11 @@ Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/ver
 
 ## Production (Vercel)
 
-**Recommended: one project** with **Root Directory = `.` (repository root)**. That serves the Vite UI and Express `/api` from the same deployment (see root `vercel.json`). Connect Wallet then hits same-origin `/api/app/auth/challenge` and `/api/app/auth/verify` — no dashboard rewrite and no `VITE_API_BASE_URL`.
+`kasvolume-api-server` is **self-contained**: committed `artifacts/api-server/deploy/` + `npm install --omit=dev` (no monorepo root required). Set env: `DATABASE_URL`, `SESSION_SECRET`, `KRON_TOKEN_ID`, `NODE_ENV=production`.
 
-| Setting | Value |
-| --- | --- |
-| Root Directory | `.` (leave empty / repo root) |
-| Framework Preset | Other |
-| Install / Build / Output | From root `vercel.json` (do not override) |
+**UI host:** Root Directory `artifacts/kron-trading-bot` (colocated `/api` via committed `server/` bundle) with the same env vars — enable **Include source files outside Root Directory** so the Vite monorepo install works. Or one project with Root Directory `.`. Leave `VITE_API_BASE_URL` unset.
 
-### Env on that project
-
-- `DATABASE_URL`
-- `SESSION_SECRET`
-- `KRON_TOKEN_ID` (value in `.env.example`)
-- `NODE_ENV=production`
-- `BASE_PATH=/` (build, if you override the UI build)
-- Leave `VITE_API_BASE_URL` unset
-
-### Existing split projects (optional)
-
-| Project root directory | Role |
-| --- | --- |
-| `artifacts/api-server` | API only (`api/index.js` + staged `app.mjs`) |
-| `artifacts/kron-trading-bot` | UI **and** colocated `/api` serverless (preferred over rewrite) |
-
-If you keep a **UI-only** project without the colocated function, add a rewrite:
-
-- Source: `/api/:path*`
-- Destination: `https://<your-api-deployment>/api/:path*`
-
-**Alternative:** set frontend build env `VITE_API_BASE_URL=https://<your-api-deployment>` and on the API set `CORS_ORIGIN=https://<your-frontend>` plus `COOKIE_SAME_SITE=none`.
+After API source changes: `pnpm --filter @workspace/api-server run build` and commit refreshed `deploy/` + `server/` bundles.
 
 Do not point any env at Replit.
 

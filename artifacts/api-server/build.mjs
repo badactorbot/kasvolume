@@ -3,12 +3,43 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build as esbuild } from "esbuild";
 import esbuildPluginPino from "esbuild-plugin-pino";
-import { rm } from "node:fs/promises";
+import { cp, mkdir, readdir, rm } from "node:fs/promises";
 
 // Plugins (e.g. 'esbuild-plugin-pino') may use `require` to resolve dependencies
 globalThis.require = createRequire(import.meta.url);
 
 const artifactDir = path.dirname(fileURLToPath(import.meta.url));
+
+/** Commit-friendly runtime bundle for Vercel (Root Directory = artifacts/api-server). */
+async function stageDeployBundle(distDir) {
+  const deployDir = path.resolve(artifactDir, "deploy");
+  await rm(deployDir, { recursive: true, force: true });
+  await mkdir(deployDir, { recursive: true });
+
+  const staged = [];
+  for (const file of await readdir(distDir)) {
+    const isApp = file === "app.mjs";
+    const isWorker =
+      file.startsWith("pino-") || file.startsWith("thread-stream-");
+    if ((!isApp && !isWorker) || file.endsWith(".map")) continue;
+    await cp(path.join(distDir, file), path.join(deployDir, file));
+    staged.push(file);
+  }
+
+  if (!staged.includes("app.mjs")) {
+    throw new Error("deploy staging failed: dist/app.mjs missing");
+  }
+  console.log(`Staged deploy bundle: ${staged.join(", ")}`);
+
+  // Keep frontend colocated /api in sync when building from the monorepo.
+  const frontendServer = path.resolve(artifactDir, "../kron-trading-bot/server");
+  await rm(frontendServer, { recursive: true, force: true });
+  await mkdir(frontendServer, { recursive: true });
+  for (const file of staged) {
+    await cp(path.join(deployDir, file), path.join(frontendServer, file));
+  }
+  console.log(`Synced frontend server bundle (${staged.length} files)`);
+}
 
 async function buildAll() {
   const distDir = path.resolve(artifactDir, "dist");
@@ -125,6 +156,8 @@ globalThis.__dirname = __bannerPath.dirname(globalThis.__filename);
     `,
     },
   });
+
+  await stageDeployBundle(distDir);
 }
 
 buildAll().catch((err) => {
