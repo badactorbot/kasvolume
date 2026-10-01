@@ -46661,13 +46661,41 @@ var managedLotsTable = pgTable(
 
 // ../../lib/db/src/index.ts
 var { Pool: Pool3 } = esm_default;
-if (!process.env.DATABASE_URL) {
-  throw new Error(
-    "DATABASE_URL must be set. Did you forget to provision a database?"
-  );
+var poolRef;
+var dbRef;
+function requireDatabaseUrl() {
+  const url = process.env.DATABASE_URL?.trim();
+  if (!url) {
+    throw new Error(
+      "DATABASE_URL must be set. Did you forget to provision a database?"
+    );
+  }
+  return url;
 }
-var pool = new Pool3({ connectionString: process.env.DATABASE_URL });
-var db = drizzle(pool, { schema: schema_exports });
+function getPool() {
+  if (!poolRef) {
+    poolRef = new Pool3({ connectionString: requireDatabaseUrl() });
+  }
+  return poolRef;
+}
+function getDb() {
+  if (!dbRef) {
+    dbRef = drizzle(getPool(), { schema: schema_exports });
+  }
+  return dbRef;
+}
+var pool = new Proxy({}, {
+  get(_target, prop, receiver) {
+    const value = Reflect.get(getPool(), prop, receiver);
+    return typeof value === "function" ? value.bind(getPool()) : value;
+  }
+});
+var db = new Proxy({}, {
+  get(_target, prop, receiver) {
+    const value = Reflect.get(getDb(), prop, receiver);
+    return typeof value === "function" ? value.bind(getDb()) : value;
+  }
+});
 
 // src/lib/interrupted-trade-service.ts
 var STALE_IN_FLIGHT_MS = 10 * 6e4;
