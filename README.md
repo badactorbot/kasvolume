@@ -11,7 +11,7 @@ Dry-run-first KCC20 trading console with Kasware wallet auth and user-funded bot
 
 ## Local run (same-origin `/api`)
 
-1. Set env (see `.env.example`): `DATABASE_URL`, `SESSION_SECRET`, `KRON_TOKEN_ID`, API `PORT=8080`.
+1. Set env (see `.env.example`): `DATABASE_URL`, `SESSION_SECRET`, API `PORT=8080`. Token ID is entered in the UI (not a required env).
 2. `pnpm install`
 3. `pnpm --filter @workspace/db run push`
 4. API: `PORT=8080 pnpm --filter @workspace/api-server run dev`
@@ -22,7 +22,7 @@ Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/ver
 
 ## Production (Vercel)
 
-`kasvolume-api-server` is **self-contained**: committed `artifacts/api-server/deploy/` + `npm install --omit=dev` (no monorepo root required). Set env: `DATABASE_URL`, `SESSION_SECRET`, `KRON_TOKEN_ID`, `NODE_ENV=production`.
+`kasvolume-api-server` is **self-contained**: committed `artifacts/api-server/deploy/` + `npm install --omit=dev` (no monorepo root required). Set env: `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`. Do **not** require `KRON_TOKEN_ID` — users enter the covenant/token ID in the console after wallet connect.
 
 **UI host:** Root Directory `artifacts/kron-trading-bot` (colocated `/api` via committed `server/` bundle) with the same env vars — enable **Include source files outside Root Directory** so the Vite monorepo install works. Or one project with Root Directory `.`. Leave `VITE_API_BASE_URL` unset.
 
