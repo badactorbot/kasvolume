@@ -3,34 +3,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build as esbuild } from "esbuild";
 import esbuildPluginPino from "esbuild-plugin-pino";
-import { cp, mkdir, readdir, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 
 // Plugins (e.g. 'esbuild-plugin-pino') may use `require` to resolve dependencies
 globalThis.require = createRequire(import.meta.url);
 
 const artifactDir = path.dirname(fileURLToPath(import.meta.url));
-
-/** Stage the Express bundle into `api/` so Vercel packages it with the serverless entry. */
-async function stageVercelApi(distDir) {
-  const apiDir = path.resolve(artifactDir, "api");
-  await mkdir(apiDir, { recursive: true });
-
-  const staged = [];
-  for (const file of await readdir(distDir)) {
-    const isApp = file === "app.mjs";
-    const isWorker =
-      file.startsWith("pino-") || file.startsWith("thread-stream-");
-    if ((!isApp && !isWorker) || file.endsWith(".map")) continue;
-    await cp(path.join(distDir, file), path.join(apiDir, file));
-    staged.push(file);
-  }
-
-  if (!staged.includes("app.mjs")) {
-    throw new Error("Vercel staging failed: dist/app.mjs was not produced");
-  }
-
-  console.log(`Staged Vercel API bundle: ${staged.join(", ")}`);
-}
 
 async function buildAll() {
   const distDir = path.resolve(artifactDir, "dist");
@@ -147,8 +125,6 @@ globalThis.__dirname = __bannerPath.dirname(globalThis.__filename);
     `,
     },
   });
-
-  await stageVercelApi(distDir);
 }
 
 buildAll().catch((err) => {
