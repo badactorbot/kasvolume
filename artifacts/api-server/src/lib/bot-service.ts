@@ -28,8 +28,10 @@ interface ActivityEntry {
   amountKas: number;
 }
 
+// Default is unset; dry-run / admin console users enter tokenId via the UI config form.
+// Optional KRON_TOKEN_ID only seeds a default for local dry-run convenience — not required for user bots.
 const config: BotConfig = {
-  tokenId: process.env.KRON_TOKEN_ID ?? "KCC20_TOKEN_ID_REQUIRED",
+  tokenId: process.env.KRON_TOKEN_ID?.trim() || "KCC20_TOKEN_ID_REQUIRED",
   buyCount: 5,
   sellCount: 5,
   tradesPerHour: 10,

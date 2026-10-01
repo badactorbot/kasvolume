@@ -37,6 +37,24 @@ export class RetryableTradeStateError extends Error {
 const toBytes = (hex: string) => Uint8Array.from(Buffer.from(hex, "hex"));
 const toKas = (sompi: bigint) => Number(sompi) / Number(SOMPI_PER_KAS);
 
+/** User console always passes credentials.tokenId from the bot row / UI. Env is CLI-only. */
+function resolveLiveTokenId(credentials?: LiveBotCredentials) {
+  if (credentials) {
+    const tokenId = credentials.tokenId?.trim().toLowerCase();
+    if (!tokenId) {
+      throw new Error("Bot token ID is required. Enter the covenant ID in the console.");
+    }
+    return tokenId;
+  }
+  const tokenId = process.env.KRON_TOKEN_ID?.trim().toLowerCase();
+  if (!tokenId) {
+    throw new Error(
+      "KRON_TOKEN_ID env is required only for server-owned CLI / file automation (not wallet-connect user bots).",
+    );
+  }
+  return tokenId;
+}
+
 async function executionAlreadyCompleted() {
   try {
     await access(EXECUTION_LOCK);
@@ -80,9 +98,8 @@ async function runLiveBuy(
   enforceMinimumOutput = true,
 ) {
   const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
-  const tokenId = (credentials?.tokenId ?? process.env.KRON_TOKEN_ID)?.trim().toLowerCase();
+  const tokenId = resolveLiveTokenId(credentials);
   if (!privateKey) throw new Error("Dedicated bot wallet secret is not configured.");
-  if (!tokenId) throw new Error("KRON token ID is not configured.");
 
   const k = await loadKaspa();
   let key: any;
@@ -375,8 +392,8 @@ async function runAutomatedSell(lot: {
   amount: string;
 }, submit: boolean, credentials?: LiveBotCredentials) {
   const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
-  const tokenId = (credentials?.tokenId ?? process.env.KRON_TOKEN_ID)?.trim().toLowerCase();
-  if (!privateKey || !tokenId) throw new Error("Live wallet or token configuration is missing.");
+  const tokenId = resolveLiveTokenId(credentials);
+  if (!privateKey) throw new Error("Live wallet configuration is missing.");
 
   const k = await loadKaspa();
   const key = new k.PrivateKey(privateKey);

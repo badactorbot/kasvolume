@@ -38599,7 +38599,7 @@ var logger = (0, import_pino.default)({
 
 // src/lib/bot-service.ts
 var config = {
-  tokenId: process.env.KRON_TOKEN_ID ?? "KCC20_TOKEN_ID_REQUIRED",
+  tokenId: process.env.KRON_TOKEN_ID?.trim() || "KCC20_TOKEN_ID_REQUIRED",
   buyCount: 5,
   sellCount: 5,
   tradesPerHour: 10,
@@ -38921,14 +38921,29 @@ var RetryableTradeStateError = class extends Error {
 };
 var toBytes = (hex) => Uint8Array.from(Buffer.from(hex, "hex"));
 var toKas = (sompi) => Number(sompi) / Number(SOMPI_PER_KAS);
+function resolveLiveTokenId(credentials) {
+  if (credentials) {
+    const tokenId2 = credentials.tokenId?.trim().toLowerCase();
+    if (!tokenId2) {
+      throw new Error("Bot token ID is required. Enter the covenant ID in the console.");
+    }
+    return tokenId2;
+  }
+  const tokenId = process.env.KRON_TOKEN_ID?.trim().toLowerCase();
+  if (!tokenId) {
+    throw new Error(
+      "KRON_TOKEN_ID env is required only for server-owned CLI / file automation (not wallet-connect user bots)."
+    );
+  }
+  return tokenId;
+}
 async function prepareLiveBuy() {
   return runLiveBuy(false, false);
 }
 async function runLiveBuy(submit, signOnly, automation = false, credentials, enforceMinimumOutput = true) {
   const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
-  const tokenId = (credentials?.tokenId ?? process.env.KRON_TOKEN_ID)?.trim().toLowerCase();
+  const tokenId = resolveLiveTokenId(credentials);
   if (!privateKey) throw new Error("Dedicated bot wallet secret is not configured.");
-  if (!tokenId) throw new Error("KRON token ID is not configured.");
   const k = await loadKaspa();
   let key;
   try {
@@ -39178,8 +39193,8 @@ async function executeUserAutomatedSell(lot, credentials) {
 }
 async function runAutomatedSell(lot, submit, credentials) {
   const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
-  const tokenId = (credentials?.tokenId ?? process.env.KRON_TOKEN_ID)?.trim().toLowerCase();
-  if (!privateKey || !tokenId) throw new Error("Live wallet or token configuration is missing.");
+  const tokenId = resolveLiveTokenId(credentials);
+  if (!privateKey) throw new Error("Live wallet configuration is missing.");
   const k = await loadKaspa();
   const key = new k.PrivateKey(privateKey);
   const publicKey = key.toPublicKey();
