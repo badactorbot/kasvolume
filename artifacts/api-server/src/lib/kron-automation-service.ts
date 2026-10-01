@@ -1,4 +1,4 @@
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { executeAutomatedBuy, executeAutomatedSell } from "./kron-live-service";
 import { logger } from "./logger";
@@ -29,11 +29,35 @@ type AutomationState = {
 
 let running = false;
 
+function defaultState(): AutomationState {
+  return {
+    version: 1,
+    armed: false,
+    phase: "buying",
+    completedBuys: 0,
+    completedSells: 0,
+    totalTrades: 0,
+    lastTradeAt: null,
+    nextRunAt: null,
+    inFlight: null,
+    stopReason: null,
+    managedLots: [],
+  };
+}
+
 async function readState(): Promise<AutomationState> {
-  return JSON.parse(await readFile(STATE_PATH, "utf8")) as AutomationState;
+  try {
+    return JSON.parse(await readFile(STATE_PATH, "utf8")) as AutomationState;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return defaultState();
+    }
+    throw error;
+  }
 }
 
 async function writeState(state: AutomationState) {
+  await mkdir(path.dirname(STATE_PATH), { recursive: true });
   const temporary = `${STATE_PATH}.tmp`;
   await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`);
   await rename(temporary, STATE_PATH);
