@@ -47747,12 +47747,22 @@ var userId = (req) => {
   if (!id) throw new Error("Connect and verify your wallet first.");
   return id;
 };
+var publicErrorMessage = (error) => {
+  const message = error instanceof Error ? error.message : "Request failed";
+  if (/connection terminated|ECONNREFUSED|ECONNRESET|timeout|ENOTFOUND|connect ETIMEDOUT/i.test(message)) {
+    return "Database temporarily unavailable. Retry in a few seconds. If this keeps happening on Fly trial, add a payment method so Machines stay running.";
+  }
+  if (/^Failed query:/i.test(message)) {
+    return "Database request failed. Retry connect; if it persists, check Fly Postgres is running.";
+  }
+  return message;
+};
 var handler = (fn) => async (req, res) => {
   try {
     await fn(req, res);
   } catch (error) {
     req.log.warn({ err: error }, "User bot request blocked");
-    res.status(400).json({ error: error instanceof Error ? error.message : "Request failed" });
+    res.status(400).json({ error: publicErrorMessage(error) });
   }
 };
 router3.post("/app/auth/challenge", handler(async (req, res) => {
