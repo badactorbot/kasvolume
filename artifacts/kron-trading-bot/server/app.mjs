@@ -38901,6 +38901,7 @@ import path from "node:path";
 var API_URL = "https://api.kron.technology";
 var INDEXER_URL = "https://idx.kron.technology/v1/kcc20";
 var NODE_URL = "wss://node.kron.technology";
+var SEQUENCER_URL = "https://seq.kron.technology";
 var NETWORK_ID = "mainnet";
 var LIVE_TEST_KAS = 21;
 var SOMPI_PER_KAS = 100000000n;
@@ -38922,6 +38923,42 @@ var RetryableTradeStateError = class extends Error {
 };
 var toBytes = (hex) => Uint8Array.from(Buffer.from(hex, "hex"));
 var toKas = (sompi) => Number(sompi) / Number(SOMPI_PER_KAS);
+function unwrapIndexerRow(value) {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+function poolParamsFromCurve(curveParams) {
+  return {
+    creatorFeeOwner: toBytes(curveParams.creatorFeeOwner),
+    platformFeeOwner: toBytes(curveParams.platformFeeOwner),
+    creatorFeeBps: BigInt(curveParams.dexCreatorFeeBps ?? 0),
+    platformFeeBps: BigInt(curveParams.dexPlatformFeeBps ?? 0),
+    lpFeeBps: BigInt(curveParams.dexLpFeeBps ?? 0),
+    lockedShares: BigInt(curveParams.poolLockedShares ?? 1e6)
+  };
+}
+async function resolvePoolHead(tick, indexer, submit) {
+  const sequence = await new kron.client.SequencerClient(SEQUENCER_URL).head(tick);
+  if (submit && sequence.head) {
+    throw new RetryableTradeStateError(
+      "The AMM pool has an in-flight sequenced trade; waiting for it to settle."
+    );
+  }
+  if (sequence.head) {
+    return {
+      pool: sequence.head.poolOutpoint,
+      poolToken: sequence.head.poolTokenOutpoint,
+      reserves: sequence.head.reserves
+    };
+  }
+  const confirmed = unwrapIndexerRow(await indexer.poolhead(tick));
+  if (!confirmed?.pool || !confirmed?.poolToken || !confirmed?.reserves) {
+    throw new RetryableTradeStateError(
+      "AMM pool head is temporarily unavailable; waiting to retry."
+    );
+  }
+  return confirmed;
+}
 function resolveLiveTokenId(credentials) {
   if (credentials) {
     const tokenId2 = credentials.tokenId?.trim().toLowerCase();
@@ -38963,13 +39000,44 @@ async function runLiveBuy(submit, signOnly, automation = false, credentials, enf
   if (!entry || !entry.extensions.chainVerified || entry.network !== NETWORK_ID) {
     throw new Error("Configured token is not a chain-verified Kron mainnet token.");
   }
-  if (!entry.extensions.curveCovenantId || !entry.extensions.curveParams) {
-    throw new Error("Configured token has no active Kron curve.");
+  if (!entry.extensions.curveParams) {
+    throw new Error("Configured token is missing Kron template params.");
   }
-  const tokenResponse = await indexer.token(entry.symbol.toLowerCase());
-  const token = Array.isArray(tokenResponse) ? tokenResponse[0] : tokenResponse;
-  if (!token || token.graduated || !token.cpState) {
-    throw new Error("This guarded preview currently supports pre-graduation curve buys only.");
+  const token = unwrapIndexerRow(await indexer.token(entry.symbol.toLowerCase()));
+  if (!token) {
+    throw new RetryableTradeStateError(
+      "Indexer has no live state for this token yet; waiting to retry."
+    );
+  }
+  const graduated = Boolean(token.graduated || token.cpState?.graduated);
+  const poolCovidHex = (entry.extensions.poolCovenantId || token.poolCovenantId || "").toLowerCase() || null;
+  if (graduated) {
+    if (!poolCovidHex) {
+      throw new Error("This token has graduated but has no AMM pool covenant id.");
+    }
+    return runPoolBuy({
+      submit,
+      signOnly,
+      automation,
+      enforceMinimumOutput,
+      privateKey,
+      key,
+      publicKey,
+      walletAddress,
+      buyerPubkey,
+      entry,
+      token,
+      poolCovidHex,
+      indexer
+    });
+  }
+  if (!entry.extensions.curveCovenantId) {
+    throw new Error("Configured token has no active Kron bonding curve.");
+  }
+  if (!token.cpState) {
+    throw new RetryableTradeStateError(
+      "Bonding-curve state is temporarily unavailable; waiting to retry."
+    );
   }
   const templates = await kron.client.fetchCpTemplates({
     baseUrl: API_URL,
@@ -38980,7 +39048,7 @@ async function runLiveBuy(submit, signOnly, automation = false, credentials, enf
   const tokenCovid = toBytes(entry.covenantId);
   const curveCovid = toBytes(entry.extensions.curveCovenantId);
   const sequence = await new kron.client.SequencerClient(
-    "https://seq.kron.technology"
+    SEQUENCER_URL
   ).curveHead(entry.extensions.curveCovenantId);
   if (submit && sequence.ok && sequence.head) {
     throw new RetryableTradeStateError(
@@ -39206,14 +39274,45 @@ async function runAutomatedSell(lot, submit, credentials) {
   const entry = (await registry.tokenlist({ all: true })).tokens.find(
     (token2) => token2.covenantId.toLowerCase() === tokenId
   );
-  if (!entry?.extensions.curveCovenantId || !entry.extensions.curveParams) {
-    throw new Error("Configured token has no active Kron curve.");
+  if (!entry?.extensions.curveParams) {
+    throw new Error("Configured token is missing Kron template params.");
   }
-  const tokenResponse = await indexer.token(entry.symbol.toLowerCase());
-  const token = Array.isArray(tokenResponse) ? tokenResponse[0] : tokenResponse;
-  if (!token?.cpState || token.graduated) throw new Error("KDIST is no longer on its curve.");
+  const token = unwrapIndexerRow(await indexer.token(entry.symbol.toLowerCase()));
+  if (!token) {
+    throw new RetryableTradeStateError(
+      "Indexer has no live state for this token yet; waiting to retry."
+    );
+  }
+  const graduated = Boolean(token.graduated || token.cpState?.graduated);
+  const poolCovidHex = (entry.extensions.poolCovenantId || token.poolCovenantId || "").toLowerCase() || null;
+  if (graduated) {
+    if (!poolCovidHex) {
+      throw new Error("This token has graduated but has no AMM pool covenant id.");
+    }
+    return runPoolSell({
+      lot,
+      submit,
+      privateKey,
+      key,
+      publicKey,
+      walletAddress,
+      traderPubkey,
+      entry,
+      token,
+      poolCovidHex,
+      indexer
+    });
+  }
+  if (!entry.extensions.curveCovenantId) {
+    throw new Error("Configured token has no active Kron bonding curve.");
+  }
+  if (!token.cpState) {
+    throw new RetryableTradeStateError(
+      "Bonding-curve state is temporarily unavailable; waiting to retry."
+    );
+  }
   const sequence = await new kron.client.SequencerClient(
-    "https://seq.kron.technology"
+    SEQUENCER_URL
   ).curveHead(entry.extensions.curveCovenantId);
   if (sequence.ok && sequence.head) {
     throw new RetryableTradeStateError(
@@ -39368,6 +39467,425 @@ async function runAutomatedSell(lot, submit, credentials) {
       netCreditKas: toKas(netCredit),
       signed: true,
       submitted: submit
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+  }
+}
+async function runPoolBuy(args) {
+  const {
+    submit,
+    signOnly,
+    automation,
+    enforceMinimumOutput,
+    key,
+    walletAddress,
+    buyerPubkey,
+    entry,
+    poolCovidHex,
+    indexer
+  } = args;
+  let workingKey = key;
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  if (!templates.pool) {
+    throw new Error("Configured token is missing a compiled AMM pool template.");
+  }
+  const tick = entry.symbol.toLowerCase();
+  const head = await resolvePoolHead(tick, indexer, submit);
+  const poolCovid = toBytes(poolCovidHex);
+  const tokenCovid = toBytes(entry.covenantId);
+  const poolState = {
+    kasReserve: BigInt(head.reserves.kasReserve),
+    tokenReserve: BigInt(head.reserves.tokenReserve),
+    tokenCovid,
+    totalShares: BigInt(head.reserves.totalShares),
+    lpCovid: toBytes(head.reserves.lpCovid || kron.genesis.ZERO_COVID)
+  };
+  const poolParams = poolParamsFromCurve(entry.extensions.curveParams);
+  const quote = kron.poolCpV3.quotePoolV3Buy(
+    poolState,
+    poolParams,
+    BigInt(LIVE_TEST_KAS) * SOMPI_PER_KAS
+  );
+  if (!quote?.tokenOut) {
+    throw new Error("Kron returned no executable AMM pool buy quote.");
+  }
+  const k = await loadKaspa();
+  const inventoryState = kron.kcc20.covenantIdOwned(poolCovid, poolState.tokenReserve, false);
+  const resolvedPoolAddress = kron.poolCpV3.poolCpV3Address(
+    k,
+    templates.pool,
+    poolState,
+    NETWORK_ID
+  );
+  const inventoryAddress = kron.kcc20.kcc20Address(
+    k,
+    templates.token,
+    inventoryState,
+    NETWORK_ID
+  );
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [
+      { entries: poolEntries },
+      { entries: inventoryEntries },
+      { entries: walletEntries },
+      tokenBalanceResponse
+    ] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: [resolvedPoolAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] }),
+      indexer.balance(tick, walletAddress)
+    ]);
+    const poolEntry = poolEntries.find(
+      (item) => item.outpoint.transactionId === head.pool.transactionId && item.outpoint.index === head.pool.index
+    ) ?? (poolEntries.length === 1 ? poolEntries[0] : null);
+    const inventoryEntry = inventoryEntries.find(
+      (item) => item.outpoint.transactionId === head.poolToken.transactionId && item.outpoint.index === head.poolToken.index
+    ) ?? (inventoryEntries.length === 1 ? inventoryEntries[0] : null);
+    if (!poolEntry || !inventoryEntry) {
+      throw new RetryableTradeStateError(
+        "Live AMM pool state is temporarily ambiguous; waiting before retrying."
+      );
+    }
+    if (!walletEntries.length) throw new Error("Bot wallet has no spendable KAS UTXOs.");
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const presenceWitnessIdx = 2;
+    const spend3 = kron.poolCpV3.buildPoolV3SwapKasForToken(
+      k,
+      templates.pool,
+      templates.token,
+      poolParams,
+      {
+        transactionId: poolEntry.outpoint.transactionId,
+        index: poolEntry.outpoint.index,
+        state: poolState,
+        tokenUtxo: {
+          transactionId: inventoryEntry.outpoint.transactionId,
+          index: inventoryEntry.outpoint.index,
+          value: BigInt(inventoryEntry.amount)
+        }
+      },
+      poolCovid,
+      buyerPubkey,
+      quote,
+      [],
+      presenceWitnessIdx
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    const fundingTotal = fundingEntries.reduce(
+      (sum, item) => sum + BigInt(item.amount),
+      0n
+    );
+    const walletBalance = walletEntries.reduce(
+      (sum, item) => sum + BigInt(item.amount),
+      0n
+    );
+    const maximumDebit = fundingTotal - assembly.change;
+    const recipientDust = maximumDebit - quote.total - networkFee;
+    if (maximumDebit > MAXIMUM_DEBIT_SOMPI) {
+      throw new Error(
+        `Maximum debit ${toKas(maximumDebit)} KAS exceeds the approved 22.75 KAS cap.`
+      );
+    }
+    if (!automation && walletBalance - maximumDebit < MINIMUM_RESERVE_SOMPI) {
+      throw new Error("Trade would breach the 25 KAS wallet reserve.");
+    }
+    if (enforceMinimumOutput && quote.tokenOut < 8n) {
+      throw new Error("Quote fell below the approved minimum output of 8 tokens.");
+    }
+    const rawTokenBalance = Array.isArray(tokenBalanceResponse) ? tokenBalanceResponse[0]?.balance : tokenBalanceResponse?.balance;
+    let transactionId;
+    let fundingSignatureScriptBytes;
+    if (submit || signOnly) {
+      const inputsBefore = assembly.transaction.inputs;
+      const covenantScripts = inputsBefore.slice(0, assembly.fundingInputIndexes[0]).map((input) => input.signatureScript);
+      assembly.transaction = k.signTransaction(assembly.transaction, [workingKey], false);
+      const inputsAfter = assembly.transaction.inputs;
+      covenantScripts.forEach((script, index) => {
+        if (inputsAfter[index].signatureScript !== script) {
+          throw new Error("Native signer modified a covenant input; refusing submission.");
+        }
+      });
+      fundingSignatureScriptBytes = assembly.fundingInputIndexes.map((index) => {
+        const script = inputsAfter[index].signatureScript;
+        if (!script || typeof script !== "string" || script.length % 2 !== 0) {
+          throw new Error("Native signer produced an invalid funding signature script.");
+        }
+        return script.length / 2;
+      });
+    }
+    if (submit && !automation) {
+      await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
+      await writeFile(
+        EXECUTION_LOCK,
+        JSON.stringify({ status: "pending", createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
+        { flag: "wx" }
+      );
+      try {
+        const result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+        transactionId = result.transactionId;
+        await writeFile(
+          EXECUTION_LOCK,
+          JSON.stringify({
+            status: "submitted",
+            transactionId,
+            submittedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            tokenId: entry.covenantId,
+            tradeKas: LIVE_TEST_KAS,
+            maximumDebitKas: toKas(maximumDebit),
+            venue: "pool"
+          })
+        );
+      } catch (error) {
+        await unlink(EXECUTION_LOCK).catch(() => void 0);
+        throw error;
+      }
+    } else if (submit) {
+      try {
+        const result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+        transactionId = result.transactionId;
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Pool buy submission failed with an unknown result.",
+          error
+        );
+      }
+    }
+    return {
+      tokenId: entry.covenantId,
+      symbol: entry.symbol,
+      tokenName: entry.name,
+      walletAddress,
+      walletKasBalance: toKas(walletBalance),
+      walletTokenBalance: Number(rawTokenBalance ?? 0),
+      tradeKas: LIVE_TEST_KAS,
+      tokenOut: Number(quote.tokenOut),
+      kronFeeKas: toKas(quote.creatorFee + quote.platformFee + quote.lpFee),
+      networkFeeKas: toKas(networkFee),
+      recipientDustKas: toKas(recipientDust),
+      maximumDebitKas: toKas(maximumDebit),
+      transactionBuilt: true,
+      signed: submit || signOnly,
+      submitted: submit,
+      transactionId,
+      fundingSignatureScriptBytes,
+      preparedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      venue: "pool",
+      warnings: [
+        "This preview is state-dependent and must be rebuilt immediately before execution.",
+        submit ? "The one-time live-test cap is now permanently consumed." : "No transaction was signed or submitted.",
+        "Live execution is available only from the private server command line."
+      ]
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+    workingKey = void 0;
+  }
+}
+async function runPoolSell(args) {
+  const {
+    lot,
+    submit,
+    key,
+    walletAddress,
+    traderPubkey,
+    entry,
+    poolCovidHex,
+    indexer
+  } = args;
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  if (!templates.pool) {
+    throw new Error("Configured token is missing a compiled AMM pool template.");
+  }
+  const tick = entry.symbol.toLowerCase();
+  const head = await resolvePoolHead(tick, indexer, submit);
+  const poolCovid = toBytes(poolCovidHex);
+  const tokenCovid = toBytes(entry.covenantId);
+  const poolState = {
+    kasReserve: BigInt(head.reserves.kasReserve),
+    tokenReserve: BigInt(head.reserves.tokenReserve),
+    tokenCovid,
+    totalShares: BigInt(head.reserves.totalShares),
+    lpCovid: toBytes(head.reserves.lpCovid || kron.genesis.ZERO_COVID)
+  };
+  const poolParams = poolParamsFromCurve(entry.extensions.curveParams);
+  const quote = kron.poolCpV3.quotePoolV3Sell(poolState, poolParams, BigInt(lot.amount));
+  if (!quote?.net || quote.net <= 0n) {
+    throw new Error("Managed lot has no positive AMM pool sell quote.");
+  }
+  const k = await loadKaspa();
+  const inventoryState = kron.kcc20.covenantIdOwned(poolCovid, poolState.tokenReserve, false);
+  const resolvedPoolAddress = kron.poolCpV3.poolCpV3Address(
+    k,
+    templates.pool,
+    poolState,
+    NETWORK_ID
+  );
+  const inventoryAddress = kron.kcc20.kcc20Address(
+    k,
+    templates.token,
+    inventoryState,
+    NETWORK_ID
+  );
+  const owned = await indexer.tokenUtxos(tick, walletAddress);
+  const ownedLot = owned.find(
+    (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
+  );
+  if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
+  const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+  const sellerAddress = kron.kcc20.kcc20Address(
+    k,
+    decoded.template,
+    decoded.state,
+    NETWORK_ID
+  );
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [
+      { entries: poolEntries },
+      { entries: inventoryEntries },
+      { entries: sellerEntries },
+      { entries: walletEntries }
+    ] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: [resolvedPoolAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [sellerAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] })
+    ]);
+    const poolEntry = poolEntries.find(
+      (item) => item.outpoint.transactionId === head.pool.transactionId && item.outpoint.index === head.pool.index
+    ) ?? (poolEntries.length === 1 ? poolEntries[0] : null);
+    const inventoryEntry = inventoryEntries.find(
+      (item) => item.outpoint.transactionId === head.poolToken.transactionId && item.outpoint.index === head.poolToken.index
+    ) ?? (inventoryEntries.length === 1 ? inventoryEntries[0] : null);
+    if (!poolEntry || !inventoryEntry) {
+      throw new RetryableTradeStateError(
+        "Live AMM pool state is temporarily ambiguous; waiting before retrying."
+      );
+    }
+    const sellerEntry = sellerEntries.find(
+      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
+    );
+    if (!sellerEntry || !walletEntries.length) {
+      throw new Error("Required sell UTXO is missing.");
+    }
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const presenceWitnessIdx = 3;
+    const spend3 = kron.poolCpV3.buildPoolV3SwapTokenForKas(
+      k,
+      templates.pool,
+      templates.token,
+      poolParams,
+      {
+        transactionId: poolEntry.outpoint.transactionId,
+        index: poolEntry.outpoint.index,
+        state: poolState,
+        tokenUtxo: {
+          transactionId: inventoryEntry.outpoint.transactionId,
+          index: inventoryEntry.outpoint.index,
+          value: BigInt(inventoryEntry.amount)
+        }
+      },
+      poolCovid,
+      traderPubkey,
+      [{
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state
+      }],
+      quote,
+      presenceWitnessIdx
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    const fundingTotal = BigInt(fundingEntries[0].amount);
+    const explicitTraderKas = templates.pool.recipientBound ? quote.kasOut - quote.creatorFee - quote.platformFee : 0n;
+    const netCredit = assembly.change - fundingTotal + explicitTraderKas;
+    if (netCredit <= 0n) {
+      throw new Error("Assembled pool sell does not produce a positive KAS credit.");
+    }
+    const covenantScripts = assembly.transaction.inputs.slice(0, assembly.fundingInputIndexes[0]).map((input) => input.signatureScript);
+    assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
+    covenantScripts.forEach((script, index) => {
+      if (assembly.transaction.inputs[index].signatureScript !== script) {
+        throw new Error("Signer modified a covenant input.");
+      }
+    });
+    let result = null;
+    if (submit) {
+      try {
+        result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Pool sell submission failed with an unknown result.",
+          error
+        );
+      }
+    }
+    return {
+      transactionId: result?.transactionId,
+      tokenIn: Number(lot.amount),
+      grossKas: toKas(quote.kasOut),
+      kronFeeKas: toKas(quote.creatorFee + quote.platformFee + quote.lpFee),
+      networkFeeKas: toKas(networkFee),
+      netCreditKas: toKas(netCredit),
+      signed: true,
+      submitted: submit,
+      venue: "pool"
     };
   } finally {
     await rpc.disconnect().catch(() => void 0);
