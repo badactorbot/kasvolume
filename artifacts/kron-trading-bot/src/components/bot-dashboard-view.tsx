@@ -7,7 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { useToast } from '@/hooks/use-toast';
-import { Play, Square, Wallet, Info, Copy, Check, ExternalLink, ScrollText } from 'lucide-react';
+import { Play, Square, Wallet, Info, Copy, Check, ExternalLink, ScrollText, RefreshCw } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Separator } from '@/components/ui/separator';
 import { CovenantChangeDialog } from '@/components/covenant-change-dialog';
@@ -19,10 +19,26 @@ export function BotDashboardView({ bot, strategy, walletAddress }: { bot: Active
   const [fundingAmount, setFundingAmount] = useState('');
   const [isFunding, setIsFunding] = useState(false);
   const [addressCopied, setAddressCopied] = useState(false);
+  const [isRefreshingBalance, setIsRefreshingBalance] = useState(false);
   const startBot = useStartUserBot();
   const stopBot = useStopUserBot();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+
+  const handleRefreshBalance = async () => {
+    try {
+      setIsRefreshingBalance(true);
+      await queryClient.refetchQueries({ queryKey: getGetUserBotDashboardQueryKey() });
+    } catch (err: any) {
+      toast({
+        title: 'Balance refresh failed',
+        description: err?.message || 'Could not read the on-chain bot balance.',
+        variant: 'destructive',
+      });
+    } finally {
+      setIsRefreshingBalance(false);
+    }
+  };
 
   const handleStart = async () => {
     try {
@@ -161,8 +177,22 @@ export function BotDashboardView({ bot, strategy, walletAddress }: { bot: Active
           <CardContent className="p-6 flex-1 flex flex-col">
             <div className="flex items-center justify-between mb-6">
               <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Bot Wallet (KAS)</p>
-              <div className="p-2 bg-primary/10 rounded-md text-primary border border-primary/20">
-                <Wallet className="w-4 h-4" />
+              <div className="flex items-center gap-1.5">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  onClick={handleRefreshBalance}
+                  disabled={isRefreshingBalance}
+                  className="h-8 w-8 text-muted-foreground hover:text-primary"
+                  aria-label="Refresh bot balance from chain"
+                  title="Refresh balance"
+                >
+                  <RefreshCw className={`w-4 h-4 ${isRefreshingBalance ? 'animate-spin' : ''}`} />
+                </Button>
+                <div className="p-2 bg-primary/10 rounded-md text-primary border border-primary/20">
+                  <Wallet className="w-4 h-4" />
+                </div>
               </div>
             </div>
             
@@ -171,7 +201,7 @@ export function BotDashboardView({ bot, strategy, walletAddress }: { bot: Active
                 {bot.botKasBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </p>
               <p className="mt-2 text-[9px] font-bold uppercase tracking-widest text-muted-foreground/70">
-                Live chain balance · refreshes every minute
+                Live chain balance · refresh or auto every minute
               </p>
               <div className="mt-4 rounded-lg border border-primary/40 bg-primary/5 p-3 shadow-[0_0_18px_rgba(45,212,191,0.08)]">
                 <p className="mb-2 text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
