@@ -764,8 +764,8 @@ var require_depd = __commonJS({
       return deprecate;
     }
     function eehaslisteners(emitter, type) {
-      var count2 = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
-      return count2 > 0;
+      var count = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
+      return count > 0;
     }
     function isignored(namespace) {
       if (process.noDeprecation) {
@@ -18468,14 +18468,14 @@ var require_urlencoded = __commonJS({
       };
     }
     function parameterCount(body, limit) {
-      let count2 = 0;
+      let count = 0;
       let index = -1;
       do {
-        count2++;
-        if (count2 > limit) return void 0;
+        count++;
+        if (count > limit) return void 0;
         index = body.indexOf("&", index + 1);
       } while (index !== -1);
-      return count2;
+      return count;
     }
   }
 });
@@ -23023,8 +23023,8 @@ var require_send = __commonJS({
       }
     }
     function hasListeners(emitter, type) {
-      var count2 = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
-      return count2 > 0;
+      var count = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
+      return count > 0;
     }
     function normalizeList(val, name) {
       var list = [].concat(val || []);
@@ -29503,11 +29503,11 @@ var require_binaryParsers = __commonJS({
         var array = [];
         var i2;
         if (dimension.length > 1) {
-          var count2 = dimension.shift();
-          for (i2 = 0; i2 < count2; i2++) {
+          var count = dimension.shift();
+          for (i2 = 0; i2 < count; i2++) {
             array[i2] = parse(dimension, elementType2);
           }
-          dimension.unshift(count2);
+          dimension.unshift(count);
         } else {
           for (i2 = 0; i2 < dimension[0]; i2++) {
             array[i2] = parseElement(elementType2);
@@ -39257,10 +39257,12 @@ async function runLiveBuy(submit, signOnly, automation = false, credentials, enf
     key = void 0;
   }
 }
-async function executeUserAutomatedSell(lot, credentials) {
-  return runAutomatedSell(lot, true, credentials);
+async function executeUserAutomatedSellLots(lots, credentials) {
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
+  return runAutomatedSell(lots, true, credentials);
 }
-async function runAutomatedSell(lot, submit, credentials) {
+async function runAutomatedSell(lots, submit, credentials) {
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
   const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
   const tokenId = resolveLiveTokenId(credentials);
   if (!privateKey) throw new Error("Live wallet configuration is missing.");
@@ -39290,7 +39292,7 @@ async function runAutomatedSell(lot, submit, credentials) {
       throw new Error("This token has graduated but has no AMM pool covenant id.");
     }
     return runPoolSell({
-      lot,
+      lots,
       submit,
       privateKey,
       key,
@@ -39328,6 +39330,7 @@ async function runAutomatedSell(lot, submit, credentials) {
   const tokenCovid = toBytes(entry.covenantId);
   const curveCovid = toBytes(entry.extensions.curveCovenantId);
   const tokenReserve = BigInt(token.cpState.tokenReserve);
+  const totalTokenIn = lots.reduce((sum, lot) => sum + BigInt(lot.amount), 0n);
   const state2 = { graduated: false, tokenCovid, tokenReserve };
   const inventoryState = kron.kcc20.covenantIdOwned(curveCovid, tokenReserve, false);
   const curveAddress = kron.curveCp.cpAddress(k, templates.curve, state2, NETWORK_ID);
@@ -39338,17 +39341,21 @@ async function runAutomatedSell(lot, submit, credentials) {
     NETWORK_ID
   );
   const owned = await indexer.tokenUtxos(entry.symbol.toLowerCase(), walletAddress);
-  const ownedLot = owned.find(
-    (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
-  );
-  if (!ownedLot) throw new Error("Managed KDIST lot is no longer spendable.");
-  const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
-  const sellerAddress = kron.kcc20.kcc20Address(
-    k,
-    decoded.template,
-    decoded.state,
-    NETWORK_ID
-  );
+  const preparedLots = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const sellerAddresses = [...new Set(preparedLots.map((item) => item.sellerAddress))];
   const rpc = new k.RpcClient({
     url: NODE_URL,
     networkId: NETWORK_ID,
@@ -39364,7 +39371,7 @@ async function runAutomatedSell(lot, submit, credentials) {
     ] = await Promise.all([
       rpc.getUtxosByAddresses({ addresses: [curveAddress] }),
       rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [sellerAddress] }),
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
       rpc.getUtxosByAddresses({ addresses: [walletAddress] })
     ]);
     if (curveEntries.length !== 1 || inventoryEntries.length !== 1) {
@@ -39372,10 +39379,19 @@ async function runAutomatedSell(lot, submit, credentials) {
         "Live curve state is temporarily ambiguous; waiting before retrying."
       );
     }
-    const sellerEntry = sellerEntries.find(
-      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
-    );
-    if (!sellerEntry || !walletEntries.length) throw new Error("Required sell UTXO is missing.");
+    const sellerTokens = preparedLots.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
+      );
+      if (!sellerEntry) throw new Error("Required sell UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state
+      };
+    });
+    if (!walletEntries.length) throw new Error("Required sell UTXO is missing.");
     const p = entry.extensions.curveParams;
     const quote = kron.curve.quoteCpSell(
       {
@@ -39387,12 +39403,13 @@ async function runAutomatedSell(lot, submit, credentials) {
         platformFeeBps: BigInt(p.platformFeeBps),
         devFundBps: BigInt(p.devFundBps ?? 0)
       },
-      BigInt(lot.amount)
+      totalTokenIn
     );
-    if (!quote?.net || quote.net <= 0n) throw new Error("Managed lot has no positive sell quote.");
+    if (!quote?.net || quote.net <= 0n) throw new Error("Managed lots have no positive sell quote.");
     const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
     const curveEntry = curveEntries[0];
     const inventoryEntry = inventoryEntries[0];
+    const presenceWitnessIdx = 2 + sellerTokens.length;
     const spend3 = kron.curveCp.buildCpSell(
       k,
       templates.curve,
@@ -39403,12 +39420,7 @@ async function runAutomatedSell(lot, submit, credentials) {
         realKas: BigInt(curveEntry.amount),
         state: state2
       },
-      [{
-        transactionId: lot.transactionId,
-        index: lot.index,
-        value: BigInt(sellerEntry.amount),
-        state: decoded.state
-      }],
+      sellerTokens,
       {
         transactionId: inventoryEntry.outpoint.transactionId,
         index: inventoryEntry.outpoint.index,
@@ -39417,9 +39429,9 @@ async function runAutomatedSell(lot, submit, credentials) {
       },
       curveCovid,
       traderPubkey,
-      BigInt(lot.amount),
+      totalTokenIn,
       quote.kasOut,
-      3
+      presenceWitnessIdx
     );
     let assembly = kron.spend.assembleNativeTx(k, {
       spend: spend3,
@@ -39460,7 +39472,8 @@ async function runAutomatedSell(lot, submit, credentials) {
     }
     return {
       transactionId: result?.transactionId,
-      tokenIn: Number(lot.amount),
+      tokenIn: Number(totalTokenIn),
+      lotCount: lots.length,
       grossKas: toKas(quote.kasOut),
       kronFeeKas: toKas(quote.fee),
       networkFeeKas: toKas(networkFee),
@@ -39713,7 +39726,7 @@ async function runPoolBuy(args) {
 }
 async function runPoolSell(args) {
   const {
-    lot,
+    lots,
     submit,
     key,
     walletAddress,
@@ -39722,6 +39735,7 @@ async function runPoolSell(args) {
     poolCovidHex,
     indexer
   } = args;
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
   const templates = await kron.client.fetchCpTemplates({
     baseUrl: API_URL,
     tokenCovid: entry.covenantId,
@@ -39743,9 +39757,10 @@ async function runPoolSell(args) {
     lpCovid: toBytes(head.reserves.lpCovid || kron.genesis.ZERO_COVID)
   };
   const poolParams = poolParamsFromCurve(entry.extensions.curveParams);
-  const quote = kron.poolCpV3.quotePoolV3Sell(poolState, poolParams, BigInt(lot.amount));
+  const totalTokenIn = lots.reduce((sum, lot) => sum + BigInt(lot.amount), 0n);
+  const quote = kron.poolCpV3.quotePoolV3Sell(poolState, poolParams, totalTokenIn);
   if (!quote?.net || quote.net <= 0n) {
-    throw new Error("Managed lot has no positive AMM pool sell quote.");
+    throw new Error("Managed lots have no positive AMM pool sell quote.");
   }
   const k = await loadKaspa();
   const inventoryState = kron.kcc20.covenantIdOwned(poolCovid, poolState.tokenReserve, false);
@@ -39762,17 +39777,21 @@ async function runPoolSell(args) {
     NETWORK_ID
   );
   const owned = await indexer.tokenUtxos(tick, walletAddress);
-  const ownedLot = owned.find(
-    (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
-  );
-  if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
-  const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
-  const sellerAddress = kron.kcc20.kcc20Address(
-    k,
-    decoded.template,
-    decoded.state,
-    NETWORK_ID
-  );
+  const preparedLots = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const sellerAddresses = [...new Set(preparedLots.map((item) => item.sellerAddress))];
   const rpc = new k.RpcClient({
     url: NODE_URL,
     networkId: NETWORK_ID,
@@ -39788,7 +39807,7 @@ async function runPoolSell(args) {
     ] = await Promise.all([
       rpc.getUtxosByAddresses({ addresses: [resolvedPoolAddress] }),
       rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [sellerAddress] }),
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
       rpc.getUtxosByAddresses({ addresses: [walletAddress] })
     ]);
     const poolEntry = poolEntries.find(
@@ -39802,14 +39821,23 @@ async function runPoolSell(args) {
         "Live AMM pool state is temporarily ambiguous; waiting before retrying."
       );
     }
-    const sellerEntry = sellerEntries.find(
-      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
-    );
-    if (!sellerEntry || !walletEntries.length) {
+    const traderTokens = preparedLots.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
+      );
+      if (!sellerEntry) throw new Error("Required sell UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state
+      };
+    });
+    if (!walletEntries.length) {
       throw new Error("Required sell UTXO is missing.");
     }
     const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
-    const presenceWitnessIdx = 3;
+    const presenceWitnessIdx = 2 + traderTokens.length;
     const spend3 = kron.poolCpV3.buildPoolV3SwapTokenForKas(
       k,
       templates.pool,
@@ -39827,12 +39855,7 @@ async function runPoolSell(args) {
       },
       poolCovid,
       traderPubkey,
-      [{
-        transactionId: lot.transactionId,
-        index: lot.index,
-        value: BigInt(sellerEntry.amount),
-        state: decoded.state
-      }],
+      traderTokens,
       quote,
       presenceWitnessIdx
     );
@@ -39878,7 +39901,8 @@ async function runPoolSell(args) {
     }
     return {
       transactionId: result?.transactionId,
-      tokenIn: Number(lot.amount),
+      tokenIn: Number(totalTokenIn),
+      lotCount: lots.length,
       grossKas: toKas(quote.kasOut),
       kronFeeKas: toKas(quote.creatorFee + quote.platformFee + quote.lpFee),
       networkFeeKas: toKas(networkFee),
@@ -43270,11 +43294,6 @@ function mapRelationalRow(tablesConfig, tableConfig, row, buildQueryResultSelect
     }
   }
   return result;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/functions/aggregate.js
-function count(expression) {
-  return sql`count(${expression || sql.raw("*")})`.mapWith(Number);
 }
 
 // src/lib/user-app-service.ts
@@ -48018,25 +48037,19 @@ async function submitUserBotKasWithdrawal(userId2, signedTransaction) {
 
 // src/lib/bot-sell-all-service.ts
 var ACTIVE_SELL_ALL_MS = 2 * 6e4;
-var BETWEEN_LOTS_MS = 15e3;
 var RETRY_WAIT_MS = 2e4;
-var SELL_ALL_DEADLINE_MS = 25 * 6e4;
-var MAX_ATTEMPTS_PER_LOT = 12;
+var SELL_ALL_DEADLINE_MS = 10 * 6e4;
+var MAX_ATTEMPTS = 12;
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function countOpenLots(botId) {
-  const [row] = await db.select({ value: count() }).from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt)));
-  return Number(row?.value ?? 0);
-}
-async function nextOpenLot(botId) {
-  const [lot] = await db.select().from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt))).orderBy(asc(managedLotsTable.createdAt)).limit(1);
-  return lot ?? null;
+async function listOpenLots(botId) {
+  return db.select().from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt))).orderBy(asc(managedLotsTable.createdAt));
 }
 function isDefinitiveSubmissionRejection(message) {
   return /orphan|is an orphan|rejected transaction|double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i.test(message);
 }
 function isRetryableFailure(error, message) {
   if (error instanceof RetryableTradeStateError) return true;
-  return /orphan|is an orphan|curve is busy|in-flight sequenced|no longer spendable/i.test(message);
+  return /orphan|is an orphan|curve is busy|in-flight sequenced|amm pool has an in-flight|no longer spendable/i.test(message);
 }
 async function clearSellAllMarker(botId, marker) {
   await db.update(tradingBotsTable).set({
@@ -48092,8 +48105,8 @@ async function sellAllUserBotManagedPositions(userId2) {
       }
     }
   }
-  const initialOpen = await countOpenLots(bot.id);
-  if (initialOpen === 0) {
+  const openLots = await listOpenLots(bot.id);
+  if (openLots.length === 0) {
     return {
       soldCount: 0,
       remainingOpenLots: 0,
@@ -48107,7 +48120,7 @@ async function sellAllUserBotManagedPositions(userId2) {
     action: "sell-all",
     startedAt: startedAt.toISOString(),
     heartbeatAt: startedAt.toISOString(),
-    soldCount: 0
+    lotCount: openLots.length
   };
   const [claim] = await db.update(tradingBotsTable).set({
     inFlight,
@@ -48123,148 +48136,99 @@ async function sellAllUserBotManagedPositions(userId2) {
     privateKey: decryptPrivateKey(bot.encryptedPrivateKey),
     tokenId
   };
-  const sellTransactionIds = [];
-  let soldCount = 0;
-  const initialTotalTrades = bot.totalTrades;
+  const lots = openLots.map((lot) => ({
+    transactionId: lot.buyTransactionId,
+    index: lot.outputIndex,
+    amount: lot.tokenAmount.toString()
+  }));
   const deadline = Date.now() + SELL_ALL_DEADLINE_MS;
+  let lastMessage = "Unknown sell failure";
   try {
-    while (Date.now() < deadline) {
-      const remaining = await countOpenLots(bot.id);
-      if (remaining === 0) break;
-      const lot = await nextOpenLot(bot.id);
-      if (!lot) break;
-      inFlight = await heartbeat(bot.id, inFlight, {
-        currentLotId: lot.id,
-        soldCount
-      });
-      let lotSold = false;
-      let lastMessage = "Unknown sell failure";
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_LOT && Date.now() < deadline; attempt += 1) {
-        inFlight = await heartbeat(bot.id, inFlight, {
-          currentLotId: lot.id,
-          soldCount
-        });
-        let submissionAttempted = false;
-        try {
-          const result = await executeUserAutomatedSell({
-            transactionId: lot.buyTransactionId,
-            index: lot.outputIndex,
-            amount: lot.tokenAmount.toString()
-          }, credentials);
-          submissionAttempted = true;
-          if (!result.transactionId) {
-            throw new Error("Sell submission returned no transaction ID.");
-          }
-          await db.transaction(async (tx) => {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS && Date.now() < deadline; attempt += 1) {
+      inFlight = await heartbeat(bot.id, inFlight, { lotCount: openLots.length });
+      let submissionAttempted = false;
+      try {
+        const result = await executeUserAutomatedSellLots(lots, credentials);
+        submissionAttempted = true;
+        if (!result.transactionId) {
+          throw new Error("Sell-all submission returned no transaction ID.");
+        }
+        const soldAt = /* @__PURE__ */ new Date();
+        await db.transaction(async (tx) => {
+          for (const lot of openLots) {
             await tx.update(managedLotsTable).set({
               sellTransactionId: result.transactionId,
-              soldAt: /* @__PURE__ */ new Date()
+              soldAt
             }).where(eq(managedLotsTable.id, lot.id));
-            await tx.update(tradingBotsTable).set({
-              totalTrades: initialTotalTrades + soldCount + 1,
-              lastTradeAt: /* @__PURE__ */ new Date(),
-              stopReason: null,
-              updatedAt: /* @__PURE__ */ new Date()
-            }).where(eq(tradingBotsTable.id, bot.id));
-          });
-          sellTransactionIds.push(result.transactionId);
-          soldCount += 1;
-          lotSold = true;
-          logger.info({
-            botId: bot.id,
-            lotId: lot.id,
-            transactionId: result.transactionId,
-            soldCount,
-            remainingAfter: remaining - 1
-          }, "Sell-all lot sold");
-          break;
-        } catch (error) {
-          submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
-          lastMessage = error instanceof Error ? error.message : "Unknown sell failure";
-          const definitiveReject = submissionAttempted && isDefinitiveSubmissionRejection(lastMessage);
-          const retryable = isRetryableFailure(error, lastMessage) || submissionAttempted && definitiveReject;
-          if (submissionAttempted && !definitiveReject) {
-            await db.update(tradingBotsTable).set({
-              status: "paused",
-              nextRunAt: null,
-              stopReason: `Sell-all paused after uncertain submission: ${lastMessage}`,
-              inFlight,
-              updatedAt: /* @__PURE__ */ new Date()
-            }).where(eq(tradingBotsTable.id, bot.id));
-            throw new Error(
-              `Sold ${soldCount} of ${initialOpen} position(s); a later sell may have been submitted and needs reconciliation. ${lastMessage}`
-            );
           }
-          if (retryable && attempt < MAX_ATTEMPTS_PER_LOT && Date.now() + RETRY_WAIT_MS < deadline) {
-            logger.warn({
-              botId: bot.id,
-              lotId: lot.id,
-              attempt,
-              err: lastMessage
-            }, "Sell-all retrying lot after transient failure");
-            inFlight = await heartbeat(bot.id, inFlight, { soldCount });
-            await sleep(RETRY_WAIT_MS);
-            continue;
-          }
-          const remainingOpenLots2 = await countOpenLots(bot.id);
-          await db.update(tradingBotsTable).set({
+          await tx.update(tradingBotsTable).set({
+            phase: "buying",
+            completedBuys: 0,
+            completedSells: 0,
+            totalTrades: bot.totalTrades + 1,
+            lastTradeAt: soldAt,
+            nextRunAt: null,
             inFlight: null,
-            stopReason: soldCount > 0 ? `Sell-all stopped after ${soldCount} of ${initialOpen} sale(s): ${lastMessage}` : `Sell-all failed: ${lastMessage}`,
-            phase: remainingOpenLots2 === 0 ? "buying" : "selling",
-            completedBuys: remainingOpenLots2 === 0 ? 0 : bot.completedBuys,
-            completedSells: remainingOpenLots2 === 0 ? 0 : bot.completedSells,
+            stopReason: null,
+            updatedAt: soldAt
+          }).where(eq(tradingBotsTable.id, bot.id));
+        });
+        logger.info({
+          botId: bot.id,
+          transactionId: result.transactionId,
+          soldCount: openLots.length,
+          tokenIn: result.tokenIn
+        }, "Sell-all completed in one transaction");
+        return {
+          soldCount: openLots.length,
+          remainingOpenLots: 0,
+          sellTransactionIds: [result.transactionId],
+          complete: true,
+          message: `Sold all ${openLots.length} managed position(s) in one transaction. You can withdraw KAS now.`
+        };
+      } catch (error) {
+        submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
+        lastMessage = error instanceof Error ? error.message : "Unknown sell failure";
+        const definitiveReject = submissionAttempted && isDefinitiveSubmissionRejection(lastMessage);
+        const retryable = isRetryableFailure(error, lastMessage) || submissionAttempted && definitiveReject;
+        if (submissionAttempted && !definitiveReject) {
+          await db.update(tradingBotsTable).set({
+            status: "paused",
+            nextRunAt: null,
+            stopReason: `Sell-all paused after uncertain submission: ${lastMessage}`,
+            inFlight,
             updatedAt: /* @__PURE__ */ new Date()
           }).where(eq(tradingBotsTable.id, bot.id));
           throw new Error(
-            `Sold ${soldCount} of ${initialOpen} position(s), then failed: ${lastMessage}` + (remainingOpenLots2 > 0 ? ` ${remainingOpenLots2} remain \u2014 retry Sell all.` : "")
+            `Sell-all may have been submitted and needs reconciliation. ${lastMessage}`
           );
         }
-      }
-      if (!lotSold) {
-        const remainingOpenLots2 = await countOpenLots(bot.id);
+        if (retryable && attempt < MAX_ATTEMPTS && Date.now() + RETRY_WAIT_MS < deadline) {
+          logger.warn({
+            botId: bot.id,
+            attempt,
+            err: lastMessage
+          }, "Sell-all retrying single-tx sell after transient failure");
+          inFlight = await heartbeat(bot.id, inFlight, { lotCount: openLots.length });
+          await sleep(RETRY_WAIT_MS);
+          continue;
+        }
         await db.update(tradingBotsTable).set({
           inFlight: null,
-          stopReason: `Sell-all timed out after ${soldCount} of ${initialOpen} sale(s).`,
-          phase: remainingOpenLots2 === 0 ? "buying" : "selling",
+          stopReason: `Sell-all failed: ${lastMessage}`,
+          phase: "selling",
           updatedAt: /* @__PURE__ */ new Date()
         }).where(eq(tradingBotsTable.id, bot.id));
-        throw new Error(
-          `Sold ${soldCount} of ${initialOpen} position(s), then timed out. ${remainingOpenLots2} remain \u2014 retry Sell all.`
-        );
+        throw new Error(`Sell-all failed: ${lastMessage}`);
       }
-      if (await countOpenLots(bot.id) > 0) {
-        inFlight = await heartbeat(bot.id, inFlight, { soldCount });
-        await sleep(BETWEEN_LOTS_MS);
-      }
-    }
-    const remainingOpenLots = await countOpenLots(bot.id);
-    if (remainingOpenLots > 0) {
-      await db.update(tradingBotsTable).set({
-        inFlight: null,
-        stopReason: `Sell-all reached time limit after ${soldCount} of ${initialOpen} sale(s).`,
-        phase: "selling",
-        updatedAt: /* @__PURE__ */ new Date()
-      }).where(eq(tradingBotsTable.id, bot.id));
-      throw new Error(
-        `Sold ${soldCount} of ${initialOpen} position(s) before the time limit. ${remainingOpenLots} remain \u2014 retry Sell all.`
-      );
     }
     await db.update(tradingBotsTable).set({
-      phase: "buying",
-      completedBuys: 0,
-      completedSells: 0,
-      nextRunAt: null,
       inFlight: null,
-      stopReason: null,
+      stopReason: `Sell-all timed out: ${lastMessage}`,
+      phase: "selling",
       updatedAt: /* @__PURE__ */ new Date()
     }).where(eq(tradingBotsTable.id, bot.id));
-    return {
-      soldCount,
-      remainingOpenLots: 0,
-      sellTransactionIds,
-      complete: true,
-      message: `Sold all ${soldCount} managed position(s). You can withdraw KAS now.`
-    };
+    throw new Error(`Sell-all timed out: ${lastMessage}`);
   } catch (error) {
     throw error;
   }

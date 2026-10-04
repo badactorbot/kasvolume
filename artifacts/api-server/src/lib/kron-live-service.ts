@@ -472,34 +472,42 @@ async function runLiveBuy(
   }
 }
 
-export async function executeAutomatedSell(lot: {
+export type ManagedSellLot = {
   transactionId: string;
   index: number;
   amount: string;
-}) {
-  return runAutomatedSell(lot, true);
+};
+
+export async function executeAutomatedSell(lot: ManagedSellLot) {
+  return runAutomatedSell([lot], true);
 }
 
 export async function executeUserAutomatedSell(
-  lot: { transactionId: string; index: number; amount: string },
+  lot: ManagedSellLot,
   credentials: LiveBotCredentials,
 ) {
-  return runAutomatedSell(lot, true, credentials);
+  return runAutomatedSell([lot], true, credentials);
 }
 
-export async function validateAutomatedSell(lot: {
-  transactionId: string;
-  index: number;
-  amount: string;
-}) {
-  return runAutomatedSell(lot, false);
+/** Sell one or many managed lots in a single covenant transaction. */
+export async function executeUserAutomatedSellLots(
+  lots: ManagedSellLot[],
+  credentials: LiveBotCredentials,
+) {
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
+  return runAutomatedSell(lots, true, credentials);
 }
 
-async function runAutomatedSell(lot: {
-  transactionId: string;
-  index: number;
-  amount: string;
-}, submit: boolean, credentials?: LiveBotCredentials) {
+export async function validateAutomatedSell(lot: ManagedSellLot) {
+  return runAutomatedSell([lot], false);
+}
+
+async function runAutomatedSell(
+  lots: ManagedSellLot[],
+  submit: boolean,
+  credentials?: LiveBotCredentials,
+) {
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
   const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
   const tokenId = resolveLiveTokenId(credentials);
   if (!privateKey) throw new Error("Live wallet configuration is missing.");
@@ -536,7 +544,7 @@ async function runAutomatedSell(lot: {
       throw new Error("This token has graduated but has no AMM pool covenant id.");
     }
     return runPoolSell({
-      lot,
+      lots,
       submit,
       privateKey,
       key,
@@ -577,6 +585,7 @@ async function runAutomatedSell(lot: {
   const tokenCovid = toBytes(entry.covenantId);
   const curveCovid = toBytes(entry.extensions.curveCovenantId);
   const tokenReserve = BigInt(token.cpState.tokenReserve);
+  const totalTokenIn = lots.reduce((sum, lot) => sum + BigInt(lot.amount), 0n);
   const state = { graduated: false, tokenCovid, tokenReserve };
   const inventoryState = kron.kcc20.covenantIdOwned(curveCovid, tokenReserve, false);
   const curveAddress = kron.curveCp.cpAddress(k, templates.curve, state, NETWORK_ID);
@@ -587,20 +596,24 @@ async function runAutomatedSell(lot: {
     NETWORK_ID,
   );
   const owned = await indexer.tokenUtxos(entry.symbol.toLowerCase(), walletAddress);
-  const ownedLot = owned.find(
-    (item) =>
-      item.outpoint.transactionId === lot.transactionId &&
-      item.outpoint.index === lot.index &&
-      item.amount === lot.amount,
-  );
-  if (!ownedLot) throw new Error("Managed KDIST lot is no longer spendable.");
-  const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
-  const sellerAddress = kron.kcc20.kcc20Address(
-    k,
-    decoded.template,
-    decoded.state,
-    NETWORK_ID,
-  );
+  const preparedLots = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) =>
+        item.outpoint.transactionId === lot.transactionId &&
+        item.outpoint.index === lot.index &&
+        item.amount === lot.amount,
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID,
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const sellerAddresses = [...new Set(preparedLots.map((item) => item.sellerAddress))];
 
   const rpc = new k.RpcClient({
     url: NODE_URL,
@@ -617,7 +630,7 @@ async function runAutomatedSell(lot: {
     ] = await Promise.all([
       rpc.getUtxosByAddresses({ addresses: [curveAddress] }),
       rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [sellerAddress] }),
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
       rpc.getUtxosByAddresses({ addresses: [walletAddress] }),
     ]);
     if (curveEntries.length !== 1 || inventoryEntries.length !== 1) {
@@ -625,12 +638,21 @@ async function runAutomatedSell(lot: {
         "Live curve state is temporarily ambiguous; waiting before retrying.",
       );
     }
-    const sellerEntry = sellerEntries.find(
-      (item) =>
-        item.outpoint.transactionId === lot.transactionId &&
-        item.outpoint.index === lot.index,
-    );
-    if (!sellerEntry || !walletEntries.length) throw new Error("Required sell UTXO is missing.");
+    const sellerTokens = preparedLots.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item) =>
+          item.outpoint.transactionId === lot.transactionId &&
+          item.outpoint.index === lot.index,
+      );
+      if (!sellerEntry) throw new Error("Required sell UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state,
+      };
+    });
+    if (!walletEntries.length) throw new Error("Required sell UTXO is missing.");
 
     const p = entry.extensions.curveParams;
     const quote = kron.curve.quoteCpSell(
@@ -643,15 +665,17 @@ async function runAutomatedSell(lot: {
         platformFeeBps: BigInt(p.platformFeeBps),
         devFundBps: BigInt(p.devFundBps ?? 0),
       },
-      BigInt(lot.amount),
+      totalTokenIn,
     );
-    if (!quote?.net || quote.net <= 0n) throw new Error("Managed lot has no positive sell quote.");
+    if (!quote?.net || quote.net <= 0n) throw new Error("Managed lots have no positive sell quote.");
 
     const fundingEntries = [...walletEntries]
       .sort((a, b) => (BigInt(a.amount) < BigInt(b.amount) ? 1 : -1))
       .slice(0, 1);
     const curveEntry = curveEntries[0];
     const inventoryEntry = inventoryEntries[0];
+    // [0]=curve [1]=inventory [...sellerTokens] [funding]
+    const presenceWitnessIdx = 2 + sellerTokens.length;
     const spend = kron.curveCp.buildCpSell(
       k,
       templates.curve,
@@ -662,12 +686,7 @@ async function runAutomatedSell(lot: {
         realKas: BigInt(curveEntry.amount),
         state,
       },
-      [{
-        transactionId: lot.transactionId,
-        index: lot.index,
-        value: BigInt(sellerEntry.amount),
-        state: decoded.state,
-      }],
+      sellerTokens,
       {
         transactionId: inventoryEntry.outpoint.transactionId,
         index: inventoryEntry.outpoint.index,
@@ -676,9 +695,9 @@ async function runAutomatedSell(lot: {
       },
       curveCovid,
       traderPubkey,
-      BigInt(lot.amount),
+      totalTokenIn,
       quote.kasOut,
-      3,
+      presenceWitnessIdx,
     );
     let assembly = kron.spend.assembleNativeTx(k, {
       spend,
@@ -722,7 +741,8 @@ async function runAutomatedSell(lot: {
     }
     return {
       transactionId: result?.transactionId,
-      tokenIn: Number(lot.amount),
+      tokenIn: Number(totalTokenIn),
+      lotCount: lots.length,
       grossKas: toKas(quote.kasOut),
       kronFeeKas: toKas(quote.fee),
       networkFeeKas: toKas(networkFee),
@@ -1013,7 +1033,7 @@ async function runPoolBuy(args: {
 }
 
 async function runPoolSell(args: {
-  lot: { transactionId: string; index: number; amount: string };
+  lots: ManagedSellLot[];
   submit: boolean;
   privateKey: string;
   key: any;
@@ -1026,7 +1046,7 @@ async function runPoolSell(args: {
   indexer: InstanceType<typeof kron.client.IndexerClient>;
 }) {
   const {
-    lot,
+    lots,
     submit,
     key,
     walletAddress,
@@ -1035,6 +1055,7 @@ async function runPoolSell(args: {
     poolCovidHex,
     indexer,
   } = args;
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
 
   const templates = await kron.client.fetchCpTemplates({
     baseUrl: API_URL,
@@ -1058,9 +1079,10 @@ async function runPoolSell(args: {
     lpCovid: toBytes(head.reserves.lpCovid || kron.genesis.ZERO_COVID),
   };
   const poolParams = poolParamsFromCurve(entry.extensions.curveParams);
-  const quote = kron.poolCpV3.quotePoolV3Sell(poolState, poolParams, BigInt(lot.amount));
+  const totalTokenIn = lots.reduce((sum, lot) => sum + BigInt(lot.amount), 0n);
+  const quote = kron.poolCpV3.quotePoolV3Sell(poolState, poolParams, totalTokenIn);
   if (!quote?.net || quote.net <= 0n) {
-    throw new Error("Managed lot has no positive AMM pool sell quote.");
+    throw new Error("Managed lots have no positive AMM pool sell quote.");
   }
 
   const k = await loadKaspa();
@@ -1079,20 +1101,24 @@ async function runPoolSell(args: {
   );
 
   const owned = await indexer.tokenUtxos(tick, walletAddress);
-  const ownedLot = owned.find(
-    (item) =>
-      item.outpoint.transactionId === lot.transactionId &&
-      item.outpoint.index === lot.index &&
-      item.amount === lot.amount,
-  );
-  if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
-  const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
-  const sellerAddress = kron.kcc20.kcc20Address(
-    k,
-    decoded.template,
-    decoded.state,
-    NETWORK_ID,
-  );
+  const preparedLots = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) =>
+        item.outpoint.transactionId === lot.transactionId &&
+        item.outpoint.index === lot.index &&
+        item.amount === lot.amount,
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID,
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const sellerAddresses = [...new Set(preparedLots.map((item) => item.sellerAddress))];
 
   const rpc = new k.RpcClient({
     url: NODE_URL,
@@ -1109,7 +1135,7 @@ async function runPoolSell(args: {
     ] = await Promise.all([
       rpc.getUtxosByAddresses({ addresses: [resolvedPoolAddress] }),
       rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [sellerAddress] }),
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
       rpc.getUtxosByAddresses({ addresses: [walletAddress] }),
     ]);
 
@@ -1129,20 +1155,29 @@ async function runPoolSell(args: {
       );
     }
 
-    const sellerEntry = sellerEntries.find(
-      (item: any) =>
-        item.outpoint.transactionId === lot.transactionId &&
-        item.outpoint.index === lot.index,
-    );
-    if (!sellerEntry || !walletEntries.length) {
+    const traderTokens = preparedLots.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item: any) =>
+          item.outpoint.transactionId === lot.transactionId &&
+          item.outpoint.index === lot.index,
+      );
+      if (!sellerEntry) throw new Error("Required sell UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state,
+      };
+    });
+    if (!walletEntries.length) {
       throw new Error("Required sell UTXO is missing.");
     }
 
     const fundingEntries = [...walletEntries]
       .sort((a: any, b: any) => (BigInt(a.amount) < BigInt(b.amount) ? 1 : -1))
       .slice(0, 1);
-    // [0]=pool [1]=poolToken [2]=traderToken [3]=funding
-    const presenceWitnessIdx = 3;
+    // [0]=pool [1]=poolToken [...traderTokens] [funding]
+    const presenceWitnessIdx = 2 + traderTokens.length;
     const spend = kron.poolCpV3.buildPoolV3SwapTokenForKas(
       k,
       templates.pool,
@@ -1160,12 +1195,7 @@ async function runPoolSell(args: {
       },
       poolCovid,
       traderPubkey,
-      [{
-        transactionId: lot.transactionId,
-        index: lot.index,
-        value: BigInt(sellerEntry.amount),
-        state: decoded.state,
-      }],
+      traderTokens,
       quote,
       presenceWitnessIdx,
     );
@@ -1219,7 +1249,8 @@ async function runPoolSell(args: {
     }
     return {
       transactionId: result?.transactionId,
-      tokenIn: Number(lot.amount),
+      tokenIn: Number(totalTokenIn),
+      lotCount: lots.length,
       grossKas: toKas(quote.kasOut),
       kronFeeKas: toKas(quote.creatorFee + quote.platformFee + quote.lpFee),
       networkFeeKas: toKas(networkFee),

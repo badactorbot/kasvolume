@@ -1,7 +1,7 @@
-import { and, asc, count, eq, isNull, ne } from "drizzle-orm";
+import { and, asc, eq, isNull, ne } from "drizzle-orm";
 import { db, managedLotsTable, tradingBotsTable } from "@workspace/db";
 import {
-  executeUserAutomatedSell,
+  executeUserAutomatedSellLots,
   RetryableTradeStateError,
   TradeSubmissionAttemptedError,
 } from "./kron-live-service";
@@ -11,41 +11,28 @@ import { logger } from "./logger";
 
 /** Concurrent requests only block while a sell-all is actively heartbeating. */
 const ACTIVE_SELL_ALL_MS = 2 * 60_000;
-/** Wait between successful lot sells so the curve/sequencer can settle. */
-const BETWEEN_LOTS_MS = 15_000;
-/** Backoff when the curve reports busy / transient reject. */
+/** Backoff when the curve/pool reports busy / transient reject. */
 const RETRY_WAIT_MS = 20_000;
-/** Overall deadline for one Sell All request (covers several lots + retries). */
-const SELL_ALL_DEADLINE_MS = 25 * 60_000;
-/** Max attempts per individual lot before giving up that lot. */
-const MAX_ATTEMPTS_PER_LOT = 12;
+/** Overall deadline for one Sell All request (single-tx retries). */
+const SELL_ALL_DEADLINE_MS = 10 * 60_000;
+/** Max rebuild/submit attempts for the one combined sell. */
+const MAX_ATTEMPTS = 12;
 
 type SellAllInFlight = {
   action: "sell-all";
   startedAt: string;
   heartbeatAt: string;
-  currentLotId?: string;
-  soldCount?: number;
+  lotCount?: number;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function countOpenLots(botId: string) {
-  const [row] = await db
-    .select({ value: count() })
-    .from(managedLotsTable)
-    .where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt)));
-  return Number(row?.value ?? 0);
-}
-
-async function nextOpenLot(botId: string) {
-  const [lot] = await db
+async function listOpenLots(botId: string) {
+  return db
     .select()
     .from(managedLotsTable)
     .where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt)))
-    .orderBy(asc(managedLotsTable.createdAt))
-    .limit(1);
-  return lot ?? null;
+    .orderBy(asc(managedLotsTable.createdAt));
 }
 
 /** RPC rejections that did not land on-chain — safe to retry or clear the lock. */
@@ -56,8 +43,8 @@ function isDefinitiveSubmissionRejection(message: string) {
 
 function isRetryableFailure(error: unknown, message: string) {
   if (error instanceof RetryableTradeStateError) return true;
-  // Orphans / race after a prior sell often clear after a short wait.
-  return /orphan|is an orphan|curve is busy|in-flight sequenced|no longer spendable/i.test(message);
+  return /orphan|is an orphan|curve is busy|in-flight sequenced|amm pool has an in-flight|no longer spendable/i
+    .test(message);
 }
 
 async function clearSellAllMarker(botId: string, marker: unknown) {
@@ -71,11 +58,7 @@ async function clearSellAllMarker(botId: string, marker: unknown) {
   ));
 }
 
-async function heartbeat(
-  botId: string,
-  base: SellAllInFlight,
-  patch: Partial<SellAllInFlight> = {},
-) {
+async function heartbeat(botId: string, base: SellAllInFlight, patch: Partial<SellAllInFlight> = {}) {
   const next: SellAllInFlight = {
     ...base,
     ...patch,
@@ -132,8 +115,8 @@ export async function sellAllUserBotManagedPositions(userId: string) {
     }
   }
 
-  const initialOpen = await countOpenLots(bot.id);
-  if (initialOpen === 0) {
+  const openLots = await listOpenLots(bot.id);
+  if (openLots.length === 0) {
     return {
       soldCount: 0,
       remainingOpenLots: 0,
@@ -148,7 +131,7 @@ export async function sellAllUserBotManagedPositions(userId: string) {
     action: "sell-all",
     startedAt: startedAt.toISOString(),
     heartbeatAt: startedAt.toISOString(),
-    soldCount: 0,
+    lotCount: openLots.length,
   };
   const [claim] = await db.update(tradingBotsTable).set({
     inFlight,
@@ -165,170 +148,108 @@ export async function sellAllUserBotManagedPositions(userId: string) {
     privateKey: decryptPrivateKey(bot.encryptedPrivateKey),
     tokenId,
   };
-  const sellTransactionIds: string[] = [];
-  let soldCount = 0;
-  const initialTotalTrades = bot.totalTrades;
+  const lots = openLots.map((lot) => ({
+    transactionId: lot.buyTransactionId,
+    index: lot.outputIndex,
+    amount: lot.tokenAmount.toString(),
+  }));
   const deadline = Date.now() + SELL_ALL_DEADLINE_MS;
+  let lastMessage = "Unknown sell failure";
 
   try {
-    while (Date.now() < deadline) {
-      const remaining = await countOpenLots(bot.id);
-      if (remaining === 0) break;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS && Date.now() < deadline; attempt += 1) {
+      inFlight = await heartbeat(bot.id, inFlight, { lotCount: openLots.length });
+      let submissionAttempted = false;
+      try {
+        const result = await executeUserAutomatedSellLots(lots, credentials);
+        submissionAttempted = true;
+        if (!result.transactionId) {
+          throw new Error("Sell-all submission returned no transaction ID.");
+        }
 
-      const lot = await nextOpenLot(bot.id);
-      if (!lot) break;
-
-      inFlight = await heartbeat(bot.id, inFlight, {
-        currentLotId: lot.id,
-        soldCount,
-      });
-
-      let lotSold = false;
-      let lastMessage = "Unknown sell failure";
-
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_LOT && Date.now() < deadline; attempt += 1) {
-        inFlight = await heartbeat(bot.id, inFlight, {
-          currentLotId: lot.id,
-          soldCount,
-        });
-
-        let submissionAttempted = false;
-        try {
-          const result = await executeUserAutomatedSell({
-            transactionId: lot.buyTransactionId,
-            index: lot.outputIndex,
-            amount: lot.tokenAmount.toString(),
-          }, credentials);
-          submissionAttempted = true;
-          if (!result.transactionId) {
-            throw new Error("Sell submission returned no transaction ID.");
-          }
-
-          await db.transaction(async (tx) => {
+        const soldAt = new Date();
+        await db.transaction(async (tx) => {
+          for (const lot of openLots) {
             await tx.update(managedLotsTable).set({
               sellTransactionId: result.transactionId,
-              soldAt: new Date(),
+              soldAt,
             }).where(eq(managedLotsTable.id, lot.id));
-            await tx.update(tradingBotsTable).set({
-              totalTrades: initialTotalTrades + soldCount + 1,
-              lastTradeAt: new Date(),
-              stopReason: null,
-              updatedAt: new Date(),
-            }).where(eq(tradingBotsTable.id, bot.id));
-          });
-
-          sellTransactionIds.push(result.transactionId);
-          soldCount += 1;
-          lotSold = true;
-          logger.info({
-            botId: bot.id,
-            lotId: lot.id,
-            transactionId: result.transactionId,
-            soldCount,
-            remainingAfter: remaining - 1,
-          }, "Sell-all lot sold");
-          break;
-        } catch (error) {
-          submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
-          lastMessage = error instanceof Error ? error.message : "Unknown sell failure";
-          const definitiveReject = submissionAttempted && isDefinitiveSubmissionRejection(lastMessage);
-          const retryable = isRetryableFailure(error, lastMessage)
-            || (submissionAttempted && definitiveReject);
-
-          if (submissionAttempted && !definitiveReject) {
-            // Truly uncertain outcome — keep lock for reconciliation; do not continue.
-            await db.update(tradingBotsTable).set({
-              status: "paused",
-              nextRunAt: null,
-              stopReason: `Sell-all paused after uncertain submission: ${lastMessage}`,
-              inFlight,
-              updatedAt: new Date(),
-            }).where(eq(tradingBotsTable.id, bot.id));
-            throw new Error(
-              `Sold ${soldCount} of ${initialOpen} position(s); a later sell may have been submitted and needs reconciliation. ${lastMessage}`,
-            );
           }
-
-          if (retryable && attempt < MAX_ATTEMPTS_PER_LOT && Date.now() + RETRY_WAIT_MS < deadline) {
-            logger.warn({
-              botId: bot.id,
-              lotId: lot.id,
-              attempt,
-              err: lastMessage,
-            }, "Sell-all retrying lot after transient failure");
-            inFlight = await heartbeat(bot.id, inFlight, { soldCount });
-            await sleep(RETRY_WAIT_MS);
-            continue;
-          }
-
-          const remainingOpenLots = await countOpenLots(bot.id);
-          await db.update(tradingBotsTable).set({
+          await tx.update(tradingBotsTable).set({
+            phase: "buying",
+            completedBuys: 0,
+            completedSells: 0,
+            totalTrades: bot.totalTrades + 1,
+            lastTradeAt: soldAt,
+            nextRunAt: null,
             inFlight: null,
-            stopReason: soldCount > 0
-              ? `Sell-all stopped after ${soldCount} of ${initialOpen} sale(s): ${lastMessage}`
-              : `Sell-all failed: ${lastMessage}`,
-            phase: remainingOpenLots === 0 ? "buying" : "selling",
-            completedBuys: remainingOpenLots === 0 ? 0 : bot.completedBuys,
-            completedSells: remainingOpenLots === 0 ? 0 : bot.completedSells,
+            stopReason: null,
+            updatedAt: soldAt,
+          }).where(eq(tradingBotsTable.id, bot.id));
+        });
+
+        logger.info({
+          botId: bot.id,
+          transactionId: result.transactionId,
+          soldCount: openLots.length,
+          tokenIn: result.tokenIn,
+        }, "Sell-all completed in one transaction");
+
+        return {
+          soldCount: openLots.length,
+          remainingOpenLots: 0,
+          sellTransactionIds: [result.transactionId],
+          complete: true,
+          message: `Sold all ${openLots.length} managed position(s) in one transaction. You can withdraw KAS now.`,
+        };
+      } catch (error) {
+        submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
+        lastMessage = error instanceof Error ? error.message : "Unknown sell failure";
+        const definitiveReject = submissionAttempted && isDefinitiveSubmissionRejection(lastMessage);
+        const retryable = isRetryableFailure(error, lastMessage)
+          || (submissionAttempted && definitiveReject);
+
+        if (submissionAttempted && !definitiveReject) {
+          await db.update(tradingBotsTable).set({
+            status: "paused",
+            nextRunAt: null,
+            stopReason: `Sell-all paused after uncertain submission: ${lastMessage}`,
+            inFlight,
             updatedAt: new Date(),
           }).where(eq(tradingBotsTable.id, bot.id));
           throw new Error(
-            `Sold ${soldCount} of ${initialOpen} position(s), then failed: ${lastMessage}`
-              + (remainingOpenLots > 0 ? ` ${remainingOpenLots} remain — retry Sell all.` : ""),
+            `Sell-all may have been submitted and needs reconciliation. ${lastMessage}`,
           );
         }
-      }
 
-      if (!lotSold) {
-        const remainingOpenLots = await countOpenLots(bot.id);
+        if (retryable && attempt < MAX_ATTEMPTS && Date.now() + RETRY_WAIT_MS < deadline) {
+          logger.warn({
+            botId: bot.id,
+            attempt,
+            err: lastMessage,
+          }, "Sell-all retrying single-tx sell after transient failure");
+          inFlight = await heartbeat(bot.id, inFlight, { lotCount: openLots.length });
+          await sleep(RETRY_WAIT_MS);
+          continue;
+        }
+
         await db.update(tradingBotsTable).set({
           inFlight: null,
-          stopReason: `Sell-all timed out after ${soldCount} of ${initialOpen} sale(s).`,
-          phase: remainingOpenLots === 0 ? "buying" : "selling",
+          stopReason: `Sell-all failed: ${lastMessage}`,
+          phase: "selling",
           updatedAt: new Date(),
         }).where(eq(tradingBotsTable.id, bot.id));
-        throw new Error(
-          `Sold ${soldCount} of ${initialOpen} position(s), then timed out. ${remainingOpenLots} remain — retry Sell all.`,
-        );
+        throw new Error(`Sell-all failed: ${lastMessage}`);
       }
-
-      // More lots left: wait for sequencer/curve before the next sell.
-      if (await countOpenLots(bot.id) > 0) {
-        inFlight = await heartbeat(bot.id, inFlight, { soldCount });
-        await sleep(BETWEEN_LOTS_MS);
-      }
-    }
-
-    const remainingOpenLots = await countOpenLots(bot.id);
-    if (remainingOpenLots > 0) {
-      await db.update(tradingBotsTable).set({
-        inFlight: null,
-        stopReason: `Sell-all reached time limit after ${soldCount} of ${initialOpen} sale(s).`,
-        phase: "selling",
-        updatedAt: new Date(),
-      }).where(eq(tradingBotsTable.id, bot.id));
-      throw new Error(
-        `Sold ${soldCount} of ${initialOpen} position(s) before the time limit. ${remainingOpenLots} remain — retry Sell all.`,
-      );
     }
 
     await db.update(tradingBotsTable).set({
-      phase: "buying",
-      completedBuys: 0,
-      completedSells: 0,
-      nextRunAt: null,
       inFlight: null,
-      stopReason: null,
+      stopReason: `Sell-all timed out: ${lastMessage}`,
+      phase: "selling",
       updatedAt: new Date(),
     }).where(eq(tradingBotsTable.id, bot.id));
-
-    return {
-      soldCount,
-      remainingOpenLots: 0,
-      sellTransactionIds,
-      complete: true,
-      message: `Sold all ${soldCount} managed position(s). You can withdraw KAS now.`,
-    };
+    throw new Error(`Sell-all timed out: ${lastMessage}`);
   } catch (error) {
     throw error;
   }
