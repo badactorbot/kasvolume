@@ -23,8 +23,13 @@ primary_region = "iad"
   force_https = true
   auto_stop_machines = "off"
   auto_start_machines = true
+  # Keep exactly one always-on Machine. The trade scheduler must not run twice.
   min_machines_running = 1
   processes = ["app"]
+
+[deploy]
+  # Prefer in-place updates so Fly does not keep a second standby Machine.
+  strategy = "immediate"
 
 [[vm]]
   memory = "512mb"

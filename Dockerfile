@@ -11,12 +11,12 @@ FROM base AS deps
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc tsconfig.base.json tsconfig.json ./
 COPY artifacts/api-server/package.json ./artifacts/api-server/
 COPY artifacts/kron-trading-bot/package.json ./artifacts/kron-trading-bot/
-COPY artifacts/mockup-sandbox/package.json ./artifacts/mockup-sandbox/
 COPY lib/db/package.json ./lib/db/
 COPY lib/api-zod/package.json ./lib/api-zod/
 COPY lib/api-client-react/package.json ./lib/api-client-react/
 COPY lib/api-spec/package.json ./lib/api-spec/
 COPY scripts/package.json ./scripts/
+# mockup-sandbox is excluded from the image; workspace glob simply skips it.
 RUN pnpm install --frozen-lockfile
 
 FROM deps AS build

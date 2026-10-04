@@ -11,12 +11,10 @@ node_modules
 artifacts/api-server/api
 artifacts/api-server/deploy
 artifacts/kron-trading-bot/server
+# Keep mockup out of the runtime image (not needed for API/UI).
 artifacts/mockup-sandbox
 screenshots
 attached_assets
-**/*.md
-!README.md
-!docs/always-on-hosting.md
 opt
 tmp
 *.webp
