@@ -424,6 +424,7 @@ export async function changeUserBotCovenant(userId: string, tokenId: string) {
 export async function setUserBotRunning(userId: string, running: boolean) {
   let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId)).limit(1);
   if (!bot?.activationVerifiedAt || !bot.tokenId) throw new Error("Complete setup and activation first.");
+  let resetSellCycle = false;
   if (running) {
     if (bot.inFlight) {
       await reconcileStaleInFlight(bot);
@@ -433,6 +434,18 @@ export async function setUserBotRunning(userId: string, running: boolean) {
       if (!bot || bot.inFlight) {
         throw new Error("The interrupted trade requires reconciliation before the bot can restart.");
       }
+    }
+    // Mid-cycle sell with nothing left to sell: start a fresh 5-buy cycle instead of
+    // immediately re-pausing with "No managed token lot is available to sell."
+    if (bot.phase === "selling") {
+      const [openLot] = await db.select({ id: managedLotsTable.id })
+        .from(managedLotsTable)
+        .where(and(
+          eq(managedLotsTable.botId, bot.id),
+          isNull(managedLotsTable.soldAt),
+        ))
+        .limit(1);
+      resetSellCycle = !openLot;
     }
     const k = await loadKaspa();
     const rpc = new k.RpcClient({ url: NODE_URL, networkId: "mainnet", encoding: k.Encoding.Borsh });
@@ -451,6 +464,11 @@ export async function setUserBotRunning(userId: string, running: boolean) {
     status: running ? "running" : "stopped",
     nextRunAt: running ? new Date(Date.now() + 60_000) : null,
     stopReason: running ? null : "Stopped by user.",
+    ...(running && resetSellCycle ? {
+      phase: "buying" as const,
+      completedBuys: 0,
+      completedSells: 0,
+    } : {}),
     updatedAt: new Date(),
   });
   const updated = running
