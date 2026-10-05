@@ -60,6 +60,6 @@ If the wallet network is not the site network, the page does not ask the service
 
 ## What this environment cannot do
 
-- No testnet-10 `kaspad` is available here, and there is no funded wallet, so a genesis, a paid commit, and a real reveal were not broadcast.
-- The proposal engine pins Rust `1.91.0`. This image's default `rustc` is `1.83.0`. The mint page does not shell out to `kcc721-engine`; the reference server does that when you run it.
+- No testnet-10 `kaspad` is running here, and there is no funded wallet, so a genesis, a paid commit, and a real reveal were not broadcast.
+- `kcc721-engine` at `8d26173fce52d66555134550256b2e14fe6408b2` builds with Rust 1.91.0. `compile-info` reports protocol `kcc-721`, version `0.2.0`, fee rate 100 sompi/gram. This page does not shell out to that binary. The reference server does, when you run it.
 - The published reference server accepts `kaspa:` addresses and reads `https://api.kaspa.org`. It will not finish a testnet-10 mint until it is configured for testnet-10 and a reveal artifact exists for the collection.

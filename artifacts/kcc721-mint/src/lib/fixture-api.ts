@@ -42,10 +42,12 @@ interface FixtureTx {
 export class FixtureCommitRevealApi implements CommitRevealApi {
   private txs = new Map<string, FixtureTx>();
   private commitAccepted = false;
+  private revealed: boolean;
   private readonly scene: MintScene | null;
 
   constructor(scene: MintScene | null) {
     this.scene = scene;
+    this.revealed = scene === 'success';
   }
 
   async getCollection(collectionId: string): Promise<CollectionSnapshot> {
@@ -53,7 +55,7 @@ export class FixtureCommitRevealApi implements CommitRevealApi {
       throw new CommitRevealError('KCC721 collection was not found.', 'not-found', 404);
     }
     const soldOut = this.scene === 'sold-out' || this.scene === 'sold-out-race';
-    const nextTokenId = soldOut ? 6 : 3;
+    const nextTokenId = soldOut ? 6 : this.revealed ? 4 : 3;
     const maxSupply = 5;
     return {
       collectionId: FIXTURE_COLLECTION_ID,
@@ -161,6 +163,7 @@ export class FixtureCommitRevealApi implements CommitRevealApi {
     if (known.polls >= 1) {
       known.status = 'accepted';
       if (txid === FIXTURE_COMMIT_TXID) this.commitAccepted = true;
+      if (txid === FIXTURE_REVEAL_TXID) this.revealed = true;
     }
     return {
       txid,
