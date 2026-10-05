@@ -1,0 +1,22 @@
+.git
+.agents
+.cache
+.local
+.env
+.env.*
+!.env.example
+node_modules
+**/node_modules
+**/dist
+artifacts/api-server/api
+artifacts/api-server/deploy
+artifacts/kron-trading-bot/server
+# Keep mockup out of the runtime image (not needed for API/UI).
+artifacts/mockup-sandbox
+screenshots
+attached_assets
+opt
+tmp
+*.webp
+*.png
+*.jpg

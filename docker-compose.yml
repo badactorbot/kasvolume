@@ -1,0 +1,48 @@
+# Always-on local / VPS stack for 24/7 trading.
+#
+# External Postgres:
+#   export DATABASE_URL=... SESSION_SECRET=...
+#   docker compose up -d --build
+#
+# Bundled Postgres:
+#   export SESSION_SECRET=...
+#   docker compose --profile with-db up -d --build
+#   # then set DATABASE_URL=postgresql://kasvolume:kasvolume@127.0.0.1:5432/kasvolume for schema push
+
+services:
+  db:
+    profiles: ["with-db"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kasvolume
+      POSTGRES_PASSWORD: kasvolume
+      POSTGRES_DB: kasvolume
+    ports:
+      - "5432:5432"
+    volumes:
+      - kasvolume_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kasvolume -d kasvolume"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      STATIC_DIR: /app/public
+      DATABASE_URL: ${DATABASE_URL:-postgresql://kasvolume:kasvolume@db:5432/kasvolume}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
+
+volumes:
+  kasvolume_pg:

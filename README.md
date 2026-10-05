@@ -20,7 +20,21 @@ Dry-run-first KCC20 trading console with Kasware wallet auth and user-funded bot
 
 Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/verify` on that same origin. There is **no Replit backend**.
 
-## Production (Vercel)
+## Production — 24/7 trading (required)
+
+The bot scheduler runs **inside the API process**. Serverless (Vercel) will not keep it alive.
+
+**Use always-on hosting** — see [`docs/always-on-hosting.md`](docs/always-on-hosting.md):
+
+| Option | How |
+| --- | --- |
+| **Fly.io** (recommended) | `fly secrets set …` then `fly deploy` (`fly.toml`, `min_machines_running = 1`) |
+| **Render** | Blueprint from `render.yaml` (Docker web service, not free spin-down) |
+| **Docker / VPS** | `docker compose up -d --build` |
+
+The Docker image serves UI + `/api` + scheduler on one port (`STATIC_DIR=/app/public`).
+
+## Production (Vercel) — UI / API only, not trading
 
 `kasvolume-api-server` is **self-contained**: committed `artifacts/api-server/deploy/` + `package.vercel.json` (so `npm install` is not broken by pnpm `catalog:`/`workspace:*`). Set env: `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`. Do **not** require `KRON_TOKEN_ID` — users enter the covenant/token ID in the console after wallet connect.
 
@@ -28,7 +42,7 @@ Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/ver
 
 After API source changes: `pnpm --filter @workspace/api-server run build` and commit refreshed `deploy/` + `server/` bundles.
 
-Do not point any env at Replit.
+Do not point any env at Replit. Do **not** rely on Vercel for continuous bot trading.
 
 ## Scripts
 

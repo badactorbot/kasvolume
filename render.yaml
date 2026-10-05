@@ -1,0 +1,31 @@
+# Render Blueprint — always-on web service (UI + /api + scheduler).
+# Morgen: https://dashboard.render.com → New → Blueprint → connect this repo.
+# Set SESSION_SECRET (and DATABASE_URL if not using the Render Postgres below).
+
+services:
+  - type: web
+    name: kasvolume
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "8080"
+      - key: STATIC_DIR
+        value: /app/public
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: kasvolume-db
+          property: connectionString
+
+databases:
+  - name: kasvolume-db
+    plan: free
+    databaseName: kasvolume
+    user: kasvolume
