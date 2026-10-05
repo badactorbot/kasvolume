@@ -221,7 +221,8 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
             <DialogDescription>
               Sell every remaining managed token lot from the bot wallet
               ({bot.managedTokenAmount} {bot.tokenSymbol || 'tokens'} on-chain)?
-              All open lots are sold in a single on-chain transaction.
+              Positions are sold in as few on-chain transactions as possible
+              (one when reliable; smaller batches if a combined sell is rejected).
               It uses the bot key and cannot be reversed. When finished, you can withdraw KAS.
             </DialogDescription>
           </DialogHeader>
