@@ -175,7 +175,9 @@ export async function getUserDashboard(userId: string) {
         .orderBy(desc(managedLotsTable.createdAt))
         .limit(50)
     : [];
-  const tradeHistory = lots
+  // One row per on-chain TX. Multi-lot sells share a sellTransactionId and must not
+  // appear as separate "bunch of sells" in the trade log.
+  const tradeHistory = Object.values(lots
     .flatMap((lot) => [
       ...(lot.sellTransactionId && lot.soldAt ? [{
         action: "sell" as const,
@@ -194,6 +196,35 @@ export async function getUserDashboard(userId: string) {
         tokenSymbol: lot.tokenSymbol,
       },
     ])
+    .reduce((acc, trade) => {
+      const key = `${trade.action}:${trade.transactionId}`;
+      const existing = acc[key];
+      if (!existing) {
+        acc[key] = { ...trade };
+        return acc;
+      }
+      const nextAmount = (
+        BigInt(existing.tokenAmount) + BigInt(trade.tokenAmount)
+      ).toString();
+      const nextExecutedAt = Date.parse(trade.executedAt) > Date.parse(existing.executedAt)
+        ? trade.executedAt
+        : existing.executedAt;
+      acc[key] = {
+        ...existing,
+        tokenAmount: nextAmount,
+        executedAt: nextExecutedAt,
+        tokenId: existing.tokenId ?? trade.tokenId,
+        tokenSymbol: existing.tokenSymbol ?? trade.tokenSymbol,
+      };
+      return acc;
+    }, {} as Record<string, {
+      action: "buy" | "sell";
+      transactionId: string;
+      executedAt: string;
+      tokenAmount: string;
+      tokenId: string | null;
+      tokenSymbol: string | null;
+    }>))
     .sort((a, b) => Date.parse(b.executedAt) - Date.parse(a.executedAt));
   let botKasBalance = 0;
   let managedTokenAmount = "0";

@@ -498,6 +498,146 @@ export async function executeUserAutomatedSellLots(
   return runAutomatedSell(lots, true, credentials);
 }
 
+/**
+ * Merge several presence-owned token lots into one UTXO so a later sell only needs
+ * a single trader token input. Returns the consolidated lot outpoint.
+ */
+export async function executeUserAutomatedConsolidateLots(
+  lots: ManagedSellLot[],
+  credentials: LiveBotCredentials,
+) {
+  if (lots.length < 2) throw new Error("Consolidation needs at least two managed lots.");
+  const privateKey = credentials.privateKey.trim();
+  const tokenId = resolveLiveTokenId(credentials);
+  if (!privateKey) throw new Error("Live wallet configuration is missing.");
+
+  const k = await loadKaspa();
+  const key = new k.PrivateKey(privateKey);
+  const publicKey = key.toPublicKey();
+  const walletAddress = publicKey.toAddress(k.NetworkType.Mainnet).toString();
+  const registry = new kron.client.RegistryClient(API_URL);
+  const indexer = new kron.client.IndexerClient(INDEXER_URL);
+  const entry = (await registry.tokenlist({ all: true })).tokens.find(
+    (token) => token.covenantId.toLowerCase() === tokenId,
+  );
+  if (!entry?.extensions.curveParams) {
+    throw new Error("Configured token is missing Kron template params.");
+  }
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null,
+  });
+  const tick = entry.symbol.toLowerCase();
+  const owned = await indexer.tokenUtxos(tick, walletAddress);
+  const prepared = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) =>
+        item.outpoint.transactionId === lot.transactionId &&
+        item.outpoint.index === lot.index &&
+        item.amount === lot.amount,
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable for consolidation.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID,
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const sellerAddresses = [...new Set(prepared.map((item) => item.sellerAddress))];
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh,
+  });
+  await rpc.connect();
+  try {
+    const [{ entries: sellerEntries }, { entries: walletEntries }] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] }),
+    ]);
+    if (!walletEntries.length) throw new Error("Required funding UTXO is missing for consolidation.");
+    const tokens = prepared.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item: any) =>
+          item.outpoint.transactionId === lot.transactionId &&
+          item.outpoint.index === lot.index,
+      );
+      if (!sellerEntry) throw new Error("Required consolidate UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state,
+      };
+    });
+    const fundingEntries = [...walletEntries]
+      .sort((a: any, b: any) => (BigInt(a.amount) < BigInt(b.amount) ? 1 : -1))
+      .slice(0, 1);
+    // [...token inputs] [funding]
+    const presenceWitnessIdx = tokens.length;
+    const spend = kron.curveCp.buildConsolidate(
+      k,
+      templates.token,
+      tokens,
+      presenceWitnessIdx,
+      { tokenCovid: entry.covenantId },
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10_000n,
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee,
+    });
+    const covenantScripts = assembly.transaction.inputs
+      .slice(0, assembly.fundingInputIndexes[0])
+      .map((input: any) => input.signatureScript);
+    assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
+    covenantScripts.forEach((script: string, index: number) => {
+      if (assembly.transaction.inputs[index].signatureScript !== script) {
+        throw new Error("Signer modified a covenant input.");
+      }
+    });
+    let result = null;
+    try {
+      result = await rpc.submitTransaction({
+        transaction: assembly.transaction,
+        allowOrphan: false,
+      });
+    } catch (error) {
+      throw new TradeSubmissionAttemptedError(
+        error instanceof Error ? error.message : "Consolidate submission failed with an unknown result.",
+        error,
+      );
+    }
+    if (!result?.transactionId) {
+      throw new Error("Consolidation returned no transaction ID.");
+    }
+    const totalAmount = tokens.reduce((sum, token) => sum + token.state.amount, 0n);
+    return {
+      transactionId: result.transactionId,
+      index: 0,
+      amount: totalAmount.toString(),
+      lotCount: lots.length,
+      networkFeeKas: toKas(networkFee),
+      submitted: true,
+    };
+  } finally {
+    await rpc.disconnect().catch(() => undefined);
+  }
+}
+
 export async function validateAutomatedSell(lot: ManagedSellLot) {
   return runAutomatedSell([lot], false);
 }
@@ -1079,12 +1219,6 @@ async function runPoolSell(args: {
     lpCovid: toBytes(head.reserves.lpCovid || kron.genesis.ZERO_COVID),
   };
   const poolParams = poolParamsFromCurve(entry.extensions.curveParams);
-  const totalTokenIn = lots.reduce((sum, lot) => sum + BigInt(lot.amount), 0n);
-  const quote = kron.poolCpV3.quotePoolV3Sell(poolState, poolParams, totalTokenIn);
-  if (!quote?.net || quote.net <= 0n) {
-    throw new Error("Managed lots have no positive AMM pool sell quote.");
-  }
-
   const k = await loadKaspa();
   const inventoryState = kron.kcc20.covenantIdOwned(poolCovid, poolState.tokenReserve, false);
   const resolvedPoolAddress = kron.poolCpV3.poolCpV3Address(
@@ -1118,6 +1252,15 @@ async function runPoolSell(args: {
     );
     return { lot, decoded, sellerAddress };
   });
+  // Quote from on-chain state amounts so multi-lot sells match covenant conservation.
+  const totalTokenIn = preparedLots.reduce(
+    (sum, item) => sum + BigInt(item.decoded.state.amount),
+    0n,
+  );
+  const quote = kron.poolCpV3.quotePoolV3Sell(poolState, poolParams, totalTokenIn);
+  if (!quote?.net || quote.net <= 0n) {
+    throw new Error("Managed lots have no positive AMM pool sell quote.");
+  }
   const sellerAddresses = [...new Set(preparedLots.map((item) => item.sellerAddress))];
 
   const rpc = new k.RpcClient({

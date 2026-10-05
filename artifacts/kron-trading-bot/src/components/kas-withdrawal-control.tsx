@@ -34,9 +34,8 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const amount = Number(amountKas);
-  const openLotsFromHistory = bot.tradeHistory.filter((trade) => trade.action === 'buy').length
-    - bot.tradeHistory.filter((trade) => trade.action === 'sell').length;
-  const hasOpenPositions = bot.managedTokenAmount !== '0' || openLotsFromHistory > 0;
+  // Prefer live on-chain balance; trade history is grouped by TX so row counts are not lot counts.
+  const hasOpenPositions = bot.managedTokenAmount !== '0';
   const validAmount = Number.isFinite(amount) && amount >= 0.2 && amount <= bot.botKasBalance;
   const canWithdraw = bot.status !== 'running' && !hasOpenPositions && validAmount;
   const canSellAll = bot.status !== 'running' && hasOpenPositions;
@@ -221,8 +220,8 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
             <DialogDescription>
               Sell every remaining managed token lot from the bot wallet
               ({bot.managedTokenAmount} {bot.tokenSymbol || 'tokens'} on-chain)?
-              Positions are sold in as few on-chain transactions as possible
-              (one when reliable; smaller batches if a combined sell is rejected).
+              Tries one combined sell first. If the network rejects a multi-lot sell,
+              lots are consolidated and sold in one follow-up transaction.
               It uses the bot key and cannot be reversed. When finished, you can withdraw KAS.
             </DialogDescription>
           </DialogHeader>

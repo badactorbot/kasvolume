@@ -274,7 +274,7 @@ export function BotDashboardView({ bot, strategy, walletAddress }: { bot: Active
                 </div>
               ) : bot.tradeHistory.map((trade, index) => (
                 <a
-                  key={`${trade.transactionId}-${trade.action}`}
+                  key={`${trade.action}-${trade.transactionId}-${trade.executedAt}`}
                   href={`https://explorer.kaspa.org/txs/${trade.transactionId}`}
                   target="_blank"
                   rel="noreferrer"
