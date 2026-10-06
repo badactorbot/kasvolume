@@ -20,15 +20,27 @@ Dry-run-first KCC20 trading console with Kasware wallet auth and user-funded bot
 
 Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/verify` on that same origin. There is **no Replit backend**.
 
-## Production (Vercel)
+## Production (Vercel) — UI / API only, not trading
 
-`kasvolume-api-server` is **self-contained**: committed `artifacts/api-server/deploy/` + `package.vercel.json` (so `npm install` is not broken by pnpm `catalog:`/`workspace:*`). Set env: `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`. Do **not** require `KRON_TOKEN_ID` — users enter the covenant/token ID in the console after wallet connect.
+Root `vercel.json` uses **Vercel Services** (one project, shared domain):
 
-**Connect needs `/api` on the UI origin.** Prefer one project with Root Directory `.` (root `vercel.json`). Or Root Directory `artifacts/kron-trading-bot` with **Include source files outside Root Directory** enabled. Or UI-only + rewrite / `VITE_API_BASE_URL` to the Ready API host. Leave `VITE_API_BASE_URL` unset when API is colocated.
+| Service | Path | Role |
+| --- | --- | --- |
+| `api-server` | `/api/*` | Express API (wallet auth, dashboard, sell-all) |
+| `kron-trading-bot` | `/*` | Vite UI |
+
+**Vercel project settings (required):**
+
+1. **Root Directory:** `.` (repository root — not `artifacts/api-server` alone)
+2. **Environment variables:** `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`
+3. Do **not** set `KRON_TOKEN_ID` — users pick the token in the UI after connect
+4. Leave `VITE_API_BASE_URL` unset (same-origin `/api`)
+
+**Legacy fallback:** if Root Directory must stay `artifacts/kron-trading-bot`, enable **Include source files outside the Root Directory** and use that folder’s `vercel.json` (builds API + UI together).
 
 After API source changes: `pnpm --filter @workspace/api-server run build` and commit refreshed `deploy/` + `server/` bundles.
 
-Do not point any env at Replit.
+Do not point any env at Replit. Do **not** rely on Vercel for continuous bot trading — use Fly for 24/7 bot runs ([`docs/always-on-hosting.md`](docs/always-on-hosting.md)).
 
 ## Scripts
 
