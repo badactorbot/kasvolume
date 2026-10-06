@@ -1,35 +1,23 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "services": {
-    "api-server": {
-      "root": "artifacts/api-server",
-      "framework": "express",
-      "entrypoint": "api/index.js",
-      "installCommand": "cd ../.. && npx pnpm@10.33.3 install --frozen-lockfile",
-      "buildCommand": "cd ../.. && npx pnpm@10.33.3 --filter @workspace/api-server run build",
-      "functions": {
-        "api/index.js": {
-          "maxDuration": 60,
-          "includeFiles": "deploy/**"
-        }
-      }
-    },
-    "kron-trading-bot": {
-      "root": "artifacts/kron-trading-bot",
-      "framework": "vite",
-      "installCommand": "cd ../.. && npx pnpm@10.33.3 install --frozen-lockfile",
-      "buildCommand": "cd ../.. && BASE_PATH=/ npx pnpm@10.33.3 --filter @workspace/kron-trading-bot run build",
-      "outputDirectory": "dist/public"
+  "framework": null,
+  "installCommand": "npx pnpm@10.33.3 install --frozen-lockfile",
+  "buildCommand": "npx pnpm@10.33.3 --filter @workspace/api-server run build && BASE_PATH=/ npx pnpm@10.33.3 --filter @workspace/kron-trading-bot run build",
+  "outputDirectory": "artifacts/kron-trading-bot/dist/public",
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60,
+      "includeFiles": "{artifacts/api-server/deploy/**,artifacts/kron-trading-bot/server/**}"
     }
   },
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": { "service": "api-server" }
+      "destination": "/api"
     },
     {
       "source": "/(.*)",
-      "destination": { "service": "kron-trading-bot" }
+      "destination": "/index.html"
     }
   ]
 }

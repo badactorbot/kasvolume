@@ -22,25 +22,22 @@ Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/ver
 
 ## Production (Vercel) — UI / API only, not trading
 
-Root `vercel.json` uses **Vercel Services** (one project, shared domain):
-
-| Service | Path | Role |
-| --- | --- | --- |
-| `api-server` | `/api/*` | Express API (wallet auth, dashboard, sell-all) |
-| `kron-trading-bot` | `/*` | Vite UI |
+Root `vercel.json` builds the Vite UI and routes `/api/*` to the Express function (`api/index.js` → committed deploy bundle).
 
 **Vercel project settings (required):**
 
-1. **Root Directory:** `.` (repository root — not `artifacts/api-server` alone)
-2. **Environment variables:** `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`
+1. **Root Directory:** empty / `.` (repository root — **not** `artifacts/api-server`)
+2. **Environment variables (Production):** `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`
 3. Do **not** set `KRON_TOKEN_ID` — users pick the token in the UI after connect
 4. Leave `VITE_API_BASE_URL` unset (same-origin `/api`)
 
-**Legacy fallback:** if Root Directory must stay `artifacts/kron-trading-bot`, enable **Include source files outside the Root Directory** and use that folder’s `vercel.json` (builds API + UI together).
+**Fallback:** Root Directory `artifacts/kron-trading-bot` + enable **Include source files outside the Root Directory** (that folder’s `vercel.json` builds API + UI).
 
 After API source changes: `pnpm --filter @workspace/api-server run build` and commit refreshed `deploy/` + `server/` bundles.
 
 Do not point any env at Replit. Do **not** rely on Vercel for continuous bot trading — use Fly for 24/7 bot runs ([`docs/always-on-hosting.md`](docs/always-on-hosting.md)).
+
+Smoke test after deploy: `curl https://<your-vercel-url>/api/healthz` → `{"status":"ok"}`.
 
 ## Scripts
 

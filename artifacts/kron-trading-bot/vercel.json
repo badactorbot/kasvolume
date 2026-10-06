@@ -1,5 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
   "installCommand": "cd ../.. && npx pnpm@10.33.3 install --frozen-lockfile",
   "buildCommand": "cd ../.. && npx pnpm@10.33.3 --filter @workspace/api-server run build && BASE_PATH=/ npx pnpm@10.33.3 --filter @workspace/kron-trading-bot run build",
   "outputDirectory": "dist/public",
