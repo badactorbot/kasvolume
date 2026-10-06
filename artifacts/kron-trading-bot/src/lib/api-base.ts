@@ -3,9 +3,14 @@ import { setBaseUrl } from '@workspace/api-client-react';
 /**
  * Configure the API client before any React queries run.
  *
- * Default: same-origin relative `/api/...` (Vite proxy locally, Vercel rewrite in prod).
+ * Default: same-origin relative `/api/...` at the site root (Vite proxy locally,
+ * Vercel rewrite in prod). When the UI is hosted under a path prefix such as
+ * `/volume-bot/` on a shared marketing domain, root `/api` is still correct if
+ * that domain proxies `/api/app/*` and `/api/bot/*` to this deployment.
+ *
  * Optional: set `VITE_API_BASE_URL` at build time to an absolute API origin
- * (e.g. `https://<your-api>.vercel.app`) when the UI and API are on different hosts.
+ * (e.g. `https://<your-api>.vercel.app`) or a path prefix (e.g. `/volume-bot`)
+ * when the UI and API are on different hosts/paths.
  * Never falls back to Replit or any other hardcoded remote.
  */
 export function configureApiBaseUrl(): void {

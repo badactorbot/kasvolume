@@ -22,14 +22,21 @@ Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/ver
 
 ## Production (Vercel) — UI / API only, not trading
 
-Root `vercel.json` builds the Vite UI and routes `/api/*` to the Express function (`api/index.js` → committed deploy bundle).
+Root `vercel.json` builds the Vite UI with `BASE_PATH=/volume-bot/` and routes `/api/*` to the Express function (`api/index.js` → committed deploy bundle). The UI is served at `/volume-bot/`; `/` redirects there. Assets under `/volume-bot/assets/*` rewrite to `/assets/*`.
+
+**Live URLs:**
+
+- Standalone: https://kasvolume.vercel.app/volume-bot/
+- Marketing domain (proxied from `code-builder` / kasdistro): https://www.kasdistro.com/volume-bot/
+
+On `www.kasdistro.com`, `/volume-bot/*` and volume-bot API paths (`/api/app/*`, `/api/bot/*`, `/api/healthz`) are rewritten to this project so wallet cookies stay same-origin.
 
 **Vercel project settings (required):**
 
 1. **Root Directory:** empty / `.` (repository root — **not** `artifacts/api-server`)
 2. **Environment variables (Production):** `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`
 3. Do **not** set `KRON_TOKEN_ID` — users pick the token in the UI after connect
-4. Leave `VITE_API_BASE_URL` unset (same-origin `/api`)
+4. Leave `VITE_API_BASE_URL` unset (same-origin `/api` at the domain root)
 
 **Fallback:** Root Directory `artifacts/kron-trading-bot` + enable **Include source files outside the Root Directory** (that folder’s `vercel.json` builds API + UI).
 
@@ -37,7 +44,13 @@ After API source changes: `pnpm --filter @workspace/api-server run build` and co
 
 Do not point any env at Replit. Do **not** rely on Vercel for continuous bot trading — use Fly for 24/7 bot runs ([`docs/always-on-hosting.md`](docs/always-on-hosting.md)).
 
-Smoke test after deploy: `curl https://<your-vercel-url>/api/healthz` → `{"status":"ok"}`.
+Smoke test after deploy:
+
+```sh
+curl https://kasvolume.vercel.app/api/healthz
+curl https://www.kasdistro.com/api/healthz
+curl -sI https://www.kasdistro.com/volume-bot/
+```
 
 ## Scripts
 
