@@ -56,3 +56,4 @@ Thumbs.db
 # Local env pulls (Vercel CLI)
 .env.local
 .env*.local
+.env*
