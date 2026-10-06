@@ -19,16 +19,16 @@
   ],
   "rewrites": [
     {
-      "source": "/volume-bot/api/(.*)",
-      "destination": "/api"
+      "source": "/volume-bot/api/:path*",
+      "destination": "/api/:path*"
     },
     {
       "source": "/api/(.*)",
       "destination": "/api"
     },
     {
-      "source": "/volume-bot/assets/(.*)",
-      "destination": "/assets/$1"
+      "source": "/volume-bot/assets/:path*",
+      "destination": "/assets/:path*"
     },
     {
       "source": "/volume-bot",

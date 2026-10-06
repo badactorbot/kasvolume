@@ -47861,6 +47861,7 @@ app.use((0, import_cookie_parser.default)());
 app.use(import_express5.default.json({ limit: "1mb" }));
 app.use(import_express5.default.urlencoded({ extended: true }));
 app.use("/api", routes_default);
+app.use("/volume-bot/api", routes_default);
 var app_default = app;
 export {
   app_default as default
