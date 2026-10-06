@@ -44,12 +44,30 @@ const userId = (req: any) => {
   if (!id) throw new Error("Connect and verify your wallet first.");
   return id;
 };
+function publicErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) return "Request failed";
+  const cause = (error as Error & { cause?: unknown }).cause;
+  const causeMessage =
+    cause instanceof Error
+      ? cause.message
+      : typeof cause === "string"
+        ? cause
+        : cause && typeof cause === "object" && "message" in cause
+          ? String((cause as { message: unknown }).message)
+          : null;
+  // Drizzle wraps the Postgres/driver error in `cause` and only puts the SQL in `message`.
+  if (causeMessage && error.message.startsWith("Failed query:")) {
+    return `${error.message}\nCause: ${causeMessage}`;
+  }
+  return error.message;
+}
+
 const handler = (fn: (req: any, res: any) => Promise<void>) => async (req: any, res: any) => {
   try {
     await fn(req, res);
   } catch (error) {
     req.log.warn({ err: error }, "User bot request blocked");
-    res.status(400).json({ error: error instanceof Error ? error.message : "Request failed" });
+    res.status(400).json({ error: publicErrorMessage(error) });
   }
 };
 
