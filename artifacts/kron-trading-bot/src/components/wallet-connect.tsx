@@ -16,6 +16,19 @@ export function WalletConnect() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
+  const friendlyConnectError = (err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err ?? 'Failed to connect wallet');
+    if (/connection terminated|ECONNREFUSED|timeout|Failed query/i.test(message)) {
+      return 'Server database was unavailable. Wait a few seconds and try Connect again. If this keeps happening, the Fly.io trial machine may have stopped — add a payment method at fly.io/trial.';
+    }
+    if (/signMessage|User rejected|denied/i.test(message)) {
+      return 'Wallet signature was cancelled. Approve the Kasware message to finish connecting.';
+    }
+    // Keep API errors readable; drop giant drizzle dumps.
+    if (message.length > 220) return `${message.slice(0, 220)}…`;
+    return message;
+  };
+
   const handleConnect = async () => {
     try {
       setIsConnecting(true);
@@ -55,9 +68,10 @@ export function WalletConnect() {
       queryClient.invalidateQueries({ queryKey: getGetUserBotDashboardQueryKey() });
       toast({ title: 'Wallet connected successfully' });
       
-    } catch (err: any) {
-      setError(err.message || 'Failed to connect wallet');
-      toast({ title: 'Connection failed', description: err.message, variant: 'destructive' });
+    } catch (err: unknown) {
+      const message = friendlyConnectError(err);
+      setError(message);
+      toast({ title: 'Connection failed', description: message, variant: 'destructive' });
     } finally {
       setIsConnecting(false);
     }

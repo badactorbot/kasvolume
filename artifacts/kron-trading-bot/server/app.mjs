@@ -764,8 +764,8 @@ var require_depd = __commonJS({
       return deprecate;
     }
     function eehaslisteners(emitter, type) {
-      var count2 = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
-      return count2 > 0;
+      var count = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
+      return count > 0;
     }
     function isignored(namespace) {
       if (process.noDeprecation) {
@@ -18468,14 +18468,14 @@ var require_urlencoded = __commonJS({
       };
     }
     function parameterCount(body, limit) {
-      let count2 = 0;
+      let count = 0;
       let index = -1;
       do {
-        count2++;
-        if (count2 > limit) return void 0;
+        count++;
+        if (count > limit) return void 0;
         index = body.indexOf("&", index + 1);
       } while (index !== -1);
-      return count2;
+      return count;
     }
   }
 });
@@ -23023,8 +23023,8 @@ var require_send = __commonJS({
       }
     }
     function hasListeners(emitter, type) {
-      var count2 = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
-      return count2 > 0;
+      var count = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
+      return count > 0;
     }
     function normalizeList(val, name) {
       var list = [].concat(val || []);
@@ -29503,11 +29503,11 @@ var require_binaryParsers = __commonJS({
         var array = [];
         var i2;
         if (dimension.length > 1) {
-          var count2 = dimension.shift();
-          for (i2 = 0; i2 < count2; i2++) {
+          var count = dimension.shift();
+          for (i2 = 0; i2 < count; i2++) {
             array[i2] = parse(dimension, elementType2);
           }
-          dimension.unshift(count2);
+          dimension.unshift(count);
         } else {
           for (i2 = 0; i2 < dimension[0]; i2++) {
             array[i2] = parseElement(elementType2);
@@ -38900,6 +38900,7 @@ import path from "node:path";
 var API_URL = "https://api.kron.technology";
 var INDEXER_URL = "https://idx.kron.technology/v1/kcc20";
 var NODE_URL = "wss://node.kron.technology";
+var SEQUENCER_URL = "https://seq.kron.technology";
 var NETWORK_ID = "mainnet";
 var LIVE_TEST_KAS = 21;
 var SOMPI_PER_KAS = 100000000n;
@@ -38921,6 +38922,42 @@ var RetryableTradeStateError = class extends Error {
 };
 var toBytes = (hex) => Uint8Array.from(Buffer.from(hex, "hex"));
 var toKas = (sompi) => Number(sompi) / Number(SOMPI_PER_KAS);
+function unwrapIndexerRow(value) {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+function poolParamsFromCurve(curveParams) {
+  return {
+    creatorFeeOwner: toBytes(curveParams.creatorFeeOwner),
+    platformFeeOwner: toBytes(curveParams.platformFeeOwner),
+    creatorFeeBps: BigInt(curveParams.dexCreatorFeeBps ?? 0),
+    platformFeeBps: BigInt(curveParams.dexPlatformFeeBps ?? 0),
+    lpFeeBps: BigInt(curveParams.dexLpFeeBps ?? 0),
+    lockedShares: BigInt(curveParams.poolLockedShares ?? 1e6)
+  };
+}
+async function resolvePoolHead(tick, indexer, submit) {
+  const sequence = await new kron.client.SequencerClient(SEQUENCER_URL).head(tick);
+  if (submit && sequence.head) {
+    throw new RetryableTradeStateError(
+      "The AMM pool has an in-flight sequenced trade; waiting for it to settle."
+    );
+  }
+  if (sequence.head) {
+    return {
+      pool: sequence.head.poolOutpoint,
+      poolToken: sequence.head.poolTokenOutpoint,
+      reserves: sequence.head.reserves
+    };
+  }
+  const confirmed = unwrapIndexerRow(await indexer.poolhead(tick));
+  if (!confirmed?.pool || !confirmed?.poolToken || !confirmed?.reserves) {
+    throw new RetryableTradeStateError(
+      "AMM pool head is temporarily unavailable; waiting to retry."
+    );
+  }
+  return confirmed;
+}
 function resolveLiveTokenId(credentials) {
   if (credentials) {
     const tokenId2 = credentials.tokenId?.trim().toLowerCase();
@@ -38962,13 +38999,44 @@ async function runLiveBuy(submit, signOnly, automation = false, credentials, enf
   if (!entry || !entry.extensions.chainVerified || entry.network !== NETWORK_ID) {
     throw new Error("Configured token is not a chain-verified Kron mainnet token.");
   }
-  if (!entry.extensions.curveCovenantId || !entry.extensions.curveParams) {
-    throw new Error("Configured token has no active Kron curve.");
+  if (!entry.extensions.curveParams) {
+    throw new Error("Configured token is missing Kron template params.");
   }
-  const tokenResponse = await indexer.token(entry.symbol.toLowerCase());
-  const token = Array.isArray(tokenResponse) ? tokenResponse[0] : tokenResponse;
-  if (!token || token.graduated || !token.cpState) {
-    throw new Error("This guarded preview currently supports pre-graduation curve buys only.");
+  const token = unwrapIndexerRow(await indexer.token(entry.symbol.toLowerCase()));
+  if (!token) {
+    throw new RetryableTradeStateError(
+      "Indexer has no live state for this token yet; waiting to retry."
+    );
+  }
+  const graduated = Boolean(token.graduated || token.cpState?.graduated);
+  const poolCovidHex = (entry.extensions.poolCovenantId || token.poolCovenantId || "").toLowerCase() || null;
+  if (graduated) {
+    if (!poolCovidHex) {
+      throw new Error("This token has graduated but has no AMM pool covenant id.");
+    }
+    return runPoolBuy({
+      submit,
+      signOnly,
+      automation,
+      enforceMinimumOutput,
+      privateKey,
+      key,
+      publicKey,
+      walletAddress,
+      buyerPubkey,
+      entry,
+      token,
+      poolCovidHex,
+      indexer
+    });
+  }
+  if (!entry.extensions.curveCovenantId) {
+    throw new Error("Configured token has no active Kron bonding curve.");
+  }
+  if (!token.cpState) {
+    throw new RetryableTradeStateError(
+      "Bonding-curve state is temporarily unavailable; waiting to retry."
+    );
   }
   const templates = await kron.client.fetchCpTemplates({
     baseUrl: API_URL,
@@ -38979,7 +39047,7 @@ async function runLiveBuy(submit, signOnly, automation = false, credentials, enf
   const tokenCovid = toBytes(entry.covenantId);
   const curveCovid = toBytes(entry.extensions.curveCovenantId);
   const sequence = await new kron.client.SequencerClient(
-    "https://seq.kron.technology"
+    SEQUENCER_URL
   ).curveHead(entry.extensions.curveCovenantId);
   if (submit && sequence.ok && sequence.head) {
     throw new RetryableTradeStateError(
@@ -39188,10 +39256,133 @@ async function runLiveBuy(submit, signOnly, automation = false, credentials, enf
     key = void 0;
   }
 }
-async function executeUserAutomatedSell(lot, credentials) {
-  return runAutomatedSell(lot, true, credentials);
+async function executeUserAutomatedSellLots(lots, credentials) {
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
+  return runAutomatedSell(lots, true, credentials);
 }
-async function runAutomatedSell(lot, submit, credentials) {
+async function executeUserAutomatedConsolidateLots(lots, credentials) {
+  if (lots.length < 2) throw new Error("Consolidation needs at least two managed lots.");
+  const privateKey = credentials.privateKey.trim();
+  const tokenId = resolveLiveTokenId(credentials);
+  if (!privateKey) throw new Error("Live wallet configuration is missing.");
+  const k = await loadKaspa();
+  const key = new k.PrivateKey(privateKey);
+  const publicKey = key.toPublicKey();
+  const walletAddress = publicKey.toAddress(k.NetworkType.Mainnet).toString();
+  const registry = new kron.client.RegistryClient(API_URL);
+  const indexer = new kron.client.IndexerClient(INDEXER_URL);
+  const entry = (await registry.tokenlist({ all: true })).tokens.find(
+    (token) => token.covenantId.toLowerCase() === tokenId
+  );
+  if (!entry?.extensions.curveParams) {
+    throw new Error("Configured token is missing Kron template params.");
+  }
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  const tick = entry.symbol.toLowerCase();
+  const owned = await indexer.tokenUtxos(tick, walletAddress);
+  const prepared = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable for consolidation.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const sellerAddresses = [...new Set(prepared.map((item) => item.sellerAddress))];
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [{ entries: sellerEntries }, { entries: walletEntries }] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] })
+    ]);
+    if (!walletEntries.length) throw new Error("Required funding UTXO is missing for consolidation.");
+    const tokens = prepared.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
+      );
+      if (!sellerEntry) throw new Error("Required consolidate UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state
+      };
+    });
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const presenceWitnessIdx = tokens.length;
+    const spend3 = kron.curveCp.buildConsolidate(
+      k,
+      templates.token,
+      tokens,
+      presenceWitnessIdx,
+      { tokenCovid: entry.covenantId }
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    const covenantScripts = assembly.transaction.inputs.slice(0, assembly.fundingInputIndexes[0]).map((input) => input.signatureScript);
+    assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
+    covenantScripts.forEach((script, index) => {
+      if (assembly.transaction.inputs[index].signatureScript !== script) {
+        throw new Error("Signer modified a covenant input.");
+      }
+    });
+    let result = null;
+    try {
+      result = await rpc.submitTransaction({
+        transaction: assembly.transaction,
+        allowOrphan: false
+      });
+    } catch (error) {
+      throw new TradeSubmissionAttemptedError(
+        error instanceof Error ? error.message : "Consolidate submission failed with an unknown result.",
+        error
+      );
+    }
+    if (!result?.transactionId) {
+      throw new Error("Consolidation returned no transaction ID.");
+    }
+    const totalAmount = tokens.reduce((sum, token) => sum + token.state.amount, 0n);
+    return {
+      transactionId: result.transactionId,
+      index: 0,
+      amount: totalAmount.toString(),
+      lotCount: lots.length,
+      networkFeeKas: toKas(networkFee),
+      submitted: true
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+  }
+}
+async function runAutomatedSell(lots, submit, credentials) {
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
   const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
   const tokenId = resolveLiveTokenId(credentials);
   if (!privateKey) throw new Error("Live wallet configuration is missing.");
@@ -39205,14 +39396,45 @@ async function runAutomatedSell(lot, submit, credentials) {
   const entry = (await registry.tokenlist({ all: true })).tokens.find(
     (token2) => token2.covenantId.toLowerCase() === tokenId
   );
-  if (!entry?.extensions.curveCovenantId || !entry.extensions.curveParams) {
-    throw new Error("Configured token has no active Kron curve.");
+  if (!entry?.extensions.curveParams) {
+    throw new Error("Configured token is missing Kron template params.");
   }
-  const tokenResponse = await indexer.token(entry.symbol.toLowerCase());
-  const token = Array.isArray(tokenResponse) ? tokenResponse[0] : tokenResponse;
-  if (!token?.cpState || token.graduated) throw new Error("KDIST is no longer on its curve.");
+  const token = unwrapIndexerRow(await indexer.token(entry.symbol.toLowerCase()));
+  if (!token) {
+    throw new RetryableTradeStateError(
+      "Indexer has no live state for this token yet; waiting to retry."
+    );
+  }
+  const graduated = Boolean(token.graduated || token.cpState?.graduated);
+  const poolCovidHex = (entry.extensions.poolCovenantId || token.poolCovenantId || "").toLowerCase() || null;
+  if (graduated) {
+    if (!poolCovidHex) {
+      throw new Error("This token has graduated but has no AMM pool covenant id.");
+    }
+    return runPoolSell({
+      lots,
+      submit,
+      privateKey,
+      key,
+      publicKey,
+      walletAddress,
+      traderPubkey,
+      entry,
+      token,
+      poolCovidHex,
+      indexer
+    });
+  }
+  if (!entry.extensions.curveCovenantId) {
+    throw new Error("Configured token has no active Kron bonding curve.");
+  }
+  if (!token.cpState) {
+    throw new RetryableTradeStateError(
+      "Bonding-curve state is temporarily unavailable; waiting to retry."
+    );
+  }
   const sequence = await new kron.client.SequencerClient(
-    "https://seq.kron.technology"
+    SEQUENCER_URL
   ).curveHead(entry.extensions.curveCovenantId);
   if (sequence.ok && sequence.head) {
     throw new RetryableTradeStateError(
@@ -39228,6 +39450,7 @@ async function runAutomatedSell(lot, submit, credentials) {
   const tokenCovid = toBytes(entry.covenantId);
   const curveCovid = toBytes(entry.extensions.curveCovenantId);
   const tokenReserve = BigInt(token.cpState.tokenReserve);
+  const totalTokenIn = lots.reduce((sum, lot) => sum + BigInt(lot.amount), 0n);
   const state2 = { graduated: false, tokenCovid, tokenReserve };
   const inventoryState = kron.kcc20.covenantIdOwned(curveCovid, tokenReserve, false);
   const curveAddress = kron.curveCp.cpAddress(k, templates.curve, state2, NETWORK_ID);
@@ -39238,17 +39461,21 @@ async function runAutomatedSell(lot, submit, credentials) {
     NETWORK_ID
   );
   const owned = await indexer.tokenUtxos(entry.symbol.toLowerCase(), walletAddress);
-  const ownedLot = owned.find(
-    (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
-  );
-  if (!ownedLot) throw new Error("Managed KDIST lot is no longer spendable.");
-  const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
-  const sellerAddress = kron.kcc20.kcc20Address(
-    k,
-    decoded.template,
-    decoded.state,
-    NETWORK_ID
-  );
+  const preparedLots = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const sellerAddresses = [...new Set(preparedLots.map((item) => item.sellerAddress))];
   const rpc = new k.RpcClient({
     url: NODE_URL,
     networkId: NETWORK_ID,
@@ -39264,7 +39491,7 @@ async function runAutomatedSell(lot, submit, credentials) {
     ] = await Promise.all([
       rpc.getUtxosByAddresses({ addresses: [curveAddress] }),
       rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [sellerAddress] }),
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
       rpc.getUtxosByAddresses({ addresses: [walletAddress] })
     ]);
     if (curveEntries.length !== 1 || inventoryEntries.length !== 1) {
@@ -39272,10 +39499,19 @@ async function runAutomatedSell(lot, submit, credentials) {
         "Live curve state is temporarily ambiguous; waiting before retrying."
       );
     }
-    const sellerEntry = sellerEntries.find(
-      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
-    );
-    if (!sellerEntry || !walletEntries.length) throw new Error("Required sell UTXO is missing.");
+    const sellerTokens = preparedLots.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
+      );
+      if (!sellerEntry) throw new Error("Required sell UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state
+      };
+    });
+    if (!walletEntries.length) throw new Error("Required sell UTXO is missing.");
     const p = entry.extensions.curveParams;
     const quote = kron.curve.quoteCpSell(
       {
@@ -39287,12 +39523,13 @@ async function runAutomatedSell(lot, submit, credentials) {
         platformFeeBps: BigInt(p.platformFeeBps),
         devFundBps: BigInt(p.devFundBps ?? 0)
       },
-      BigInt(lot.amount)
+      totalTokenIn
     );
-    if (!quote?.net || quote.net <= 0n) throw new Error("Managed lot has no positive sell quote.");
+    if (!quote?.net || quote.net <= 0n) throw new Error("Managed lots have no positive sell quote.");
     const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
     const curveEntry = curveEntries[0];
     const inventoryEntry = inventoryEntries[0];
+    const presenceWitnessIdx = 2 + sellerTokens.length;
     const spend3 = kron.curveCp.buildCpSell(
       k,
       templates.curve,
@@ -39303,12 +39540,7 @@ async function runAutomatedSell(lot, submit, credentials) {
         realKas: BigInt(curveEntry.amount),
         state: state2
       },
-      [{
-        transactionId: lot.transactionId,
-        index: lot.index,
-        value: BigInt(sellerEntry.amount),
-        state: decoded.state
-      }],
+      sellerTokens,
       {
         transactionId: inventoryEntry.outpoint.transactionId,
         index: inventoryEntry.outpoint.index,
@@ -39317,9 +39549,9 @@ async function runAutomatedSell(lot, submit, credentials) {
       },
       curveCovid,
       traderPubkey,
-      BigInt(lot.amount),
+      totalTokenIn,
       quote.kasOut,
-      3
+      presenceWitnessIdx
     );
     let assembly = kron.spend.assembleNativeTx(k, {
       spend: spend3,
@@ -39360,13 +39592,447 @@ async function runAutomatedSell(lot, submit, credentials) {
     }
     return {
       transactionId: result?.transactionId,
-      tokenIn: Number(lot.amount),
+      tokenIn: Number(totalTokenIn),
+      lotCount: lots.length,
       grossKas: toKas(quote.kasOut),
       kronFeeKas: toKas(quote.fee),
       networkFeeKas: toKas(networkFee),
       netCreditKas: toKas(netCredit),
       signed: true,
       submitted: submit
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+  }
+}
+async function runPoolBuy(args) {
+  const {
+    submit,
+    signOnly,
+    automation,
+    enforceMinimumOutput,
+    key,
+    walletAddress,
+    buyerPubkey,
+    entry,
+    poolCovidHex,
+    indexer
+  } = args;
+  let workingKey = key;
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  if (!templates.pool) {
+    throw new Error("Configured token is missing a compiled AMM pool template.");
+  }
+  const tick = entry.symbol.toLowerCase();
+  const head = await resolvePoolHead(tick, indexer, submit);
+  const poolCovid = toBytes(poolCovidHex);
+  const tokenCovid = toBytes(entry.covenantId);
+  const poolState = {
+    kasReserve: BigInt(head.reserves.kasReserve),
+    tokenReserve: BigInt(head.reserves.tokenReserve),
+    tokenCovid,
+    totalShares: BigInt(head.reserves.totalShares),
+    lpCovid: toBytes(head.reserves.lpCovid || kron.genesis.ZERO_COVID)
+  };
+  const poolParams = poolParamsFromCurve(entry.extensions.curveParams);
+  const quote = kron.poolCpV3.quotePoolV3Buy(
+    poolState,
+    poolParams,
+    BigInt(LIVE_TEST_KAS) * SOMPI_PER_KAS
+  );
+  if (!quote?.tokenOut) {
+    throw new Error("Kron returned no executable AMM pool buy quote.");
+  }
+  const k = await loadKaspa();
+  const inventoryState = kron.kcc20.covenantIdOwned(poolCovid, poolState.tokenReserve, false);
+  const resolvedPoolAddress = kron.poolCpV3.poolCpV3Address(
+    k,
+    templates.pool,
+    poolState,
+    NETWORK_ID
+  );
+  const inventoryAddress = kron.kcc20.kcc20Address(
+    k,
+    templates.token,
+    inventoryState,
+    NETWORK_ID
+  );
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [
+      { entries: poolEntries },
+      { entries: inventoryEntries },
+      { entries: walletEntries },
+      tokenBalanceResponse
+    ] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: [resolvedPoolAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] }),
+      indexer.balance(tick, walletAddress)
+    ]);
+    const poolEntry = poolEntries.find(
+      (item) => item.outpoint.transactionId === head.pool.transactionId && item.outpoint.index === head.pool.index
+    ) ?? (poolEntries.length === 1 ? poolEntries[0] : null);
+    const inventoryEntry = inventoryEntries.find(
+      (item) => item.outpoint.transactionId === head.poolToken.transactionId && item.outpoint.index === head.poolToken.index
+    ) ?? (inventoryEntries.length === 1 ? inventoryEntries[0] : null);
+    if (!poolEntry || !inventoryEntry) {
+      throw new RetryableTradeStateError(
+        "Live AMM pool state is temporarily ambiguous; waiting before retrying."
+      );
+    }
+    if (!walletEntries.length) throw new Error("Bot wallet has no spendable KAS UTXOs.");
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const presenceWitnessIdx = 2;
+    const spend3 = kron.poolCpV3.buildPoolV3SwapKasForToken(
+      k,
+      templates.pool,
+      templates.token,
+      poolParams,
+      {
+        transactionId: poolEntry.outpoint.transactionId,
+        index: poolEntry.outpoint.index,
+        state: poolState,
+        tokenUtxo: {
+          transactionId: inventoryEntry.outpoint.transactionId,
+          index: inventoryEntry.outpoint.index,
+          value: BigInt(inventoryEntry.amount)
+        }
+      },
+      poolCovid,
+      buyerPubkey,
+      quote,
+      [],
+      presenceWitnessIdx
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    const fundingTotal = fundingEntries.reduce(
+      (sum, item) => sum + BigInt(item.amount),
+      0n
+    );
+    const walletBalance = walletEntries.reduce(
+      (sum, item) => sum + BigInt(item.amount),
+      0n
+    );
+    const maximumDebit = fundingTotal - assembly.change;
+    const recipientDust = maximumDebit - quote.total - networkFee;
+    if (maximumDebit > MAXIMUM_DEBIT_SOMPI) {
+      throw new Error(
+        `Maximum debit ${toKas(maximumDebit)} KAS exceeds the approved 22.75 KAS cap.`
+      );
+    }
+    if (!automation && walletBalance - maximumDebit < MINIMUM_RESERVE_SOMPI) {
+      throw new Error("Trade would breach the 25 KAS wallet reserve.");
+    }
+    if (enforceMinimumOutput && quote.tokenOut < 8n) {
+      throw new Error("Quote fell below the approved minimum output of 8 tokens.");
+    }
+    const rawTokenBalance = Array.isArray(tokenBalanceResponse) ? tokenBalanceResponse[0]?.balance : tokenBalanceResponse?.balance;
+    let transactionId;
+    let fundingSignatureScriptBytes;
+    if (submit || signOnly) {
+      const inputsBefore = assembly.transaction.inputs;
+      const covenantScripts = inputsBefore.slice(0, assembly.fundingInputIndexes[0]).map((input) => input.signatureScript);
+      assembly.transaction = k.signTransaction(assembly.transaction, [workingKey], false);
+      const inputsAfter = assembly.transaction.inputs;
+      covenantScripts.forEach((script, index) => {
+        if (inputsAfter[index].signatureScript !== script) {
+          throw new Error("Native signer modified a covenant input; refusing submission.");
+        }
+      });
+      fundingSignatureScriptBytes = assembly.fundingInputIndexes.map((index) => {
+        const script = inputsAfter[index].signatureScript;
+        if (!script || typeof script !== "string" || script.length % 2 !== 0) {
+          throw new Error("Native signer produced an invalid funding signature script.");
+        }
+        return script.length / 2;
+      });
+    }
+    if (submit && !automation) {
+      await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
+      await writeFile(
+        EXECUTION_LOCK,
+        JSON.stringify({ status: "pending", createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
+        { flag: "wx" }
+      );
+      try {
+        const result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+        transactionId = result.transactionId;
+        await writeFile(
+          EXECUTION_LOCK,
+          JSON.stringify({
+            status: "submitted",
+            transactionId,
+            submittedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            tokenId: entry.covenantId,
+            tradeKas: LIVE_TEST_KAS,
+            maximumDebitKas: toKas(maximumDebit),
+            venue: "pool"
+          })
+        );
+      } catch (error) {
+        await unlink(EXECUTION_LOCK).catch(() => void 0);
+        throw error;
+      }
+    } else if (submit) {
+      try {
+        const result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+        transactionId = result.transactionId;
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Pool buy submission failed with an unknown result.",
+          error
+        );
+      }
+    }
+    return {
+      tokenId: entry.covenantId,
+      symbol: entry.symbol,
+      tokenName: entry.name,
+      walletAddress,
+      walletKasBalance: toKas(walletBalance),
+      walletTokenBalance: Number(rawTokenBalance ?? 0),
+      tradeKas: LIVE_TEST_KAS,
+      tokenOut: Number(quote.tokenOut),
+      kronFeeKas: toKas(quote.creatorFee + quote.platformFee + quote.lpFee),
+      networkFeeKas: toKas(networkFee),
+      recipientDustKas: toKas(recipientDust),
+      maximumDebitKas: toKas(maximumDebit),
+      transactionBuilt: true,
+      signed: submit || signOnly,
+      submitted: submit,
+      transactionId,
+      fundingSignatureScriptBytes,
+      preparedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      venue: "pool",
+      warnings: [
+        "This preview is state-dependent and must be rebuilt immediately before execution.",
+        submit ? "The one-time live-test cap is now permanently consumed." : "No transaction was signed or submitted.",
+        "Live execution is available only from the private server command line."
+      ]
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+    workingKey = void 0;
+  }
+}
+async function runPoolSell(args) {
+  const {
+    lots,
+    submit,
+    key,
+    walletAddress,
+    traderPubkey,
+    entry,
+    poolCovidHex,
+    indexer
+  } = args;
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  if (!templates.pool) {
+    throw new Error("Configured token is missing a compiled AMM pool template.");
+  }
+  const tick = entry.symbol.toLowerCase();
+  const head = await resolvePoolHead(tick, indexer, submit);
+  const poolCovid = toBytes(poolCovidHex);
+  const tokenCovid = toBytes(entry.covenantId);
+  const poolState = {
+    kasReserve: BigInt(head.reserves.kasReserve),
+    tokenReserve: BigInt(head.reserves.tokenReserve),
+    tokenCovid,
+    totalShares: BigInt(head.reserves.totalShares),
+    lpCovid: toBytes(head.reserves.lpCovid || kron.genesis.ZERO_COVID)
+  };
+  const poolParams = poolParamsFromCurve(entry.extensions.curveParams);
+  const k = await loadKaspa();
+  const inventoryState = kron.kcc20.covenantIdOwned(poolCovid, poolState.tokenReserve, false);
+  const resolvedPoolAddress = kron.poolCpV3.poolCpV3Address(
+    k,
+    templates.pool,
+    poolState,
+    NETWORK_ID
+  );
+  const inventoryAddress = kron.kcc20.kcc20Address(
+    k,
+    templates.token,
+    inventoryState,
+    NETWORK_ID
+  );
+  const owned = await indexer.tokenUtxos(tick, walletAddress);
+  const preparedLots = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const totalTokenIn = preparedLots.reduce(
+    (sum, item) => sum + BigInt(item.decoded.state.amount),
+    0n
+  );
+  const quote = kron.poolCpV3.quotePoolV3Sell(poolState, poolParams, totalTokenIn);
+  if (!quote?.net || quote.net <= 0n) {
+    throw new Error("Managed lots have no positive AMM pool sell quote.");
+  }
+  const sellerAddresses = [...new Set(preparedLots.map((item) => item.sellerAddress))];
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [
+      { entries: poolEntries },
+      { entries: inventoryEntries },
+      { entries: sellerEntries },
+      { entries: walletEntries }
+    ] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: [resolvedPoolAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] })
+    ]);
+    const poolEntry = poolEntries.find(
+      (item) => item.outpoint.transactionId === head.pool.transactionId && item.outpoint.index === head.pool.index
+    ) ?? (poolEntries.length === 1 ? poolEntries[0] : null);
+    const inventoryEntry = inventoryEntries.find(
+      (item) => item.outpoint.transactionId === head.poolToken.transactionId && item.outpoint.index === head.poolToken.index
+    ) ?? (inventoryEntries.length === 1 ? inventoryEntries[0] : null);
+    if (!poolEntry || !inventoryEntry) {
+      throw new RetryableTradeStateError(
+        "Live AMM pool state is temporarily ambiguous; waiting before retrying."
+      );
+    }
+    const traderTokens = preparedLots.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
+      );
+      if (!sellerEntry) throw new Error("Required sell UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state
+      };
+    });
+    if (!walletEntries.length) {
+      throw new Error("Required sell UTXO is missing.");
+    }
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const presenceWitnessIdx = 2 + traderTokens.length;
+    const spend3 = kron.poolCpV3.buildPoolV3SwapTokenForKas(
+      k,
+      templates.pool,
+      templates.token,
+      poolParams,
+      {
+        transactionId: poolEntry.outpoint.transactionId,
+        index: poolEntry.outpoint.index,
+        state: poolState,
+        tokenUtxo: {
+          transactionId: inventoryEntry.outpoint.transactionId,
+          index: inventoryEntry.outpoint.index,
+          value: BigInt(inventoryEntry.amount)
+        }
+      },
+      poolCovid,
+      traderPubkey,
+      traderTokens,
+      quote,
+      presenceWitnessIdx
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    const fundingTotal = BigInt(fundingEntries[0].amount);
+    const explicitTraderKas = templates.pool.recipientBound ? quote.kasOut - quote.creatorFee - quote.platformFee : 0n;
+    const netCredit = assembly.change - fundingTotal + explicitTraderKas;
+    if (netCredit <= 0n) {
+      throw new Error("Assembled pool sell does not produce a positive KAS credit.");
+    }
+    const covenantScripts = assembly.transaction.inputs.slice(0, assembly.fundingInputIndexes[0]).map((input) => input.signatureScript);
+    assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
+    covenantScripts.forEach((script, index) => {
+      if (assembly.transaction.inputs[index].signatureScript !== script) {
+        throw new Error("Signer modified a covenant input.");
+      }
+    });
+    let result = null;
+    if (submit) {
+      try {
+        result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Pool sell submission failed with an unknown result.",
+          error
+        );
+      }
+    }
+    return {
+      transactionId: result?.transactionId,
+      tokenIn: Number(totalTokenIn),
+      lotCount: lots.length,
+      grossKas: toKas(quote.kasOut),
+      kronFeeKas: toKas(quote.creatorFee + quote.platformFee + quote.lpFee),
+      networkFeeKas: toKas(networkFee),
+      netCreditKas: toKas(netCredit),
+      signed: true,
+      submitted: submit,
+      venue: "pool"
     };
   } finally {
     await rpc.disconnect().catch(() => void 0);
@@ -42751,11 +43417,6 @@ function mapRelationalRow(tablesConfig, tableConfig, row, buildQueryResultSelect
     }
   }
   return result;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/functions/aggregate.js
-function count(expression) {
-  return sql`count(${expression || sql.raw("*")})`.mapWith(Number);
 }
 
 // src/lib/user-app-service.ts
@@ -46864,7 +47525,7 @@ async function getUserDashboard(userId2) {
   if (!user) throw new Error("Wallet session is no longer valid.");
   const [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
   const lots = bot ? await db.select().from(managedLotsTable).where(eq(managedLotsTable.botId, bot.id)).orderBy(desc(managedLotsTable.createdAt)).limit(50) : [];
-  const tradeHistory = lots.flatMap((lot) => [
+  const tradeHistory = Object.values(lots.flatMap((lot) => [
     ...lot.sellTransactionId && lot.soldAt ? [{
       action: "sell",
       transactionId: lot.sellTransactionId,
@@ -46881,7 +47542,24 @@ async function getUserDashboard(userId2) {
       tokenId: lot.tokenId,
       tokenSymbol: lot.tokenSymbol
     }
-  ]).sort((a, b) => Date.parse(b.executedAt) - Date.parse(a.executedAt));
+  ]).reduce((acc, trade) => {
+    const key = `${trade.action}:${trade.transactionId}`;
+    const existing = acc[key];
+    if (!existing) {
+      acc[key] = { ...trade };
+      return acc;
+    }
+    const nextAmount = (BigInt(existing.tokenAmount) + BigInt(trade.tokenAmount)).toString();
+    const nextExecutedAt = Date.parse(trade.executedAt) > Date.parse(existing.executedAt) ? trade.executedAt : existing.executedAt;
+    acc[key] = {
+      ...existing,
+      tokenAmount: nextAmount,
+      executedAt: nextExecutedAt,
+      tokenId: existing.tokenId ?? trade.tokenId,
+      tokenSymbol: existing.tokenSymbol ?? trade.tokenSymbol
+    };
+    return acc;
+  }, {})).sort((a, b) => Date.parse(b.executedAt) - Date.parse(a.executedAt));
   let botKasBalance = 0;
   let managedTokenAmount = "0";
   if (bot) {
@@ -47079,6 +47757,7 @@ async function changeUserBotCovenant(userId2, tokenId) {
 async function setUserBotRunning(userId2, running) {
   let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
   if (!bot?.activationVerifiedAt || !bot.tokenId) throw new Error("Complete setup and activation first.");
+  let resetSellCycle = false;
   if (running) {
     if (bot.inFlight) {
       await reconcileStaleInFlight(bot);
@@ -47086,6 +47765,13 @@ async function setUserBotRunning(userId2, running) {
       if (!bot || bot.inFlight) {
         throw new Error("The interrupted trade requires reconciliation before the bot can restart.");
       }
+    }
+    if (bot.phase === "selling") {
+      const [openLot] = await db.select({ id: managedLotsTable.id }).from(managedLotsTable).where(and(
+        eq(managedLotsTable.botId, bot.id),
+        isNull(managedLotsTable.soldAt)
+      )).limit(1);
+      resetSellCycle = !openLot;
     }
     const k = await loadKaspa2();
     const rpc = new k.RpcClient({ url: NODE_URL2, networkId: "mainnet", encoding: k.Encoding.Borsh });
@@ -47104,6 +47790,11 @@ async function setUserBotRunning(userId2, running) {
     status: running ? "running" : "stopped",
     nextRunAt: running ? new Date(Date.now() + 6e4) : null,
     stopReason: running ? null : "Stopped by user.",
+    ...running && resetSellCycle ? {
+      phase: "buying",
+      completedBuys: 0,
+      completedSells: 0
+    } : {},
     updatedAt: /* @__PURE__ */ new Date()
   });
   const updated = running ? await update.where(and(eq(tradingBotsTable.id, bot.id), isNull(tradingBotsTable.inFlight))).returning({ id: tradingBotsTable.id }) : await update.where(eq(tradingBotsTable.id, bot.id)).returning({ id: tradingBotsTable.id });
@@ -47486,25 +48177,20 @@ async function submitUserBotKasWithdrawal(userId2, signedTransaction) {
 
 // src/lib/bot-sell-all-service.ts
 var ACTIVE_SELL_ALL_MS = 2 * 6e4;
-var BETWEEN_LOTS_MS = 15e3;
 var RETRY_WAIT_MS = 2e4;
-var SELL_ALL_DEADLINE_MS = 25 * 6e4;
-var MAX_ATTEMPTS_PER_LOT = 12;
+var SELL_ALL_DEADLINE_MS = 10 * 6e4;
+var MAX_ATTEMPTS_PER_BATCH = 4;
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function countOpenLots(botId) {
-  const [row] = await db.select({ value: count() }).from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt)));
-  return Number(row?.value ?? 0);
+async function listOpenLots(botId) {
+  return db.select().from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt))).orderBy(asc(managedLotsTable.createdAt));
 }
-async function nextOpenLot(botId) {
-  const [lot] = await db.select().from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt))).orderBy(asc(managedLotsTable.createdAt)).limit(1);
-  return lot ?? null;
+function isHardSubmissionRejection(message) {
+  return /verification failed|script ran, but verification failed|failed to verify the signature script|double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i.test(message);
 }
-function isDefinitiveSubmissionRejection(message) {
-  return /orphan|is an orphan|rejected transaction|double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i.test(message);
-}
-function isRetryableFailure(error, message) {
+function isTransientFailure(error, message) {
   if (error instanceof RetryableTradeStateError) return true;
-  return /orphan|is an orphan|curve is busy|in-flight sequenced|no longer spendable/i.test(message);
+  if (isHardSubmissionRejection(message)) return false;
+  return /orphan|is an orphan|curve is busy|in-flight sequenced|amm pool has an in-flight|rejected transaction/i.test(message);
 }
 async function clearSellAllMarker(botId, marker) {
   await db.update(tradingBotsTable).set({
@@ -47527,6 +48213,175 @@ async function heartbeat(botId, base, patch = {}) {
     updatedAt: /* @__PURE__ */ new Date()
   }).where(eq(tradingBotsTable.id, botId));
   return next;
+}
+async function markLotsSold(botId, lots, transactionId, previousTotalTrades) {
+  const soldAt = /* @__PURE__ */ new Date();
+  await db.transaction(async (tx) => {
+    for (const lot of lots) {
+      await tx.update(managedLotsTable).set({
+        sellTransactionId: transactionId,
+        soldAt
+      }).where(eq(managedLotsTable.id, lot.id));
+    }
+    const remaining = await tx.select({ id: managedLotsTable.id }).from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt))).limit(1);
+    const cleared = remaining.length === 0;
+    await tx.update(tradingBotsTable).set({
+      phase: cleared ? "buying" : "selling",
+      ...cleared ? { completedBuys: 0, completedSells: 0 } : {},
+      totalTrades: previousTotalTrades + 1,
+      lastTradeAt: soldAt,
+      nextRunAt: null,
+      stopReason: null,
+      updatedAt: soldAt
+    }).where(eq(tradingBotsTable.id, botId));
+  });
+  return soldAt;
+}
+async function sellMappedLots(args) {
+  const { botId, credentials, lots, mapped, deadline, stage } = args;
+  let { inFlight, soldCount, previousTotalTrades } = args;
+  let lastMessage = "Unknown sell failure";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_BATCH && Date.now() < deadline; attempt += 1) {
+    inFlight = await heartbeat(botId, inFlight, {
+      lotCount: lots.length,
+      soldCount,
+      stage
+    });
+    let submissionAttempted = false;
+    try {
+      const result = await executeUserAutomatedSellLots(mapped, credentials);
+      submissionAttempted = true;
+      if (!result.transactionId) {
+        throw new Error("Sell-all submission returned no transaction ID.");
+      }
+      await markLotsSold(botId, lots, result.transactionId, previousTotalTrades);
+      previousTotalTrades += 1;
+      soldCount += lots.length;
+      logger.info({
+        botId,
+        transactionId: result.transactionId,
+        soldCount: lots.length,
+        tokenIn: result.tokenIn,
+        stage
+      }, "Sell-all batch completed");
+      return {
+        inFlight,
+        transactionId: result.transactionId,
+        soldCount,
+        totalTrades: previousTotalTrades
+      };
+    } catch (error) {
+      submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
+      lastMessage = error instanceof Error ? error.message : "Unknown sell failure";
+      const hardReject = isHardSubmissionRejection(lastMessage);
+      const transient = isTransientFailure(error, lastMessage);
+      if (submissionAttempted && !hardReject && !transient) {
+        await db.update(tradingBotsTable).set({
+          status: "paused",
+          nextRunAt: null,
+          stopReason: `Sell-all paused after uncertain submission: ${lastMessage}`,
+          inFlight,
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq(tradingBotsTable.id, botId));
+        throw new Error(
+          `Sell-all may have been submitted and needs reconciliation. ${lastMessage}`
+        );
+      }
+      if (hardReject) {
+        throw new Error(lastMessage);
+      }
+      if (transient && attempt < MAX_ATTEMPTS_PER_BATCH && Date.now() + RETRY_WAIT_MS < deadline) {
+        logger.warn({
+          botId,
+          attempt,
+          lotCount: lots.length,
+          err: lastMessage,
+          stage
+        }, "Sell-all retrying batch after transient failure");
+        inFlight = await heartbeat(botId, inFlight, { lotCount: lots.length, soldCount, stage });
+        await sleep(RETRY_WAIT_MS);
+        continue;
+      }
+      throw new Error(lastMessage);
+    }
+  }
+  throw new Error(`Sell-all timed out: ${lastMessage}`);
+}
+async function consolidateThenSell(args) {
+  const { botId, credentials, lots, deadline } = args;
+  let { inFlight, soldCount, previousTotalTrades } = args;
+  let lastMessage = "Unknown consolidate failure";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_BATCH && Date.now() < deadline; attempt += 1) {
+    inFlight = await heartbeat(botId, inFlight, {
+      lotCount: lots.length,
+      soldCount,
+      stage: "consolidate"
+    });
+    let submissionAttempted = false;
+    try {
+      const mapped = lots.map((lot) => ({
+        transactionId: lot.buyTransactionId,
+        index: lot.outputIndex,
+        amount: lot.tokenAmount.toString()
+      }));
+      const consolidated = await executeUserAutomatedConsolidateLots(mapped, credentials);
+      submissionAttempted = true;
+      logger.info({
+        botId,
+        transactionId: consolidated.transactionId,
+        lotCount: lots.length,
+        amount: consolidated.amount
+      }, "Sell-all consolidated lots into one token UTXO");
+      const sold = await sellMappedLots({
+        botId,
+        credentials,
+        lots,
+        mapped: [{
+          transactionId: consolidated.transactionId,
+          index: consolidated.index,
+          amount: consolidated.amount
+        }],
+        inFlight,
+        deadline,
+        previousTotalTrades,
+        soldCount,
+        stage: "sell"
+      });
+      return {
+        ...sold,
+        consolidateTransactionId: consolidated.transactionId
+      };
+    } catch (error) {
+      submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
+      lastMessage = error instanceof Error ? error.message : "Unknown consolidate failure";
+      const hardReject = isHardSubmissionRejection(lastMessage);
+      const transient = isTransientFailure(error, lastMessage);
+      if (submissionAttempted && !hardReject && !transient) {
+        await db.update(tradingBotsTable).set({
+          status: "paused",
+          nextRunAt: null,
+          stopReason: `Sell-all paused after uncertain consolidation: ${lastMessage}`,
+          inFlight,
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq(tradingBotsTable.id, botId));
+        throw new Error(
+          `Sell-all may have consolidated on-chain and needs reconciliation. ${lastMessage}`
+        );
+      }
+      if (hardReject) throw new Error(lastMessage);
+      if (transient && attempt < MAX_ATTEMPTS_PER_BATCH && Date.now() + RETRY_WAIT_MS < deadline) {
+        logger.warn({
+          botId,
+          attempt,
+          err: lastMessage
+        }, "Sell-all retrying consolidate after transient failure");
+        await sleep(RETRY_WAIT_MS);
+        continue;
+      }
+      throw new Error(lastMessage);
+    }
+  }
+  throw new Error(`Sell-all consolidate timed out: ${lastMessage}`);
 }
 async function sellAllUserBotManagedPositions(userId2) {
   let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
@@ -47560,8 +48415,8 @@ async function sellAllUserBotManagedPositions(userId2) {
       }
     }
   }
-  const initialOpen = await countOpenLots(bot.id);
-  if (initialOpen === 0) {
+  const openLots = await listOpenLots(bot.id);
+  if (openLots.length === 0) {
     return {
       soldCount: 0,
       remainingOpenLots: 0,
@@ -47575,7 +48430,9 @@ async function sellAllUserBotManagedPositions(userId2) {
     action: "sell-all",
     startedAt: startedAt.toISOString(),
     heartbeatAt: startedAt.toISOString(),
-    soldCount: 0
+    lotCount: openLots.length,
+    soldCount: 0,
+    stage: "sell"
   };
   const [claim] = await db.update(tradingBotsTable).set({
     inFlight,
@@ -47591,147 +48448,87 @@ async function sellAllUserBotManagedPositions(userId2) {
     privateKey: decryptPrivateKey(bot.encryptedPrivateKey),
     tokenId
   };
+  const deadline = Date.now() + SELL_ALL_DEADLINE_MS;
   const sellTransactionIds = [];
   let soldCount = 0;
-  const initialTotalTrades = bot.totalTrades;
-  const deadline = Date.now() + SELL_ALL_DEADLINE_MS;
+  let totalTrades = bot.totalTrades;
   try {
-    while (Date.now() < deadline) {
-      const remaining = await countOpenLots(bot.id);
-      if (remaining === 0) break;
-      const lot = await nextOpenLot(bot.id);
-      if (!lot) break;
-      inFlight = await heartbeat(bot.id, inFlight, {
-        currentLotId: lot.id,
-        soldCount
+    const mapped = openLots.map((lot) => ({
+      transactionId: lot.buyTransactionId,
+      index: lot.outputIndex,
+      amount: lot.tokenAmount.toString()
+    }));
+    try {
+      const result = await sellMappedLots({
+        botId: bot.id,
+        credentials,
+        lots: openLots,
+        mapped,
+        inFlight,
+        deadline,
+        previousTotalTrades: totalTrades,
+        soldCount,
+        stage: "sell"
       });
-      let lotSold = false;
-      let lastMessage = "Unknown sell failure";
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_LOT && Date.now() < deadline; attempt += 1) {
-        inFlight = await heartbeat(bot.id, inFlight, {
-          currentLotId: lot.id,
-          soldCount
-        });
-        let submissionAttempted = false;
-        try {
-          const result = await executeUserAutomatedSell({
-            transactionId: lot.buyTransactionId,
-            index: lot.outputIndex,
-            amount: lot.tokenAmount.toString()
-          }, credentials);
-          submissionAttempted = true;
-          if (!result.transactionId) {
-            throw new Error("Sell submission returned no transaction ID.");
-          }
-          await db.transaction(async (tx) => {
-            await tx.update(managedLotsTable).set({
-              sellTransactionId: result.transactionId,
-              soldAt: /* @__PURE__ */ new Date()
-            }).where(eq(managedLotsTable.id, lot.id));
-            await tx.update(tradingBotsTable).set({
-              totalTrades: initialTotalTrades + soldCount + 1,
-              lastTradeAt: /* @__PURE__ */ new Date(),
-              stopReason: null,
-              updatedAt: /* @__PURE__ */ new Date()
-            }).where(eq(tradingBotsTable.id, bot.id));
-          });
-          sellTransactionIds.push(result.transactionId);
-          soldCount += 1;
-          lotSold = true;
-          logger.info({
-            botId: bot.id,
-            lotId: lot.id,
-            transactionId: result.transactionId,
-            soldCount,
-            remainingAfter: remaining - 1
-          }, "Sell-all lot sold");
-          break;
-        } catch (error) {
-          submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
-          lastMessage = error instanceof Error ? error.message : "Unknown sell failure";
-          const definitiveReject = submissionAttempted && isDefinitiveSubmissionRejection(lastMessage);
-          const retryable = isRetryableFailure(error, lastMessage) || submissionAttempted && definitiveReject;
-          if (submissionAttempted && !definitiveReject) {
-            await db.update(tradingBotsTable).set({
-              status: "paused",
-              nextRunAt: null,
-              stopReason: `Sell-all paused after uncertain submission: ${lastMessage}`,
-              inFlight,
-              updatedAt: /* @__PURE__ */ new Date()
-            }).where(eq(tradingBotsTable.id, bot.id));
-            throw new Error(
-              `Sold ${soldCount} of ${initialOpen} position(s); a later sell may have been submitted and needs reconciliation. ${lastMessage}`
-            );
-          }
-          if (retryable && attempt < MAX_ATTEMPTS_PER_LOT && Date.now() + RETRY_WAIT_MS < deadline) {
-            logger.warn({
-              botId: bot.id,
-              lotId: lot.id,
-              attempt,
-              err: lastMessage
-            }, "Sell-all retrying lot after transient failure");
-            inFlight = await heartbeat(bot.id, inFlight, { soldCount });
-            await sleep(RETRY_WAIT_MS);
-            continue;
-          }
-          const remainingOpenLots2 = await countOpenLots(bot.id);
-          await db.update(tradingBotsTable).set({
-            inFlight: null,
-            stopReason: soldCount > 0 ? `Sell-all stopped after ${soldCount} of ${initialOpen} sale(s): ${lastMessage}` : `Sell-all failed: ${lastMessage}`,
-            phase: remainingOpenLots2 === 0 ? "buying" : "selling",
-            completedBuys: remainingOpenLots2 === 0 ? 0 : bot.completedBuys,
-            completedSells: remainingOpenLots2 === 0 ? 0 : bot.completedSells,
-            updatedAt: /* @__PURE__ */ new Date()
-          }).where(eq(tradingBotsTable.id, bot.id));
-          throw new Error(
-            `Sold ${soldCount} of ${initialOpen} position(s), then failed: ${lastMessage}` + (remainingOpenLots2 > 0 ? ` ${remainingOpenLots2} remain \u2014 retry Sell all.` : "")
-          );
-        }
-      }
-      if (!lotSold) {
-        const remainingOpenLots2 = await countOpenLots(bot.id);
+      inFlight = result.inFlight;
+      sellTransactionIds.push(result.transactionId);
+      soldCount = result.soldCount;
+      totalTrades = result.totalTrades;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown sell failure";
+      if (!(isHardSubmissionRejection(message) && openLots.length >= 2)) {
         await db.update(tradingBotsTable).set({
           inFlight: null,
-          stopReason: `Sell-all timed out after ${soldCount} of ${initialOpen} sale(s).`,
-          phase: remainingOpenLots2 === 0 ? "buying" : "selling",
+          stopReason: `Sell-all failed: ${message}`,
+          phase: "selling",
           updatedAt: /* @__PURE__ */ new Date()
         }).where(eq(tradingBotsTable.id, bot.id));
-        throw new Error(
-          `Sold ${soldCount} of ${initialOpen} position(s), then timed out. ${remainingOpenLots2} remain \u2014 retry Sell all.`
-        );
+        throw new Error(`Sell-all failed: ${message}`);
       }
-      if (await countOpenLots(bot.id) > 0) {
-        inFlight = await heartbeat(bot.id, inFlight, { soldCount });
-        await sleep(BETWEEN_LOTS_MS);
+      logger.warn({
+        botId: bot.id,
+        lotCount: openLots.length,
+        err: message
+      }, "Sell-all falling back to consolidate-then-sell after multi-lot reject");
+      const remaining = await listOpenLots(bot.id);
+      if (remaining.length === 0) {
+        soldCount = openLots.length;
+      } else {
+        const result = await consolidateThenSell({
+          botId: bot.id,
+          credentials,
+          lots: remaining,
+          inFlight,
+          deadline,
+          previousTotalTrades: totalTrades,
+          soldCount
+        });
+        inFlight = result.inFlight;
+        sellTransactionIds.push(result.transactionId);
+        soldCount = result.soldCount;
+        totalTrades = result.totalTrades;
       }
     }
-    const remainingOpenLots = await countOpenLots(bot.id);
-    if (remainingOpenLots > 0) {
-      await db.update(tradingBotsTable).set({
-        inFlight: null,
-        stopReason: `Sell-all reached time limit after ${soldCount} of ${initialOpen} sale(s).`,
-        phase: "selling",
-        updatedAt: /* @__PURE__ */ new Date()
-      }).where(eq(tradingBotsTable.id, bot.id));
-      throw new Error(
-        `Sold ${soldCount} of ${initialOpen} position(s) before the time limit. ${remainingOpenLots} remain \u2014 retry Sell all.`
-      );
-    }
+    const leftover = await listOpenLots(bot.id);
     await db.update(tradingBotsTable).set({
-      phase: "buying",
-      completedBuys: 0,
-      completedSells: 0,
-      nextRunAt: null,
       inFlight: null,
-      stopReason: null,
+      stopReason: leftover.length === 0 ? null : `Sell-all incomplete: ${leftover.length} managed lot(s) still open.`,
+      phase: leftover.length === 0 ? "buying" : "selling",
+      completedBuys: leftover.length === 0 ? 0 : bot.completedBuys,
+      completedSells: leftover.length === 0 ? 0 : bot.completedSells,
       updatedAt: /* @__PURE__ */ new Date()
     }).where(eq(tradingBotsTable.id, bot.id));
+    if (leftover.length > 0) {
+      throw new Error(
+        `Sell-all incomplete after ${soldCount} sale(s); ${leftover.length} managed lot(s) remain.`
+      );
+    }
     return {
       soldCount,
       remainingOpenLots: 0,
       sellTransactionIds,
       complete: true,
-      message: `Sold all ${soldCount} managed position(s). You can withdraw KAS now.`
+      message: sellTransactionIds.length === 1 ? `Sold all ${soldCount} managed position(s) in one transaction. You can withdraw KAS now.` : `Sold all ${soldCount} managed position(s) across ${sellTransactionIds.length} sell transaction(s). You can withdraw KAS now.`
     };
   } catch (error) {
     throw error;
@@ -47746,12 +48543,22 @@ var userId = (req) => {
   if (!id) throw new Error("Connect and verify your wallet first.");
   return id;
 };
+function publicErrorMessage(error) {
+  if (!(error instanceof Error)) return "Request failed";
+  const cause = error.cause;
+  const causeMessage = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : cause && typeof cause === "object" && "message" in cause ? String(cause.message) : null;
+  if (causeMessage && error.message.startsWith("Failed query:")) {
+    return `${error.message}
+Cause: ${causeMessage}`;
+  }
+  return error.message;
+}
 var handler = (fn) => async (req, res) => {
   try {
     await fn(req, res);
   } catch (error) {
     req.log.warn({ err: error }, "User bot request blocked");
-    res.status(400).json({ error: error instanceof Error ? error.message : "Request failed" });
+    res.status(400).json({ error: publicErrorMessage(error) });
   }
 };
 router3.post("/app/auth/challenge", handler(async (req, res) => {
