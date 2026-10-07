@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull, ne } from "drizzle-orm";
+import { and, asc, eq, isNull, ne, sql } from "drizzle-orm";
 import { db, managedLotsTable, tradingBotsTable } from "@workspace/db";
 import {
   executeUserAutomatedConsolidateLots,
@@ -10,8 +10,11 @@ import { decryptPrivateKey } from "./user-app-service";
 import { reconcileStaleInFlight } from "./interrupted-trade-service";
 import { logger } from "./logger";
 
-/** Concurrent requests only block while a sell-all is actively heartbeating. */
-const ACTIVE_SELL_ALL_MS = 2 * 60_000;
+/** Concurrent requests only block while a sell-all is actively heartbeating.
+ *  Vercel kills the function at 60s, so a lock older than this is a crashed run. */
+const ACTIVE_SELL_ALL_MS = 90_000;
+/** Wait between one-lot fallback sells so the pool/sequencer can settle. */
+const BETWEEN_LOTS_MS = 8_000;
 /** Backoff when the curve/pool reports busy / transient reject. */
 const RETRY_WAIT_MS = 20_000;
 /** Overall deadline for one Sell All request. */
@@ -55,15 +58,64 @@ function isTransientFailure(error: unknown, message: string) {
     .test(message);
 }
 
-async function clearSellAllMarker(botId: string, marker: unknown) {
+function sellAllMarkerAgeMs(marker: { heartbeatAt?: string; startedAt?: string }) {
+  const beat = typeof marker.heartbeatAt === "string"
+    ? Date.parse(marker.heartbeatAt)
+    : typeof marker.startedAt === "string"
+      ? Date.parse(marker.startedAt)
+      : Number.NaN;
+  return Number.isFinite(beat) ? Date.now() - beat : Number.POSITIVE_INFINITY;
+}
+
+function retainSellAllForReconciliation(stopReason: string | null | undefined) {
+  return /uncertain|reconcil/i.test(stopReason ?? "");
+}
+
+function describeActiveSellAll(marker: {
+  soldCount?: number;
+  lotCount?: number;
+  stage?: string;
+  heartbeatAt?: string;
+  startedAt?: string;
+}) {
+  const ageSec = Math.max(0, Math.round(sellAllMarkerAgeMs(marker) / 1000));
+  const sold = typeof marker.soldCount === "number" ? marker.soldCount : 0;
+  const lots = typeof marker.lotCount === "number" ? marker.lotCount : undefined;
+  const stage = marker.stage === "consolidate" ? "merging lots" : "selling";
+  return lots != null
+    ? `${stage}, ${sold} of ${lots} sold, last update ${ageSec}s ago`
+    : `${stage}, last update ${ageSec}s ago`;
+}
+
+async function clearSellAllByAction(botId: string) {
   await db.update(tradingBotsTable).set({
     inFlight: null,
     stopReason: null,
     updatedAt: new Date(),
   }).where(and(
     eq(tradingBotsTable.id, botId),
-    eq(tradingBotsTable.inFlight, marker),
+    sql`${tradingBotsTable.inFlight}->>'action' = 'sell-all'`,
   ));
+}
+
+/** Refresh / dashboard: drop a crashed sell-all lock so the user can retry. */
+export async function expireStaleSellAllInFlight(bot: {
+  id: string;
+  inFlight: unknown;
+  stopReason: string | null;
+}) {
+  const marker = bot.inFlight as { action?: string; startedAt?: string; heartbeatAt?: string } | null;
+  if (!marker || marker.action !== "sell-all") return { cleared: false, active: false };
+  if (retainSellAllForReconciliation(bot.stopReason)) {
+    return { cleared: false, active: true };
+  }
+  const ageMs = sellAllMarkerAgeMs(marker);
+  if (ageMs < ACTIVE_SELL_ALL_MS) {
+    return { cleared: false, active: true };
+  }
+  await clearSellAllByAction(bot.id);
+  logger.warn({ botId: bot.id, ageMs }, "Cleared stalled sell-all marker on dashboard refresh");
+  return { cleared: true, active: false };
 }
 
 async function heartbeat(botId: string, base: SellAllInFlight, patch: Partial<SellAllInFlight> = {}) {
@@ -291,6 +343,52 @@ async function consolidateThenSell(args: {
   throw new Error(`Sell-all consolidate timed out: ${lastMessage}`);
 }
 
+async function sellLotsOneByOne(args: {
+  botId: string;
+  credentials: LiveCredentials;
+  lots: ManagedLotRow[];
+  inFlight: SellAllInFlight;
+  deadline: number;
+  previousTotalTrades: number;
+  soldCount: number;
+}): Promise<{
+  inFlight: SellAllInFlight;
+  sellTransactionIds: string[];
+  soldCount: number;
+  totalTrades: number;
+}> {
+  const { botId, credentials, lots, deadline } = args;
+  let { inFlight, soldCount, previousTotalTrades } = args;
+  const sellTransactionIds: string[] = [];
+  for (let i = 0; i < lots.length && Date.now() < deadline; i += 1) {
+    const lot = lots[i];
+    const result = await sellMappedLots({
+      botId,
+      credentials,
+      lots: [lot],
+      mapped: [{
+        transactionId: lot.buyTransactionId,
+        index: lot.outputIndex,
+        amount: lot.tokenAmount.toString(),
+      }],
+      inFlight,
+      deadline,
+      previousTotalTrades,
+      soldCount,
+      stage: "sell",
+    });
+    inFlight = result.inFlight;
+    sellTransactionIds.push(result.transactionId);
+    soldCount = result.soldCount;
+    previousTotalTrades = result.totalTrades;
+    if (i < lots.length - 1 && Date.now() + BETWEEN_LOTS_MS < deadline) {
+      inFlight = await heartbeat(botId, inFlight, { soldCount, stage: "sell" });
+      await sleep(BETWEEN_LOTS_MS);
+    }
+  }
+  return { inFlight, sellTransactionIds, soldCount, totalTrades: previousTotalTrades };
+}
+
 export async function sellAllUserBotManagedPositions(userId: string) {
   let [bot] = await db.select().from(tradingBotsTable)
     .where(eq(tradingBotsTable.userId, userId))
@@ -303,19 +401,30 @@ export async function sellAllUserBotManagedPositions(userId: string) {
   }
 
   if (bot.inFlight) {
-    const marker = bot.inFlight as { action?: string; startedAt?: string; heartbeatAt?: string };
+    const marker = bot.inFlight as {
+      action?: string;
+      startedAt?: string;
+      heartbeatAt?: string;
+      soldCount?: number;
+      lotCount?: number;
+      stage?: string;
+    };
     if (marker.action === "sell-all") {
-      const beat = typeof marker.heartbeatAt === "string"
-        ? Date.parse(marker.heartbeatAt)
-        : typeof marker.startedAt === "string"
-          ? Date.parse(marker.startedAt)
-          : Number.NaN;
-      const ageMs = Number.isFinite(beat) ? Date.now() - beat : Number.POSITIVE_INFINITY;
-      const activelyRunning = ageMs < ACTIVE_SELL_ALL_MS && !bot.stopReason;
-      if (activelyRunning) {
-        throw new Error("A sell-all operation is already in progress. Wait a moment and try again.");
+      if (retainSellAllForReconciliation(bot.stopReason)) {
+        throw new Error(
+          bot.stopReason
+            ?? "The last sell needs reconciliation before retrying Sell All.",
+        );
       }
-      await clearSellAllMarker(bot.id, bot.inFlight);
+      const ageMs = sellAllMarkerAgeMs(marker);
+      const activelyRunning = ageMs < ACTIVE_SELL_ALL_MS;
+      if (activelyRunning) {
+        throw new Error(
+          `Sell All is still running (${describeActiveSellAll(marker)}). `
+            + "Wait for that submit to finish. If it stays stuck, wait about 90 seconds and click Sell All again.",
+        );
+      }
+      await clearSellAllByAction(bot.id);
       logger.warn({ botId: bot.id, ageMs, stopReason: bot.stopReason }, "Cleared stalled sell-all marker for retry");
       [bot] = await db.select().from(tradingBotsTable)
         .where(eq(tradingBotsTable.id, bot.id))
@@ -401,7 +510,10 @@ export async function sellAllUserBotManagedPositions(userId: string) {
       totalTrades = result.totalTrades;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown sell failure";
-      if (!(isHardSubmissionRejection(message) && openLots.length >= 2)) {
+      if (/needs reconciliation|uncertain submission|uncertain consolidation/i.test(message)) {
+        throw error;
+      }
+      if (!isHardSubmissionRejection(message)) {
         await db.update(tradingBotsTable).set({
           inFlight: null,
           stopReason: `Sell-all failed: ${message}`,
@@ -411,32 +523,57 @@ export async function sellAllUserBotManagedPositions(userId: string) {
         throw new Error(`Sell-all failed: ${message}`);
       }
 
-      // Multi-input covenant sells can fail verification above ~2 lots.
-      // Consolidate into one token UTXO, then sell that piece (2 TXs total).
       logger.warn({
         botId: bot.id,
         lotCount: openLots.length,
         err: message,
-      }, "Sell-all falling back to consolidate-then-sell after multi-lot reject");
+      }, "Sell-all combined submit rejected; retrying one lot at a time");
 
-      const remaining = await listOpenLots(bot.id);
+      let remaining = await listOpenLots(bot.id);
       if (remaining.length === 0) {
-        // Combined sell may have actually landed despite the error path.
         soldCount = openLots.length;
       } else {
-        const result = await consolidateThenSell({
-          botId: bot.id,
-          credentials,
-          lots: remaining,
-          inFlight,
-          deadline,
-          previousTotalTrades: totalTrades,
-          soldCount,
-        });
-        inFlight = result.inFlight;
-        sellTransactionIds.push(result.transactionId);
-        soldCount = result.soldCount;
-        totalTrades = result.totalTrades;
+        try {
+          const sequential = await sellLotsOneByOne({
+            botId: bot.id,
+            credentials,
+            lots: remaining,
+            inFlight,
+            deadline,
+            previousTotalTrades: totalTrades,
+            soldCount,
+          });
+          inFlight = sequential.inFlight;
+          sellTransactionIds.push(...sequential.sellTransactionIds);
+          soldCount = sequential.soldCount;
+          totalTrades = sequential.totalTrades;
+        } catch (sequentialError) {
+          const sequentialMessage = sequentialError instanceof Error
+            ? sequentialError.message
+            : "Unknown sell failure";
+          remaining = await listOpenLots(bot.id);
+          if (remaining.length < 2 || !isHardSubmissionRejection(sequentialMessage)) {
+            throw sequentialError;
+          }
+          logger.warn({
+            botId: bot.id,
+            lotCount: remaining.length,
+            err: sequentialMessage,
+          }, "Sell-all falling back to consolidate-then-sell after one-lot rejects");
+          const result = await consolidateThenSell({
+            botId: bot.id,
+            credentials,
+            lots: remaining,
+            inFlight,
+            deadline,
+            previousTotalTrades: totalTrades,
+            soldCount,
+          });
+          inFlight = result.inFlight;
+          sellTransactionIds.push(result.transactionId);
+          soldCount = result.soldCount;
+          totalTrades = result.totalTrades;
+        }
       }
     }
 
@@ -468,6 +605,16 @@ export async function sellAllUserBotManagedPositions(userId: string) {
         : `Sold all ${soldCount} managed position(s) across ${sellTransactionIds.length} sell transaction(s). You can withdraw KAS now.`,
     };
   } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (!/needs reconciliation|uncertain submission|uncertain consolidation/i.test(message)) {
+      await db.update(tradingBotsTable).set({
+        inFlight: null,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(tradingBotsTable.id, bot.id),
+        sql`${tradingBotsTable.inFlight}->>'action' = 'sell-all'`,
+      ));
+    }
     throw error;
   }
 }

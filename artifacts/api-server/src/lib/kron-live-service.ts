@@ -38,6 +38,34 @@ export class RetryableTradeStateError extends Error {
 const toBytes = (hex: string) => Uint8Array.from(Buffer.from(hex, "hex"));
 const toKas = (sompi: bigint) => Number(sompi) / Number(SOMPI_PER_KAS);
 
+/**
+ * Sign only the trader P2PK funding/presence input. WASM `signTransaction` can hash
+ * without `tx.payload`; Kaspa then rejects with "script ran, but verification failed".
+ */
+function signTraderFunding(
+  k: Awaited<ReturnType<typeof loadKaspa>>,
+  assembly: { transaction: any; fundingInputIndexes: number[] },
+  key: any,
+) {
+  const indexes = assembly.fundingInputIndexes;
+  if (!indexes?.length) {
+    throw new Error("Assembled trade is missing a wallet funding input to sign.");
+  }
+  assembly.transaction = kron.spend.signFundingInputs(
+    k,
+    assembly.transaction,
+    key,
+    indexes,
+  );
+  return indexes.map((index) => {
+    const script = assembly.transaction.inputs[index]?.signatureScript;
+    if (!script || typeof script !== "string" || script.length % 2 !== 0 || script.length < 128) {
+      throw new Error("Wallet funding input was not signed.");
+    }
+    return script.length / 2;
+  });
+}
+
 function unwrapIndexerRow<T>(value: T | T[] | null | undefined): T | null {
   if (Array.isArray(value)) return (value[0] as T | undefined) ?? null;
   return value ?? null;
@@ -377,24 +405,7 @@ async function runLiveBuy(
     let transactionId: string | undefined;
     let fundingSignatureScriptBytes: number[] | undefined;
     if (submit || signOnly) {
-      const inputsBefore = assembly.transaction.inputs;
-      const covenantScripts = inputsBefore
-        .slice(0, assembly.fundingInputIndexes[0])
-        .map((input: any) => input.signatureScript);
-      assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
-      const inputsAfter = assembly.transaction.inputs;
-      covenantScripts.forEach((script: string, index: number) => {
-        if (inputsAfter[index].signatureScript !== script) {
-          throw new Error("Native signer modified a covenant input; refusing submission.");
-        }
-      });
-      fundingSignatureScriptBytes = assembly.fundingInputIndexes.map((index) => {
-        const script = inputsAfter[index].signatureScript;
-        if (!script || typeof script !== "string" || script.length % 2 !== 0) {
-          throw new Error("Native signer produced an invalid funding signature script.");
-        }
-        return script.length / 2;
-      });
+      fundingSignatureScriptBytes = signTraderFunding(k, assembly, key);
     }
     if (submit && !automation) {
       await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
@@ -600,15 +611,7 @@ export async function executeUserAutomatedConsolidateLots(
       changeAddress: walletAddress,
       networkFee,
     });
-    const covenantScripts = assembly.transaction.inputs
-      .slice(0, assembly.fundingInputIndexes[0])
-      .map((input: any) => input.signatureScript);
-    assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
-    covenantScripts.forEach((script: string, index: number) => {
-      if (assembly.transaction.inputs[index].signatureScript !== script) {
-        throw new Error("Signer modified a covenant input.");
-      }
-    });
+    signTraderFunding(k, assembly, key);
     let result = null;
     try {
       result = await rpc.submitTransaction({
@@ -856,15 +859,7 @@ async function runAutomatedSell(
     const netCredit = assembly.change - fundingTotal;
     if (netCredit <= 0n) throw new Error("Assembled sell does not produce a positive KAS credit.");
 
-    const covenantScripts = assembly.transaction.inputs
-      .slice(0, assembly.fundingInputIndexes[0])
-      .map((input: any) => input.signatureScript);
-    assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
-    covenantScripts.forEach((script: string, index: number) => {
-      if (assembly.transaction.inputs[index].signatureScript !== script) {
-        throw new Error("Signer modified a covenant input.");
-      }
-    });
+    signTraderFunding(k, assembly, key);
     let result = null;
     if (submit) {
       try {
@@ -1075,24 +1070,7 @@ async function runPoolBuy(args: {
     let transactionId: string | undefined;
     let fundingSignatureScriptBytes: number[] | undefined;
     if (submit || signOnly) {
-      const inputsBefore = assembly.transaction.inputs;
-      const covenantScripts = inputsBefore
-        .slice(0, assembly.fundingInputIndexes[0])
-        .map((input: any) => input.signatureScript);
-      assembly.transaction = k.signTransaction(assembly.transaction, [workingKey], false);
-      const inputsAfter = assembly.transaction.inputs;
-      covenantScripts.forEach((script: string, index: number) => {
-        if (inputsAfter[index].signatureScript !== script) {
-          throw new Error("Native signer modified a covenant input; refusing submission.");
-        }
-      });
-      fundingSignatureScriptBytes = assembly.fundingInputIndexes.map((index: number) => {
-        const script = inputsAfter[index].signatureScript;
-        if (!script || typeof script !== "string" || script.length % 2 !== 0) {
-          throw new Error("Native signer produced an invalid funding signature script.");
-        }
-        return script.length / 2;
-      });
+      fundingSignatureScriptBytes = signTraderFunding(k, assembly, workingKey);
     }
     if (submit && !automation) {
       await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
@@ -1366,15 +1344,7 @@ async function runPoolSell(args: {
       throw new Error("Assembled pool sell does not produce a positive KAS credit.");
     }
 
-    const covenantScripts = assembly.transaction.inputs
-      .slice(0, assembly.fundingInputIndexes[0])
-      .map((input: any) => input.signatureScript);
-    assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
-    covenantScripts.forEach((script: string, index: number) => {
-      if (assembly.transaction.inputs[index].signatureScript !== script) {
-        throw new Error("Signer modified a covenant input.");
-      }
-    });
+    signTraderFunding(k, assembly, key);
 
     let result = null;
     if (submit) {

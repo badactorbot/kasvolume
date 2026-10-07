@@ -168,7 +168,15 @@ export async function verifyWalletChallenge(input: {
 export async function getUserDashboard(userId: string) {
   const [user] = await db.select().from(walletUsersTable).where(eq(walletUsersTable.id, userId)).limit(1);
   if (!user) throw new Error("Wallet session is no longer valid.");
-  const [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId)).limit(1);
+  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId)).limit(1);
+  if (bot?.inFlight && typeof bot.inFlight === "object" && !Array.isArray(bot.inFlight)
+    && (bot.inFlight as { action?: string }).action === "sell-all") {
+    const { expireStaleSellAllInFlight } = await import("./bot-sell-all-service");
+    const expired = await expireStaleSellAllInFlight(bot);
+    if (expired.cleared) {
+      [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
+    }
+  }
   const lots = bot
     ? await db.select().from(managedLotsTable)
         .where(eq(managedLotsTable.botId, bot.id))

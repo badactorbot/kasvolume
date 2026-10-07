@@ -6,7 +6,7 @@
   "outputDirectory": "artifacts/kron-trading-bot/dist/public",
   "functions": {
     "api/index.js": {
-      "maxDuration": 60,
+      "maxDuration": 300,
       "includeFiles": "{artifacts/api-server/deploy/**,artifacts/kron-trading-bot/server/**}"
     }
   },

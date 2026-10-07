@@ -111,7 +111,16 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
       }
     } catch (err: any) {
       await queryClient.invalidateQueries({ queryKey: getGetUserBotDashboardQueryKey() });
-      setError(err.data?.error || err.response?.data?.error || err.message || 'Sell all failed');
+      const raw = err.data?.error || err.response?.data?.error || err.message || 'Sell all failed';
+      setError(
+        /still running/i.test(raw)
+          ? raw
+          : /already in progress/i.test(raw)
+            ? 'Sell All is still running. Wait about 90 seconds if it was interrupted, then click Sell All again.'
+            : /verification failed|signature script/i.test(raw)
+              ? 'The network rejected the sell signature. Click Sell All again — a stuck lock is cleared automatically, and the bot will retry one position at a time.'
+              : raw,
+      );
       setSellAllOpen(false);
     }
   };
