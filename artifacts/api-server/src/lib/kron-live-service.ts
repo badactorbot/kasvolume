@@ -40,21 +40,14 @@ const toKas = (sompi: bigint) => Number(sompi) / Number(SOMPI_PER_KAS);
 
 const KCC20_SCALE = 1_000_000n;
 
-function encodeP2pkSignatureScript(k: Awaited<ReturnType<typeof loadKaspa>>, signature: string) {
-  const hex = String(signature ?? "").replace(/^0x/i, "").toLowerCase();
-  if (/^4241[0-9a-f]{128}01$/.test(hex)) return hex.slice(2);
-  if (/^41[0-9a-f]{128}01$/.test(hex)) return hex;
-  const wrapped = String(new k.ScriptBuilder().addData(signature).drain()).toLowerCase();
-  return /^4241[0-9a-f]{128}01$/.test(wrapped) ? wrapped.slice(2) : wrapped;
-}
-
 /**
  * Sign only the trader P2PK funding/presence input.
  *
- * Do not use WASM `signTransaction` (it can omit `tx.payload` from the sighash) or
- * Kron `signFundingInputs` (it replaces `tx.inputs` and can drop v1 `computeBudget`,
- * which is also in the sighash). Either mismatch is rejected as
- * "script ran, but verification failed".
+ * Use Kron `signFundingInputs` (createInputSignature + ScriptBuilder) so the signature
+ * script matches what the network expects and `tx.payload` stays in the sighash.
+ * That helper reassigns `tx.inputs` and can drop v1 `computeBudget`, which is also in
+ * the sighash — capture budgets before signing and restore them afterward. Skipping
+ * either step yields "script ran, but verification failed".
  */
 function signTraderFunding(
   k: Awaited<ReturnType<typeof loadKaspa>>,
@@ -72,26 +65,24 @@ function signTraderFunding(
     );
   }
   const tx = assembly.transaction;
-  const inputs = tx.inputs;
-  const budgets = inputs.map((input: { computeBudget?: number }) => input.computeBudget);
   for (const index of indexes) {
-    if (!inputs[index]?.utxo) {
+    if (!tx.inputs[index]?.utxo) {
       throw new Error("Wallet funding input is missing UTXO data required for signing.");
     }
-    const signature = k.createInputSignature(tx, index, key, k.SighashType.All);
-    inputs[index].signatureScript = encodeP2pkSignatureScript(k, signature);
   }
+  const budgets = tx.inputs.map((input: { computeBudget?: number }) => input.computeBudget);
+  assembly.transaction = kron.spend.signFundingInputs(k, tx, key, indexes);
+  const inputs = assembly.transaction.inputs;
   for (const [index, budget] of budgets.entries()) {
     if (budget != null) inputs[index].computeBudget = budget;
   }
-  tx.inputs = inputs;
-  const confirmed = tx.inputs;
+  assembly.transaction.inputs = inputs;
+  const confirmed = assembly.transaction.inputs;
   for (const [index, budget] of budgets.entries()) {
     if (budget != null && confirmed[index]?.computeBudget !== budget) {
       throw new Error("Native signer dropped v1 computeBudget after signing; refusing submission.");
     }
   }
-  assembly.transaction = tx;
   return indexes.map((index) => {
     const script = assembly.transaction.inputs[index]?.signatureScript;
     if (!script || typeof script !== "string" || script.length % 2 !== 0 || script.length < 128) {

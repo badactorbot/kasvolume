@@ -28762,13 +28762,6 @@ import * as kron from "@kronsdk/kron-sdk";
 import { loadKaspa } from "@kronsdk/kron-sdk/wasm";
 import { access, mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-function encodeP2pkSignatureScript(k, signature) {
-  const hex = String(signature ?? "").replace(/^0x/i, "").toLowerCase();
-  if (/^4241[0-9a-f]{128}01$/.test(hex)) return hex.slice(2);
-  if (/^41[0-9a-f]{128}01$/.test(hex)) return hex;
-  const wrapped = String(new k.ScriptBuilder().addData(signature).drain()).toLowerCase();
-  return /^4241[0-9a-f]{128}01$/.test(wrapped) ? wrapped.slice(2) : wrapped;
-}
 function signTraderFunding(k, assembly, key, expectedPresenceIdx) {
   const indexes = assembly.fundingInputIndexes;
   if (!indexes?.length) {
@@ -28780,26 +28773,24 @@ function signTraderFunding(k, assembly, key, expectedPresenceIdx) {
     );
   }
   const tx = assembly.transaction;
-  const inputs = tx.inputs;
-  const budgets = inputs.map((input) => input.computeBudget);
   for (const index of indexes) {
-    if (!inputs[index]?.utxo) {
+    if (!tx.inputs[index]?.utxo) {
       throw new Error("Wallet funding input is missing UTXO data required for signing.");
     }
-    const signature = k.createInputSignature(tx, index, key, k.SighashType.All);
-    inputs[index].signatureScript = encodeP2pkSignatureScript(k, signature);
   }
+  const budgets = tx.inputs.map((input) => input.computeBudget);
+  assembly.transaction = kron.spend.signFundingInputs(k, tx, key, indexes);
+  const inputs = assembly.transaction.inputs;
   for (const [index, budget] of budgets.entries()) {
     if (budget != null) inputs[index].computeBudget = budget;
   }
-  tx.inputs = inputs;
-  const confirmed = tx.inputs;
+  assembly.transaction.inputs = inputs;
+  const confirmed = assembly.transaction.inputs;
   for (const [index, budget] of budgets.entries()) {
     if (budget != null && confirmed[index]?.computeBudget !== budget) {
       throw new Error("Native signer dropped v1 computeBudget after signing; refusing submission.");
     }
   }
-  assembly.transaction = tx;
   return indexes.map((index) => {
     const script = assembly.transaction.inputs[index]?.signatureScript;
     if (!script || typeof script !== "string" || script.length % 2 !== 0 || script.length < 128) {
