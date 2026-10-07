@@ -7,7 +7,7 @@ import {
   type UserBotDashboard,
 } from '@workspace/api-client-react';
 import { useQueryClient } from '@tanstack/react-query';
-import { ExternalLink } from 'lucide-react';
+import { ExternalLink, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -28,6 +28,7 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
   const [sellAllOpen, setSellAllOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [transactionId, setTransactionId] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const prepareWithdrawal = usePrepareUserBotKasWithdrawal();
   const submitWithdrawal = useSubmitUserBotKasWithdrawal();
   const sellAll = useSellAllUserBotManagedPositions();
@@ -39,7 +40,23 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
   const validAmount = Number.isFinite(amount) && amount >= 0.2 && amount <= bot.botKasBalance;
   const canWithdraw = bot.status !== 'running' && !hasOpenPositions && validAmount;
   const canSellAll = bot.status !== 'running' && hasOpenPositions;
-  const busy = prepareWithdrawal.isPending || submitWithdrawal.isPending || sellAll.isPending;
+  const busy = prepareWithdrawal.isPending || submitWithdrawal.isPending || sellAll.isPending || refreshing;
+
+  const handleRefreshWallet = async () => {
+    setError(null);
+    setRefreshing(true);
+    try {
+      await queryClient.refetchQueries({ queryKey: getGetUserBotDashboardQueryKey() });
+      toast({
+        title: 'Wallet checked',
+        description: 'Bot wallet token and KAS balances were re-read from chain. Max unlocks after every managed token is sold.',
+      });
+    } catch (err: any) {
+      setError(err.message || 'Could not refresh the bot wallet.');
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const handleWithdraw = async (mode: 'amount' | 'max' = 'amount') => {
     try {
@@ -101,9 +118,22 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
 
   return (
     <div className="mt-6 border-t border-border/50 pt-6">
-      <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-        Withdraw to Connected Wallet
-      </p>
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+          Withdraw to Connected Wallet
+        </p>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="h-8 px-3 text-[10px] font-bold uppercase tracking-widest"
+          disabled={busy}
+          onClick={handleRefreshWallet}
+        >
+          <RefreshCw className={`mr-1.5 h-3 w-3 ${refreshing ? 'animate-spin' : ''}`} />
+          {refreshing ? 'Checking…' : 'Refresh'}
+        </Button>
+      </div>
       <p className="mb-3 break-all font-mono text-[9px] text-muted-foreground/70">
         {walletAddress}
       </p>
@@ -129,6 +159,7 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
           </Button>
           <p className="text-[9px] leading-relaxed text-muted-foreground/70">
             Sells remaining tokens from the bot wallet so you can withdraw KAS.
+            After selling, use Refresh to re-check the wallet. Max enables when the chain shows no remaining tokens.
           </p>
         </div>
       )}
