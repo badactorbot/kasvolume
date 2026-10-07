@@ -44,10 +44,17 @@ async function listOpenLots(botId: string) {
     .orderBy(asc(managedLotsTable.createdAt));
 }
 
+/** Signature CHECKSIG rejects — the tx never landed; retrying other lot shapes will fail the same way. */
+function isSignatureScriptRejection(message: string) {
+  return /verification failed|script ran, but verification failed|failed to verify the signature script/i
+    .test(message);
+}
+
 /** RPC rejections that did not land — safe to clear the lock / try another strategy. */
 function isHardSubmissionRejection(message: string) {
-  return /verification failed|script ran, but verification failed|failed to verify the signature script|double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i
-    .test(message);
+  return isSignatureScriptRejection(message)
+    || /double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i
+      .test(message);
 }
 
 /** Transient node/mempool conditions worth a short retry of the same batch. */
@@ -110,7 +117,8 @@ export async function expireStaleSellAllInFlight(bot: {
     return { cleared: false, active: true };
   }
   const ageMs = sellAllMarkerAgeMs(marker);
-  if (ageMs < ACTIVE_SELL_ALL_MS) {
+  const rejected = isHardSubmissionRejection(bot.stopReason ?? "");
+  if (!rejected && ageMs < ACTIVE_SELL_ALL_MS) {
     return { cleared: false, active: true };
   }
   await clearSellAllByAction(bot.id);
@@ -417,7 +425,8 @@ export async function sellAllUserBotManagedPositions(userId: string) {
         );
       }
       const ageMs = sellAllMarkerAgeMs(marker);
-      const activelyRunning = ageMs < ACTIVE_SELL_ALL_MS;
+      const rejected = isHardSubmissionRejection(bot.stopReason ?? "");
+      const activelyRunning = !rejected && ageMs < ACTIVE_SELL_ALL_MS;
       if (activelyRunning) {
         throw new Error(
           `Sell All is still running (${describeActiveSellAll(marker)}). `
@@ -513,7 +522,7 @@ export async function sellAllUserBotManagedPositions(userId: string) {
       if (/needs reconciliation|uncertain submission|uncertain consolidation/i.test(message)) {
         throw error;
       }
-      if (!isHardSubmissionRejection(message)) {
+      if (isSignatureScriptRejection(message) || !isHardSubmissionRejection(message)) {
         await db.update(tradingBotsTable).set({
           inFlight: null,
           stopReason: `Sell-all failed: ${message}`,

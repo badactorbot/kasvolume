@@ -38,25 +38,60 @@ export class RetryableTradeStateError extends Error {
 const toBytes = (hex: string) => Uint8Array.from(Buffer.from(hex, "hex"));
 const toKas = (sompi: bigint) => Number(sompi) / Number(SOMPI_PER_KAS);
 
+const KCC20_SCALE = 1_000_000n;
+
+function encodeP2pkSignatureScript(k: Awaited<ReturnType<typeof loadKaspa>>, signature: string) {
+  const hex = String(signature ?? "").replace(/^0x/i, "").toLowerCase();
+  if (/^4241[0-9a-f]{128}01$/.test(hex)) return hex.slice(2);
+  if (/^41[0-9a-f]{128}01$/.test(hex)) return hex;
+  const wrapped = String(new k.ScriptBuilder().addData(signature).drain()).toLowerCase();
+  return /^4241[0-9a-f]{128}01$/.test(wrapped) ? wrapped.slice(2) : wrapped;
+}
+
 /**
- * Sign only the trader P2PK funding/presence input. WASM `signTransaction` can hash
- * without `tx.payload`; Kaspa then rejects with "script ran, but verification failed".
+ * Sign only the trader P2PK funding/presence input.
+ *
+ * Do not use WASM `signTransaction` (it can omit `tx.payload` from the sighash) or
+ * Kron `signFundingInputs` (it replaces `tx.inputs` and can drop v1 `computeBudget`,
+ * which is also in the sighash). Either mismatch is rejected as
+ * "script ran, but verification failed".
  */
 function signTraderFunding(
   k: Awaited<ReturnType<typeof loadKaspa>>,
   assembly: { transaction: any; fundingInputIndexes: number[] },
   key: any,
+  expectedPresenceIdx?: number,
 ) {
   const indexes = assembly.fundingInputIndexes;
   if (!indexes?.length) {
     throw new Error("Assembled trade is missing a wallet funding input to sign.");
   }
-  assembly.transaction = kron.spend.signFundingInputs(
-    k,
-    assembly.transaction,
-    key,
-    indexes,
-  );
+  if (expectedPresenceIdx != null && indexes[0] !== expectedPresenceIdx) {
+    throw new Error(
+      `Wallet funding input is at index ${indexes[0]}, but the covenant presence witness is ${expectedPresenceIdx}.`,
+    );
+  }
+  const tx = assembly.transaction;
+  const inputs = tx.inputs;
+  const budgets = inputs.map((input: { computeBudget?: number }) => input.computeBudget);
+  for (const index of indexes) {
+    if (!inputs[index]?.utxo) {
+      throw new Error("Wallet funding input is missing UTXO data required for signing.");
+    }
+    const signature = k.createInputSignature(tx, index, key, k.SighashType.All);
+    inputs[index].signatureScript = encodeP2pkSignatureScript(k, signature);
+  }
+  for (const [index, budget] of budgets.entries()) {
+    if (budget != null) inputs[index].computeBudget = budget;
+  }
+  tx.inputs = inputs;
+  const confirmed = tx.inputs;
+  for (const [index, budget] of budgets.entries()) {
+    if (budget != null && confirmed[index]?.computeBudget !== budget) {
+      throw new Error("Native signer dropped v1 computeBudget after signing; refusing submission.");
+    }
+  }
+  assembly.transaction = tx;
   return indexes.map((index) => {
     const script = assembly.transaction.inputs[index]?.signatureScript;
     if (!script || typeof script !== "string" || script.length % 2 !== 0 || script.length < 128) {
@@ -64,6 +99,17 @@ function signTraderFunding(
     }
     return script.length / 2;
   });
+}
+
+function assertPoolUtxoMatchesReserves(
+  poolEntry: { amount: string | number | bigint },
+  kasReserve: bigint,
+) {
+  if (BigInt(poolEntry.amount) !== kasReserve * KCC20_SCALE) {
+    throw new RetryableTradeStateError(
+      "Live AMM pool KAS amount does not match quoted reserves; waiting before retrying.",
+    );
+  }
 }
 
 function unwrapIndexerRow<T>(value: T | T[] | null | undefined): T | null {
@@ -405,7 +451,7 @@ async function runLiveBuy(
     let transactionId: string | undefined;
     let fundingSignatureScriptBytes: number[] | undefined;
     if (submit || signOnly) {
-      fundingSignatureScriptBytes = signTraderFunding(k, assembly, key);
+      fundingSignatureScriptBytes = signTraderFunding(k, assembly, key, assembly.fundingInputIndexes[0]);
     }
     if (submit && !automation) {
       await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
@@ -611,7 +657,7 @@ export async function executeUserAutomatedConsolidateLots(
       changeAddress: walletAddress,
       networkFee,
     });
-    signTraderFunding(k, assembly, key);
+    signTraderFunding(k, assembly, key, presenceWitnessIdx);
     let result = null;
     try {
       result = await rpc.submitTransaction({
@@ -859,7 +905,7 @@ async function runAutomatedSell(
     const netCredit = assembly.change - fundingTotal;
     if (netCredit <= 0n) throw new Error("Assembled sell does not produce a positive KAS credit.");
 
-    signTraderFunding(k, assembly, key);
+    signTraderFunding(k, assembly, key, presenceWitnessIdx);
     let result = null;
     if (submit) {
       try {
@@ -1000,6 +1046,7 @@ async function runPoolBuy(args: {
         "Live AMM pool state is temporarily ambiguous; waiting before retrying.",
       );
     }
+    assertPoolUtxoMatchesReserves(poolEntry, poolState.kasReserve);
     if (!walletEntries.length) throw new Error("Bot wallet has no spendable KAS UTXOs.");
 
     const fundingEntries = [...walletEntries]
@@ -1070,7 +1117,7 @@ async function runPoolBuy(args: {
     let transactionId: string | undefined;
     let fundingSignatureScriptBytes: number[] | undefined;
     if (submit || signOnly) {
-      fundingSignatureScriptBytes = signTraderFunding(k, assembly, workingKey);
+      fundingSignatureScriptBytes = signTraderFunding(k, assembly, workingKey, presenceWitnessIdx);
     }
     if (submit && !automation) {
       await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
@@ -1275,6 +1322,7 @@ async function runPoolSell(args: {
         "Live AMM pool state is temporarily ambiguous; waiting before retrying.",
       );
     }
+    assertPoolUtxoMatchesReserves(poolEntry, poolState.kasReserve);
 
     const traderTokens = preparedLots.map(({ lot, decoded }) => {
       const sellerEntry = sellerEntries.find(
@@ -1344,7 +1392,7 @@ async function runPoolSell(args: {
       throw new Error("Assembled pool sell does not produce a positive KAS credit.");
     }
 
-    signTraderFunding(k, assembly, key);
+    signTraderFunding(k, assembly, key, presenceWitnessIdx);
 
     let result = null;
     if (submit) {

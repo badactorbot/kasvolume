@@ -28762,17 +28762,44 @@ import * as kron from "@kronsdk/kron-sdk";
 import { loadKaspa } from "@kronsdk/kron-sdk/wasm";
 import { access, mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-function signTraderFunding(k, assembly, key) {
+function encodeP2pkSignatureScript(k, signature) {
+  const hex = String(signature ?? "").replace(/^0x/i, "").toLowerCase();
+  if (/^4241[0-9a-f]{128}01$/.test(hex)) return hex.slice(2);
+  if (/^41[0-9a-f]{128}01$/.test(hex)) return hex;
+  const wrapped = String(new k.ScriptBuilder().addData(signature).drain()).toLowerCase();
+  return /^4241[0-9a-f]{128}01$/.test(wrapped) ? wrapped.slice(2) : wrapped;
+}
+function signTraderFunding(k, assembly, key, expectedPresenceIdx) {
   const indexes = assembly.fundingInputIndexes;
   if (!indexes?.length) {
     throw new Error("Assembled trade is missing a wallet funding input to sign.");
   }
-  assembly.transaction = kron.spend.signFundingInputs(
-    k,
-    assembly.transaction,
-    key,
-    indexes
-  );
+  if (expectedPresenceIdx != null && indexes[0] !== expectedPresenceIdx) {
+    throw new Error(
+      `Wallet funding input is at index ${indexes[0]}, but the covenant presence witness is ${expectedPresenceIdx}.`
+    );
+  }
+  const tx = assembly.transaction;
+  const inputs = tx.inputs;
+  const budgets = inputs.map((input) => input.computeBudget);
+  for (const index of indexes) {
+    if (!inputs[index]?.utxo) {
+      throw new Error("Wallet funding input is missing UTXO data required for signing.");
+    }
+    const signature = k.createInputSignature(tx, index, key, k.SighashType.All);
+    inputs[index].signatureScript = encodeP2pkSignatureScript(k, signature);
+  }
+  for (const [index, budget] of budgets.entries()) {
+    if (budget != null) inputs[index].computeBudget = budget;
+  }
+  tx.inputs = inputs;
+  const confirmed = tx.inputs;
+  for (const [index, budget] of budgets.entries()) {
+    if (budget != null && confirmed[index]?.computeBudget !== budget) {
+      throw new Error("Native signer dropped v1 computeBudget after signing; refusing submission.");
+    }
+  }
+  assembly.transaction = tx;
   return indexes.map((index) => {
     const script = assembly.transaction.inputs[index]?.signatureScript;
     if (!script || typeof script !== "string" || script.length % 2 !== 0 || script.length < 128) {
@@ -28780,6 +28807,13 @@ function signTraderFunding(k, assembly, key) {
     }
     return script.length / 2;
   });
+}
+function assertPoolUtxoMatchesReserves(poolEntry, kasReserve) {
+  if (BigInt(poolEntry.amount) !== kasReserve * KCC20_SCALE) {
+    throw new RetryableTradeStateError(
+      "Live AMM pool KAS amount does not match quoted reserves; waiting before retrying."
+    );
+  }
 }
 function unwrapIndexerRow(value) {
   if (Array.isArray(value)) return value[0] ?? null;
@@ -29026,7 +29060,7 @@ async function runLiveBuy(submit, signOnly, automation = false, credentials, enf
     let transactionId;
     let fundingSignatureScriptBytes;
     if (submit || signOnly) {
-      fundingSignatureScriptBytes = signTraderFunding(k, assembly, key);
+      fundingSignatureScriptBytes = signTraderFunding(k, assembly, key, assembly.fundingInputIndexes[0]);
     }
     if (submit && !automation) {
       await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
@@ -29190,7 +29224,7 @@ async function executeUserAutomatedConsolidateLots(lots, credentials) {
       changeAddress: walletAddress,
       networkFee
     });
-    signTraderFunding(k, assembly, key);
+    signTraderFunding(k, assembly, key, presenceWitnessIdx);
     let result = null;
     try {
       result = await rpc.submitTransaction({
@@ -29407,7 +29441,7 @@ async function runAutomatedSell(lots, submit, credentials) {
     const fundingTotal = BigInt(fundingEntries[0].amount);
     const netCredit = assembly.change - fundingTotal;
     if (netCredit <= 0n) throw new Error("Assembled sell does not produce a positive KAS credit.");
-    signTraderFunding(k, assembly, key);
+    signTraderFunding(k, assembly, key, presenceWitnessIdx);
     let result = null;
     if (submit) {
       try {
@@ -29523,6 +29557,7 @@ async function runPoolBuy(args) {
         "Live AMM pool state is temporarily ambiguous; waiting before retrying."
       );
     }
+    assertPoolUtxoMatchesReserves(poolEntry, poolState.kasReserve);
     if (!walletEntries.length) throw new Error("Bot wallet has no spendable KAS UTXOs.");
     const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
     const presenceWitnessIdx = 2;
@@ -29585,7 +29620,7 @@ async function runPoolBuy(args) {
     let transactionId;
     let fundingSignatureScriptBytes;
     if (submit || signOnly) {
-      fundingSignatureScriptBytes = signTraderFunding(k, assembly, workingKey);
+      fundingSignatureScriptBytes = signTraderFunding(k, assembly, workingKey, presenceWitnessIdx);
     }
     if (submit && !automation) {
       await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
@@ -29761,6 +29796,7 @@ async function runPoolSell(args) {
         "Live AMM pool state is temporarily ambiguous; waiting before retrying."
       );
     }
+    assertPoolUtxoMatchesReserves(poolEntry, poolState.kasReserve);
     const traderTokens = preparedLots.map(({ lot, decoded }) => {
       const sellerEntry = sellerEntries.find(
         (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
@@ -29818,7 +29854,7 @@ async function runPoolSell(args) {
     if (netCredit <= 0n) {
       throw new Error("Assembled pool sell does not produce a positive KAS credit.");
     }
-    signTraderFunding(k, assembly, key);
+    signTraderFunding(k, assembly, key, presenceWitnessIdx);
     let result = null;
     if (submit) {
       try {
@@ -29849,7 +29885,7 @@ async function runPoolSell(args) {
     await rpc.disconnect().catch(() => void 0);
   }
 }
-var API_URL, INDEXER_URL, NODE_URL, SEQUENCER_URL, NETWORK_ID, LIVE_TEST_KAS, SOMPI_PER_KAS, MAXIMUM_DEBIT_SOMPI, MINIMUM_RESERVE_SOMPI, EXECUTION_LOCK, TradeSubmissionAttemptedError, RetryableTradeStateError, toBytes, toKas;
+var API_URL, INDEXER_URL, NODE_URL, SEQUENCER_URL, NETWORK_ID, LIVE_TEST_KAS, SOMPI_PER_KAS, MAXIMUM_DEBIT_SOMPI, MINIMUM_RESERVE_SOMPI, EXECUTION_LOCK, TradeSubmissionAttemptedError, RetryableTradeStateError, toBytes, toKas, KCC20_SCALE;
 var init_kron_live_service = __esm({
   "src/lib/kron-live-service.ts"() {
     "use strict";
@@ -29878,6 +29914,7 @@ var init_kron_live_service = __esm({
     };
     toBytes = (hex) => Uint8Array.from(Buffer.from(hex, "hex"));
     toKas = (sompi) => Number(sompi) / Number(SOMPI_PER_KAS);
+    KCC20_SCALE = 1000000n;
   }
 });
 
@@ -43814,8 +43851,11 @@ __export(bot_sell_all_service_exports, {
 async function listOpenLots(botId) {
   return db.select().from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt))).orderBy(asc(managedLotsTable.createdAt));
 }
+function isSignatureScriptRejection(message) {
+  return /verification failed|script ran, but verification failed|failed to verify the signature script/i.test(message);
+}
 function isHardSubmissionRejection(message) {
-  return /verification failed|script ran, but verification failed|failed to verify the signature script|double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i.test(message);
+  return isSignatureScriptRejection(message) || /double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i.test(message);
 }
 function isTransientFailure(error, message) {
   if (error instanceof RetryableTradeStateError) return true;
@@ -43853,7 +43893,8 @@ async function expireStaleSellAllInFlight(bot) {
     return { cleared: false, active: true };
   }
   const ageMs = sellAllMarkerAgeMs(marker);
-  if (ageMs < ACTIVE_SELL_ALL_MS) {
+  const rejected = isHardSubmissionRejection(bot.stopReason ?? "");
+  if (!rejected && ageMs < ACTIVE_SELL_ALL_MS) {
     return { cleared: false, active: true };
   }
   await clearSellAllByAction(bot.id);
@@ -44090,7 +44131,8 @@ async function sellAllUserBotManagedPositions(userId2) {
         );
       }
       const ageMs = sellAllMarkerAgeMs(marker);
-      const activelyRunning = ageMs < ACTIVE_SELL_ALL_MS;
+      const rejected = isHardSubmissionRejection(bot.stopReason ?? "");
+      const activelyRunning = !rejected && ageMs < ACTIVE_SELL_ALL_MS;
       if (activelyRunning) {
         throw new Error(
           `Sell All is still running (${describeActiveSellAll(marker)}). Wait for that submit to finish. If it stays stuck, wait about 90 seconds and click Sell All again.`
@@ -44175,7 +44217,7 @@ async function sellAllUserBotManagedPositions(userId2) {
       if (/needs reconciliation|uncertain submission|uncertain consolidation/i.test(message)) {
         throw error;
       }
-      if (!isHardSubmissionRejection(message)) {
+      if (isSignatureScriptRejection(message) || !isHardSubmissionRejection(message)) {
         await db.update(tradingBotsTable).set({
           inFlight: null,
           stopReason: `Sell-all failed: ${message}`,
