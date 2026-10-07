@@ -28779,8 +28779,14 @@ function signTraderFunding(k, assembly, key, expectedPresenceIdx) {
     }
   }
   const budgets = tx.inputs.map((input) => input.computeBudget);
-  assembly.transaction = kron.spend.signFundingInputs(k, tx, key, indexes);
+  const covenantScripts = tx.inputs.slice(0, indexes[0]).map((input) => input.signatureScript);
+  assembly.transaction = k.signTransaction(tx, [key], false);
   const inputs = assembly.transaction.inputs;
+  covenantScripts.forEach((script, index) => {
+    if (inputs[index]?.signatureScript !== script) {
+      throw new Error("Native signer modified a covenant input; refusing submission.");
+    }
+  });
   for (const [index, budget] of budgets.entries()) {
     if (budget != null) inputs[index].computeBudget = budget;
   }
@@ -44188,27 +44194,47 @@ async function sellAllUserBotManagedPositions(userId2) {
       amount: lot.tokenAmount.toString()
     }));
     try {
-      const result = await sellMappedLots({
-        botId: bot.id,
-        credentials,
-        lots: openLots,
-        mapped,
-        inFlight,
-        deadline,
-        previousTotalTrades: totalTrades,
-        soldCount,
-        stage: "sell"
-      });
-      inFlight = result.inFlight;
-      sellTransactionIds.push(result.transactionId);
-      soldCount = result.soldCount;
-      totalTrades = result.totalTrades;
+      if (openLots.length === 1) {
+        const result = await sellMappedLots({
+          botId: bot.id,
+          credentials,
+          lots: openLots,
+          mapped,
+          inFlight,
+          deadline,
+          previousTotalTrades: totalTrades,
+          soldCount,
+          stage: "sell"
+        });
+        inFlight = result.inFlight;
+        sellTransactionIds.push(result.transactionId);
+        soldCount = result.soldCount;
+        totalTrades = result.totalTrades;
+      } else {
+        logger.info({
+          botId: bot.id,
+          lotCount: openLots.length
+        }, "Sell-all using one-lot submits to avoid multi-input AMM verify rejects");
+        const sequential = await sellLotsOneByOne({
+          botId: bot.id,
+          credentials,
+          lots: openLots,
+          inFlight,
+          deadline,
+          previousTotalTrades: totalTrades,
+          soldCount
+        });
+        inFlight = sequential.inFlight;
+        sellTransactionIds.push(...sequential.sellTransactionIds);
+        soldCount = sequential.soldCount;
+        totalTrades = sequential.totalTrades;
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown sell failure";
       if (/needs reconciliation|uncertain submission|uncertain consolidation/i.test(message)) {
         throw error;
       }
-      if (isSignatureScriptRejection(message) || !isHardSubmissionRejection(message)) {
+      if (!isHardSubmissionRejection(message)) {
         await db.update(tradingBotsTable).set({
           inFlight: null,
           stopReason: `Sell-all failed: ${message}`,
@@ -44217,54 +44243,36 @@ async function sellAllUserBotManagedPositions(userId2) {
         }).where(eq(tradingBotsTable.id, bot.id));
         throw new Error(`Sell-all failed: ${message}`);
       }
-      logger.warn({
-        botId: bot.id,
-        lotCount: openLots.length,
-        err: message
-      }, "Sell-all combined submit rejected; retrying one lot at a time");
       let remaining = await listOpenLots(bot.id);
       if (remaining.length === 0) {
         soldCount = openLots.length;
+      } else if (remaining.length >= 2 && isHardSubmissionRejection(message)) {
+        logger.warn({
+          botId: bot.id,
+          lotCount: remaining.length,
+          err: message
+        }, "Sell-all falling back to consolidate-then-sell after lot rejects");
+        const result = await consolidateThenSell({
+          botId: bot.id,
+          credentials,
+          lots: remaining,
+          inFlight,
+          deadline,
+          previousTotalTrades: totalTrades,
+          soldCount
+        });
+        inFlight = result.inFlight;
+        sellTransactionIds.push(result.transactionId);
+        soldCount = result.soldCount;
+        totalTrades = result.totalTrades;
       } else {
-        try {
-          const sequential = await sellLotsOneByOne({
-            botId: bot.id,
-            credentials,
-            lots: remaining,
-            inFlight,
-            deadline,
-            previousTotalTrades: totalTrades,
-            soldCount
-          });
-          inFlight = sequential.inFlight;
-          sellTransactionIds.push(...sequential.sellTransactionIds);
-          soldCount = sequential.soldCount;
-          totalTrades = sequential.totalTrades;
-        } catch (sequentialError) {
-          const sequentialMessage = sequentialError instanceof Error ? sequentialError.message : "Unknown sell failure";
-          remaining = await listOpenLots(bot.id);
-          if (remaining.length < 2 || !isHardSubmissionRejection(sequentialMessage)) {
-            throw sequentialError;
-          }
-          logger.warn({
-            botId: bot.id,
-            lotCount: remaining.length,
-            err: sequentialMessage
-          }, "Sell-all falling back to consolidate-then-sell after one-lot rejects");
-          const result = await consolidateThenSell({
-            botId: bot.id,
-            credentials,
-            lots: remaining,
-            inFlight,
-            deadline,
-            previousTotalTrades: totalTrades,
-            soldCount
-          });
-          inFlight = result.inFlight;
-          sellTransactionIds.push(result.transactionId);
-          soldCount = result.soldCount;
-          totalTrades = result.totalTrades;
-        }
+        await db.update(tradingBotsTable).set({
+          inFlight: null,
+          stopReason: `Sell-all failed: ${message}`,
+          phase: "selling",
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq(tradingBotsTable.id, bot.id));
+        throw error;
       }
     }
     const leftover = await listOpenLots(bot.id);

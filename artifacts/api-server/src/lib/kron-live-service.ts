@@ -43,11 +43,10 @@ const KCC20_SCALE = 1_000_000n;
 /**
  * Sign only the trader P2PK funding/presence input.
  *
- * Use Kron `signFundingInputs` (createInputSignature + ScriptBuilder) so the signature
- * script matches what the network expects and `tx.payload` stays in the sighash.
- * That helper reassigns `tx.inputs` and can drop v1 `computeBudget`, which is also in
- * the sighash — capture budgets before signing and restore them afterward. Skipping
- * either step yields "script ran, but verification failed".
+ * Use native `signTransaction` (proven on live buys/withdrawals). It keeps `tx.payload`
+ * and signs in place. Capture/restore v1 `computeBudget` because reassigning `tx.inputs`
+ * can drop it from the sighash. Do not use Kron `signFundingInputs` here — it has produced
+ * malformed presence signatures against the live node.
  */
 function signTraderFunding(
   k: Awaited<ReturnType<typeof loadKaspa>>,
@@ -71,8 +70,16 @@ function signTraderFunding(
     }
   }
   const budgets = tx.inputs.map((input: { computeBudget?: number }) => input.computeBudget);
-  assembly.transaction = kron.spend.signFundingInputs(k, tx, key, indexes);
+  const covenantScripts = tx.inputs
+    .slice(0, indexes[0])
+    .map((input: { signatureScript?: string }) => input.signatureScript);
+  assembly.transaction = k.signTransaction(tx, [key], false);
   const inputs = assembly.transaction.inputs;
+  covenantScripts.forEach((script, index) => {
+    if (inputs[index]?.signatureScript !== script) {
+      throw new Error("Native signer modified a covenant input; refusing submission.");
+    }
+  });
   for (const [index, budget] of budgets.entries()) {
     if (budget != null) inputs[index].computeBudget = budget;
   }
