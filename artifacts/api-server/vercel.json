@@ -1,8 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
-  "installCommand": "cp package.vercel.json package.json && npm install --omit=dev",
-  "buildCommand": "echo \"using committed deploy/ bundle\"",
+  "installCommand": "cd ../.. && npx pnpm@10.33.3 install --frozen-lockfile",
+  "buildCommand": "cd ../.. && npx pnpm@10.33.3 --filter @workspace/api-server run build",
   "functions": {
     "api/index.js": {
       "maxDuration": 60,

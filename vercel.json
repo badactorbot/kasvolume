@@ -2,21 +2,40 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
   "installCommand": "npx pnpm@10.33.3 install --frozen-lockfile",
-  "buildCommand": "BASE_PATH=/ npx pnpm@10.33.3 --filter @workspace/kron-trading-bot run build",
+  "buildCommand": "npx pnpm@10.33.3 --filter @workspace/api-server run build && BASE_PATH=/volume-bot/ npx pnpm@10.33.3 --filter @workspace/kron-trading-bot run build",
   "outputDirectory": "artifacts/kron-trading-bot/dist/public",
   "functions": {
     "api/index.js": {
-      "maxDuration": 60,
-      "includeFiles": "artifacts/api-server/deploy/**"
+      "maxDuration": 300,
+      "includeFiles": "{artifacts/api-server/deploy/**,artifacts/kron-trading-bot/server/**}"
     }
   },
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/volume-bot/",
+      "permanent": false
+    }
+  ],
   "rewrites": [
+    {
+      "source": "/volume-bot/api/:path*",
+      "destination": "/api/:path*"
+    },
     {
       "source": "/api/(.*)",
       "destination": "/api"
     },
     {
-      "source": "/((?!api/).*)",
+      "source": "/volume-bot/assets/:path*",
+      "destination": "/assets/:path*"
+    },
+    {
+      "source": "/volume-bot",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/volume-bot/(.*)",
       "destination": "/index.html"
     }
   ]

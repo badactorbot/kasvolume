@@ -48,5 +48,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 app.use("/api", router);
+// Also accept /volume-bot/api when UI is hosted under BASE_PATH=/volume-bot/
+app.use("/volume-bot/api", router);
 
 export default app;

@@ -7,7 +7,7 @@ import {
   type UserBotDashboard,
 } from '@workspace/api-client-react';
 import { useQueryClient } from '@tanstack/react-query';
-import { ExternalLink } from 'lucide-react';
+import { ExternalLink, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -28,19 +28,35 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
   const [sellAllOpen, setSellAllOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [transactionId, setTransactionId] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const prepareWithdrawal = usePrepareUserBotKasWithdrawal();
   const submitWithdrawal = useSubmitUserBotKasWithdrawal();
   const sellAll = useSellAllUserBotManagedPositions();
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const amount = Number(amountKas);
-  const openLotsFromHistory = bot.tradeHistory.filter((trade) => trade.action === 'buy').length
-    - bot.tradeHistory.filter((trade) => trade.action === 'sell').length;
-  const hasOpenPositions = bot.managedTokenAmount !== '0' || openLotsFromHistory > 0;
+  // Prefer live on-chain balance; trade history is grouped by TX so row counts are not lot counts.
+  const hasOpenPositions = bot.managedTokenAmount !== '0';
   const validAmount = Number.isFinite(amount) && amount >= 0.2 && amount <= bot.botKasBalance;
   const canWithdraw = bot.status !== 'running' && !hasOpenPositions && validAmount;
   const canSellAll = bot.status !== 'running' && hasOpenPositions;
-  const busy = prepareWithdrawal.isPending || submitWithdrawal.isPending || sellAll.isPending;
+  const busy = prepareWithdrawal.isPending || submitWithdrawal.isPending || sellAll.isPending || refreshing;
+
+  const handleRefreshWallet = async () => {
+    setError(null);
+    setRefreshing(true);
+    try {
+      await queryClient.refetchQueries({ queryKey: getGetUserBotDashboardQueryKey() });
+      toast({
+        title: 'Wallet checked',
+        description: 'Bot wallet token and KAS balances were re-read from chain. Max unlocks after every managed token is sold.',
+      });
+    } catch (err: any) {
+      setError(err.message || 'Could not refresh the bot wallet.');
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const handleWithdraw = async (mode: 'amount' | 'max' = 'amount') => {
     try {
@@ -95,16 +111,38 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
       }
     } catch (err: any) {
       await queryClient.invalidateQueries({ queryKey: getGetUserBotDashboardQueryKey() });
-      setError(err.data?.error || err.response?.data?.error || err.message || 'Sell all failed');
+      const raw = err.data?.error || err.response?.data?.error || err.message || 'Sell all failed';
+      setError(
+        /still running/i.test(raw)
+          ? raw
+          : /already in progress/i.test(raw)
+            ? 'Sell All is still running. Wait about 90 seconds if it was interrupted, then click Sell All again.'
+            : /verification failed|signature script/i.test(raw)
+              ? 'The network rejected the sell signature. Click Sell All again — a stuck lock is cleared automatically, and the bot will retry one position at a time.'
+              : raw,
+      );
       setSellAllOpen(false);
     }
   };
 
   return (
     <div className="mt-6 border-t border-border/50 pt-6">
-      <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-        Withdraw to Connected Wallet
-      </p>
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+          Withdraw to Connected Wallet
+        </p>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="h-8 px-3 text-[10px] font-bold uppercase tracking-widest"
+          disabled={busy}
+          onClick={handleRefreshWallet}
+        >
+          <RefreshCw className={`mr-1.5 h-3 w-3 ${refreshing ? 'animate-spin' : ''}`} />
+          {refreshing ? 'Checking…' : 'Refresh'}
+        </Button>
+      </div>
       <p className="mb-3 break-all font-mono text-[9px] text-muted-foreground/70">
         {walletAddress}
       </p>
@@ -130,6 +168,7 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
           </Button>
           <p className="text-[9px] leading-relaxed text-muted-foreground/70">
             Sells remaining tokens from the bot wallet so you can withdraw KAS.
+            After selling, use Refresh to re-check the wallet. Max enables when the chain shows no remaining tokens.
           </p>
         </div>
       )}
@@ -221,7 +260,8 @@ export function KasWithdrawalControl({ bot, walletAddress }: { bot: ActiveBot; w
             <DialogDescription>
               Sell every remaining managed token lot from the bot wallet
               ({bot.managedTokenAmount} {bot.tokenSymbol || 'tokens'} on-chain)?
-              This sells all open lots in one run (may take several minutes while the market settles between trades).
+              Tries one combined sell first. If the network rejects a multi-lot sell,
+              lots are consolidated and sold in one follow-up transaction.
               It uses the bot key and cannot be reversed. When finished, you can withdraw KAS.
             </DialogDescription>
           </DialogHeader>

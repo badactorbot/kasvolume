@@ -20,15 +20,37 @@ Dry-run-first KCC20 trading console with Kasware wallet auth and user-funded bot
 
 Wallet connect calls `POST /api/app/auth/challenge` then `POST /api/app/auth/verify` on that same origin. There is **no Replit backend**.
 
-## Production (Vercel)
+## Production (Vercel) — UI / API only, not trading
 
-`kasvolume-api-server` is **self-contained**: committed `artifacts/api-server/deploy/` + `package.vercel.json` (so `npm install` is not broken by pnpm `catalog:`/`workspace:*`). Set env: `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`. Do **not** require `KRON_TOKEN_ID` — users enter the covenant/token ID in the console after wallet connect.
+Root `vercel.json` builds the Vite UI with `BASE_PATH=/volume-bot/` and routes `/api/*` to the Express function (`api/index.js` → committed deploy bundle). The UI is served at `/volume-bot/`; `/` redirects there. Assets under `/volume-bot/assets/*` rewrite to `/assets/*`.
 
-**Connect needs `/api` on the UI origin.** Prefer one project with Root Directory `.` (root `vercel.json`). Or Root Directory `artifacts/kron-trading-bot` with **Include source files outside Root Directory** enabled. Or UI-only + rewrite / `VITE_API_BASE_URL` to the Ready API host. Leave `VITE_API_BASE_URL` unset when API is colocated.
+**Live URLs:**
+
+- Standalone: https://kasvolume.vercel.app/volume-bot/
+- Marketing domain (proxied from `code-builder` / kasdistro): https://www.kasdistro.com/volume-bot/
+
+On `www.kasdistro.com`, `/volume-bot/*` and volume-bot API paths (`/api/app/*`, `/api/bot/*`, `/api/healthz`) are rewritten to this project so wallet cookies stay same-origin.
+
+**Vercel project settings (required):**
+
+1. **Root Directory:** empty / `.` (repository root — **not** `artifacts/api-server`)
+2. **Environment variables (Production):** `DATABASE_URL`, `SESSION_SECRET`, `NODE_ENV=production`
+3. Do **not** set `KRON_TOKEN_ID` — users pick the token in the UI after connect
+4. Leave `VITE_API_BASE_URL` unset (same-origin `/api` at the domain root)
+
+**Fallback:** Root Directory `artifacts/kron-trading-bot` + enable **Include source files outside the Root Directory** (that folder’s `vercel.json` builds API + UI).
 
 After API source changes: `pnpm --filter @workspace/api-server run build` and commit refreshed `deploy/` + `server/` bundles.
 
-Do not point any env at Replit.
+Do not point any env at Replit. Do **not** rely on Vercel for continuous bot trading — use Fly for 24/7 bot runs ([`docs/always-on-hosting.md`](docs/always-on-hosting.md)).
+
+Smoke test after deploy:
+
+```sh
+curl https://kasvolume.vercel.app/api/healthz
+curl https://www.kasdistro.com/api/healthz
+curl -sI https://www.kasdistro.com/volume-bot/
+```
 
 ## Scripts
 

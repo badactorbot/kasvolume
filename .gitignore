@@ -49,3 +49,11 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Vercel CLI local link (project id / org)
+.vercel
+
+# Local env pulls (Vercel CLI)
+.env.local
+.env*.local
+.env*

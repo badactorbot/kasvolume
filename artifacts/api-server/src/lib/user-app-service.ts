@@ -168,14 +168,24 @@ export async function verifyWalletChallenge(input: {
 export async function getUserDashboard(userId: string) {
   const [user] = await db.select().from(walletUsersTable).where(eq(walletUsersTable.id, userId)).limit(1);
   if (!user) throw new Error("Wallet session is no longer valid.");
-  const [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId)).limit(1);
+  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId)).limit(1);
+  if (bot?.inFlight && typeof bot.inFlight === "object" && !Array.isArray(bot.inFlight)
+    && (bot.inFlight as { action?: string }).action === "sell-all") {
+    const { expireStaleSellAllInFlight } = await import("./bot-sell-all-service");
+    const expired = await expireStaleSellAllInFlight(bot);
+    if (expired.cleared) {
+      [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
+    }
+  }
   const lots = bot
     ? await db.select().from(managedLotsTable)
         .where(eq(managedLotsTable.botId, bot.id))
         .orderBy(desc(managedLotsTable.createdAt))
         .limit(50)
     : [];
-  const tradeHistory = lots
+  // One row per on-chain TX. Multi-lot sells share a sellTransactionId and must not
+  // appear as separate "bunch of sells" in the trade log.
+  const tradeHistory = Object.values(lots
     .flatMap((lot) => [
       ...(lot.sellTransactionId && lot.soldAt ? [{
         action: "sell" as const,
@@ -194,6 +204,35 @@ export async function getUserDashboard(userId: string) {
         tokenSymbol: lot.tokenSymbol,
       },
     ])
+    .reduce((acc, trade) => {
+      const key = `${trade.action}:${trade.transactionId}`;
+      const existing = acc[key];
+      if (!existing) {
+        acc[key] = { ...trade };
+        return acc;
+      }
+      const nextAmount = (
+        BigInt(existing.tokenAmount) + BigInt(trade.tokenAmount)
+      ).toString();
+      const nextExecutedAt = Date.parse(trade.executedAt) > Date.parse(existing.executedAt)
+        ? trade.executedAt
+        : existing.executedAt;
+      acc[key] = {
+        ...existing,
+        tokenAmount: nextAmount,
+        executedAt: nextExecutedAt,
+        tokenId: existing.tokenId ?? trade.tokenId,
+        tokenSymbol: existing.tokenSymbol ?? trade.tokenSymbol,
+      };
+      return acc;
+    }, {} as Record<string, {
+      action: "buy" | "sell";
+      transactionId: string;
+      executedAt: string;
+      tokenAmount: string;
+      tokenId: string | null;
+      tokenSymbol: string | null;
+    }>))
     .sort((a, b) => Date.parse(b.executedAt) - Date.parse(a.executedAt));
   let botKasBalance = 0;
   let managedTokenAmount = "0";
@@ -424,6 +463,7 @@ export async function changeUserBotCovenant(userId: string, tokenId: string) {
 export async function setUserBotRunning(userId: string, running: boolean) {
   let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId)).limit(1);
   if (!bot?.activationVerifiedAt || !bot.tokenId) throw new Error("Complete setup and activation first.");
+  let resetSellCycle = false;
   if (running) {
     if (bot.inFlight) {
       await reconcileStaleInFlight(bot);
@@ -433,6 +473,18 @@ export async function setUserBotRunning(userId: string, running: boolean) {
       if (!bot || bot.inFlight) {
         throw new Error("The interrupted trade requires reconciliation before the bot can restart.");
       }
+    }
+    // Mid-cycle sell with nothing left to sell: start a fresh 5-buy cycle instead of
+    // immediately re-pausing with "No managed token lot is available to sell."
+    if (bot.phase === "selling") {
+      const [openLot] = await db.select({ id: managedLotsTable.id })
+        .from(managedLotsTable)
+        .where(and(
+          eq(managedLotsTable.botId, bot.id),
+          isNull(managedLotsTable.soldAt),
+        ))
+        .limit(1);
+      resetSellCycle = !openLot;
     }
     const k = await loadKaspa();
     const rpc = new k.RpcClient({ url: NODE_URL, networkId: "mainnet", encoding: k.Encoding.Borsh });
@@ -451,6 +503,11 @@ export async function setUserBotRunning(userId: string, running: boolean) {
     status: running ? "running" : "stopped",
     nextRunAt: running ? new Date(Date.now() + 60_000) : null,
     stopReason: running ? null : "Stopped by user.",
+    ...(running && resetSellCycle ? {
+      phase: "buying" as const,
+      completedBuys: 0,
+      completedSells: 0,
+    } : {}),
     updatedAt: new Date(),
   });
   const updated = running

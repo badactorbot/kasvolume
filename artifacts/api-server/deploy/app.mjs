@@ -18,6 +18,14 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
   if (typeof require !== "undefined") return require.apply(this, arguments);
   throw Error('Dynamic require of "' + x + '" is not supported');
 });
+var __esm = (fn, res, err) => function __init() {
+  if (err) throw err[0];
+  try {
+    return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+  } catch (e) {
+    throw err = [e], e;
+  }
+};
 var __commonJS = (cb, mod) => function __require2() {
   try {
     return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
@@ -764,8 +772,8 @@ var require_depd = __commonJS({
       return deprecate;
     }
     function eehaslisteners(emitter, type) {
-      var count2 = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
-      return count2 > 0;
+      var count = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
+      return count > 0;
     }
     function isignored(namespace) {
       if (process.noDeprecation) {
@@ -18468,14 +18476,14 @@ var require_urlencoded = __commonJS({
       };
     }
     function parameterCount(body, limit) {
-      let count2 = 0;
+      let count = 0;
       let index = -1;
       do {
-        count2++;
-        if (count2 > limit) return void 0;
+        count++;
+        if (count > limit) return void 0;
         index = body.indexOf("&", index + 1);
       } while (index !== -1);
-      return count2;
+      return count;
     }
   }
 });
@@ -23023,8 +23031,8 @@ var require_send = __commonJS({
       }
     }
     function hasListeners(emitter, type) {
-      var count2 = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
-      return count2 > 0;
+      var count = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
+      return count > 0;
     }
     function normalizeList(val, name) {
       var list = [].concat(val || []);
@@ -28725,6 +28733,5051 @@ var require_logger = __commonJS({
   }
 });
 
+// src/lib/logger.ts
+var import_pino, isProduction, logger;
+var init_logger = __esm({
+  "src/lib/logger.ts"() {
+    "use strict";
+    import_pino = __toESM(require_pino(), 1);
+    isProduction = process.env.NODE_ENV === "production";
+    logger = (0, import_pino.default)({
+      level: process.env.LOG_LEVEL ?? "info",
+      redact: [
+        "req.headers.authorization",
+        "req.headers.cookie",
+        "res.headers['set-cookie']"
+      ],
+      ...isProduction ? {} : {
+        transport: {
+          target: "pino-pretty",
+          options: { colorize: true }
+        }
+      }
+    });
+  }
+});
+
+// src/lib/kron-live-service.ts
+import * as kron from "@kronsdk/kron-sdk";
+import { loadKaspa } from "@kronsdk/kron-sdk/wasm";
+import { access, mkdir, unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
+function signTraderFunding(k, assembly, key, expectedPresenceIdx) {
+  const indexes = assembly.fundingInputIndexes;
+  if (!indexes?.length) {
+    throw new Error("Assembled trade is missing a wallet funding input to sign.");
+  }
+  if (expectedPresenceIdx != null && indexes[0] !== expectedPresenceIdx) {
+    throw new Error(
+      `Wallet funding input is at index ${indexes[0]}, but the covenant presence witness is ${expectedPresenceIdx}.`
+    );
+  }
+  const tx = assembly.transaction;
+  for (const index of indexes) {
+    if (!tx.inputs[index]?.utxo) {
+      throw new Error("Wallet funding input is missing UTXO data required for signing.");
+    }
+  }
+  const budgets = tx.inputs.map((input) => input.computeBudget);
+  const covenantScripts = tx.inputs.slice(0, indexes[0]).map((input) => input.signatureScript);
+  assembly.transaction = k.signTransaction(tx, [key], false);
+  const inputs = assembly.transaction.inputs;
+  covenantScripts.forEach((script, index) => {
+    if (inputs[index]?.signatureScript !== script) {
+      throw new Error("Native signer modified a covenant input; refusing submission.");
+    }
+  });
+  for (const [index, budget] of budgets.entries()) {
+    if (budget != null) inputs[index].computeBudget = budget;
+  }
+  assembly.transaction.inputs = inputs;
+  const confirmed = assembly.transaction.inputs;
+  for (const [index, budget] of budgets.entries()) {
+    if (budget != null && confirmed[index]?.computeBudget !== budget) {
+      throw new Error("Native signer dropped v1 computeBudget after signing; refusing submission.");
+    }
+  }
+  return indexes.map((index) => {
+    const script = assembly.transaction.inputs[index]?.signatureScript;
+    if (!script || typeof script !== "string" || script.length % 2 !== 0 || script.length < 128) {
+      throw new Error("Wallet funding input was not signed.");
+    }
+    return script.length / 2;
+  });
+}
+function assertPoolUtxoMatchesReserves(poolEntry, kasReserve) {
+  if (BigInt(poolEntry.amount) !== kasReserve * KCC20_SCALE) {
+    throw new RetryableTradeStateError(
+      "Live AMM pool KAS amount does not match quoted reserves; waiting before retrying."
+    );
+  }
+}
+function unwrapIndexerRow(value) {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+function poolParamsFromCurve(curveParams) {
+  return {
+    creatorFeeOwner: toBytes(curveParams.creatorFeeOwner),
+    platformFeeOwner: toBytes(curveParams.platformFeeOwner),
+    creatorFeeBps: BigInt(curveParams.dexCreatorFeeBps ?? 0),
+    platformFeeBps: BigInt(curveParams.dexPlatformFeeBps ?? 0),
+    lpFeeBps: BigInt(curveParams.dexLpFeeBps ?? 0),
+    lockedShares: BigInt(curveParams.poolLockedShares ?? 1e6)
+  };
+}
+async function resolvePoolHead(tick, indexer, submit) {
+  const sequence = await new kron.client.SequencerClient(SEQUENCER_URL).head(tick);
+  if (submit && sequence.head) {
+    throw new RetryableTradeStateError(
+      "The AMM pool has an in-flight sequenced trade; waiting for it to settle."
+    );
+  }
+  if (sequence.head) {
+    return {
+      pool: sequence.head.poolOutpoint,
+      poolToken: sequence.head.poolTokenOutpoint,
+      reserves: sequence.head.reserves
+    };
+  }
+  const confirmed = unwrapIndexerRow(await indexer.poolhead(tick));
+  if (!confirmed?.pool || !confirmed?.poolToken || !confirmed?.reserves) {
+    throw new RetryableTradeStateError(
+      "AMM pool head is temporarily unavailable; waiting to retry."
+    );
+  }
+  return confirmed;
+}
+function resolveLiveTokenId(credentials) {
+  if (credentials) {
+    const tokenId2 = credentials.tokenId?.trim().toLowerCase();
+    if (!tokenId2) {
+      throw new Error("Bot token ID is required. Enter the covenant ID in the console.");
+    }
+    return tokenId2;
+  }
+  const tokenId = process.env.KRON_TOKEN_ID?.trim().toLowerCase();
+  if (!tokenId) {
+    throw new Error(
+      "KRON_TOKEN_ID env is required only for server-owned CLI / file automation (not wallet-connect user bots)."
+    );
+  }
+  return tokenId;
+}
+async function prepareLiveBuy() {
+  return runLiveBuy(false, false);
+}
+async function runLiveBuy(submit, signOnly, automation = false, credentials, enforceMinimumOutput = true) {
+  const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
+  const tokenId = resolveLiveTokenId(credentials);
+  if (!privateKey) throw new Error("Dedicated bot wallet secret is not configured.");
+  const k = await loadKaspa();
+  let key;
+  try {
+    key = new k.PrivateKey(privateKey);
+  } catch {
+    throw new Error("The configured bot wallet private key is invalid.");
+  }
+  const publicKey = key.toPublicKey();
+  const walletAddress = publicKey.toAddress(k.NetworkType.Mainnet).toString();
+  const buyerPubkey = toBytes(publicKey.toXOnlyPublicKey().toString());
+  const registry = new kron.client.RegistryClient(API_URL);
+  const indexer = new kron.client.IndexerClient(INDEXER_URL);
+  const entry = (await registry.tokenlist({ all: true })).tokens.find(
+    (token2) => token2.covenantId.toLowerCase() === tokenId
+  );
+  if (!entry || !entry.extensions.chainVerified || entry.network !== NETWORK_ID) {
+    throw new Error("Configured token is not a chain-verified Kron mainnet token.");
+  }
+  if (!entry.extensions.curveParams) {
+    throw new Error("Configured token is missing Kron template params.");
+  }
+  const token = unwrapIndexerRow(await indexer.token(entry.symbol.toLowerCase()));
+  if (!token) {
+    throw new RetryableTradeStateError(
+      "Indexer has no live state for this token yet; waiting to retry."
+    );
+  }
+  const graduated = Boolean(token.graduated || token.cpState?.graduated);
+  const poolCovidHex = (entry.extensions.poolCovenantId || token.poolCovenantId || "").toLowerCase() || null;
+  if (graduated) {
+    if (!poolCovidHex) {
+      throw new Error("This token has graduated but has no AMM pool covenant id.");
+    }
+    return runPoolBuy({
+      submit,
+      signOnly,
+      automation,
+      enforceMinimumOutput,
+      privateKey,
+      key,
+      publicKey,
+      walletAddress,
+      buyerPubkey,
+      entry,
+      token,
+      poolCovidHex,
+      indexer
+    });
+  }
+  if (!entry.extensions.curveCovenantId) {
+    throw new Error("Configured token has no active Kron bonding curve.");
+  }
+  if (!token.cpState) {
+    throw new RetryableTradeStateError(
+      "Bonding-curve state is temporarily unavailable; waiting to retry."
+    );
+  }
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  const tokenCovid = toBytes(entry.covenantId);
+  const curveCovid = toBytes(entry.extensions.curveCovenantId);
+  const sequence = await new kron.client.SequencerClient(
+    SEQUENCER_URL
+  ).curveHead(entry.extensions.curveCovenantId);
+  if (submit && sequence.ok && sequence.head) {
+    throw new RetryableTradeStateError(
+      "The curve has an in-flight sequenced trade; waiting for it to settle."
+    );
+  }
+  const tokenReserve = BigInt(token.cpState.tokenReserve);
+  const state2 = { graduated: false, tokenCovid, tokenReserve };
+  const inventoryState = kron.kcc20.covenantIdOwned(curveCovid, tokenReserve, false);
+  const curveAddress = kron.curveCp.cpAddress(k, templates.curve, state2, NETWORK_ID);
+  const inventoryAddress = kron.kcc20.kcc20Address(
+    k,
+    templates.token,
+    inventoryState,
+    NETWORK_ID
+  );
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [
+      { entries: curveEntries },
+      { entries: inventoryEntries },
+      { entries: walletEntries },
+      tokenBalanceResponse
+    ] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: [curveAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] }),
+      indexer.balance(entry.symbol.toLowerCase(), walletAddress)
+    ]);
+    if (curveEntries.length !== 1 || inventoryEntries.length !== 1) {
+      throw new RetryableTradeStateError(
+        "Live curve state is temporarily ambiguous; waiting before retrying."
+      );
+    }
+    if (!walletEntries.length) throw new Error("Bot wallet has no spendable KAS UTXOs.");
+    const curveParams = entry.extensions.curveParams;
+    const quoteState = {
+      realKas: BigInt(token.cpState.realKas),
+      tokenReserve,
+      vKas: BigInt(curveParams.vKas),
+      graduationKas: BigInt(curveParams.graduationKas),
+      creatorFeeBps: BigInt(curveParams.creatorFeeBps),
+      platformFeeBps: BigInt(curveParams.platformFeeBps),
+      devFundBps: BigInt(curveParams.devFundBps ?? 0)
+    };
+    const quote = kron.curve.quoteCpBuy(
+      quoteState,
+      BigInt(LIVE_TEST_KAS) * SOMPI_PER_KAS
+    );
+    if (!quote?.tokenOut) throw new Error("Kron returned no executable 21 KAS buy quote.");
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const curveEntry = curveEntries[0];
+    const inventoryEntry = inventoryEntries[0];
+    const spend3 = kron.curveCp.buildCpBuy(
+      k,
+      templates.curve,
+      templates.token,
+      {
+        transactionId: curveEntry.outpoint.transactionId,
+        index: curveEntry.outpoint.index,
+        realKas: BigInt(curveEntry.amount),
+        state: state2
+      },
+      {
+        transactionId: inventoryEntry.outpoint.transactionId,
+        index: inventoryEntry.outpoint.index,
+        value: BigInt(inventoryEntry.amount),
+        amount: tokenReserve
+      },
+      curveCovid,
+      buyerPubkey,
+      quote.kasIn,
+      quote.tokenOut,
+      [],
+      2
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    const fundingTotal = fundingEntries.reduce(
+      (sum, item) => sum + BigInt(item.amount),
+      0n
+    );
+    const walletBalance = walletEntries.reduce(
+      (sum, item) => sum + BigInt(item.amount),
+      0n
+    );
+    const maximumDebit = fundingTotal - assembly.change;
+    const recipientDust = maximumDebit - quote.total - networkFee;
+    if (maximumDebit > MAXIMUM_DEBIT_SOMPI) {
+      throw new Error(
+        `Maximum debit ${toKas(maximumDebit)} KAS exceeds the approved 22.75 KAS cap.`
+      );
+    }
+    if (!automation && walletBalance - maximumDebit < MINIMUM_RESERVE_SOMPI) {
+      throw new Error("Trade would breach the 25 KAS wallet reserve.");
+    }
+    if (enforceMinimumOutput && quote.tokenOut < 8n) {
+      throw new Error("Quote fell below the approved minimum output of 8 KDIST.");
+    }
+    const rawTokenBalance = Array.isArray(tokenBalanceResponse) ? tokenBalanceResponse[0]?.balance : tokenBalanceResponse?.balance;
+    let transactionId;
+    let fundingSignatureScriptBytes;
+    if (submit || signOnly) {
+      fundingSignatureScriptBytes = signTraderFunding(k, assembly, key, assembly.fundingInputIndexes[0]);
+    }
+    if (submit && !automation) {
+      await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
+      await writeFile(
+        EXECUTION_LOCK,
+        JSON.stringify({ status: "pending", createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
+        { flag: "wx" }
+      );
+      try {
+        const result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+        transactionId = result.transactionId;
+        await writeFile(
+          EXECUTION_LOCK,
+          JSON.stringify({
+            status: "submitted",
+            transactionId,
+            submittedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            tokenId: entry.covenantId,
+            tradeKas: LIVE_TEST_KAS,
+            maximumDebitKas: toKas(maximumDebit)
+          })
+        );
+      } catch (error) {
+        await unlink(EXECUTION_LOCK).catch(() => void 0);
+        throw error;
+      }
+    } else if (submit) {
+      try {
+        const result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+        transactionId = result.transactionId;
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Buy submission failed with an unknown result.",
+          error
+        );
+      }
+    }
+    return {
+      tokenId: entry.covenantId,
+      symbol: entry.symbol,
+      tokenName: entry.name,
+      walletAddress,
+      walletKasBalance: toKas(walletBalance),
+      walletTokenBalance: Number(rawTokenBalance ?? 0),
+      tradeKas: LIVE_TEST_KAS,
+      tokenOut: Number(quote.tokenOut),
+      kronFeeKas: toKas(quote.fee),
+      networkFeeKas: toKas(networkFee),
+      recipientDustKas: toKas(recipientDust),
+      maximumDebitKas: toKas(maximumDebit),
+      transactionBuilt: true,
+      signed: submit || signOnly,
+      submitted: submit,
+      transactionId,
+      fundingSignatureScriptBytes,
+      preparedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      warnings: [
+        "This preview is state-dependent and must be rebuilt immediately before execution.",
+        submit ? "The one-time live-test cap is now permanently consumed." : "No transaction was signed or submitted.",
+        "Live execution is available only from the private server command line."
+      ]
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+    key = void 0;
+  }
+}
+async function executeUserAutomatedSellLots(lots, credentials) {
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
+  return runAutomatedSell(lots, true, credentials);
+}
+async function executeUserAutomatedConsolidateLots(lots, credentials) {
+  if (lots.length < 2) throw new Error("Consolidation needs at least two managed lots.");
+  const privateKey = credentials.privateKey.trim();
+  const tokenId = resolveLiveTokenId(credentials);
+  if (!privateKey) throw new Error("Live wallet configuration is missing.");
+  const k = await loadKaspa();
+  const key = new k.PrivateKey(privateKey);
+  const publicKey = key.toPublicKey();
+  const walletAddress = publicKey.toAddress(k.NetworkType.Mainnet).toString();
+  const registry = new kron.client.RegistryClient(API_URL);
+  const indexer = new kron.client.IndexerClient(INDEXER_URL);
+  const entry = (await registry.tokenlist({ all: true })).tokens.find(
+    (token) => token.covenantId.toLowerCase() === tokenId
+  );
+  if (!entry?.extensions.curveParams) {
+    throw new Error("Configured token is missing Kron template params.");
+  }
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  const tick = entry.symbol.toLowerCase();
+  const owned = await indexer.tokenUtxos(tick, walletAddress);
+  const prepared = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable for consolidation.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const sellerAddresses = [...new Set(prepared.map((item) => item.sellerAddress))];
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [{ entries: sellerEntries }, { entries: walletEntries }] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] })
+    ]);
+    if (!walletEntries.length) throw new Error("Required funding UTXO is missing for consolidation.");
+    const tokens = prepared.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
+      );
+      if (!sellerEntry) throw new Error("Required consolidate UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state
+      };
+    });
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const presenceWitnessIdx = tokens.length;
+    const spend3 = kron.curveCp.buildConsolidate(
+      k,
+      templates.token,
+      tokens,
+      presenceWitnessIdx,
+      { tokenCovid: entry.covenantId }
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    signTraderFunding(k, assembly, key, presenceWitnessIdx);
+    let result = null;
+    try {
+      result = await rpc.submitTransaction({
+        transaction: assembly.transaction,
+        allowOrphan: false
+      });
+    } catch (error) {
+      throw new TradeSubmissionAttemptedError(
+        error instanceof Error ? error.message : "Consolidate submission failed with an unknown result.",
+        error
+      );
+    }
+    if (!result?.transactionId) {
+      throw new Error("Consolidation returned no transaction ID.");
+    }
+    const totalAmount = tokens.reduce((sum, token) => sum + token.state.amount, 0n);
+    return {
+      transactionId: result.transactionId,
+      index: 0,
+      amount: totalAmount.toString(),
+      lotCount: lots.length,
+      networkFeeKas: toKas(networkFee),
+      submitted: true
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+  }
+}
+async function runAutomatedSell(lots, submit, credentials) {
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
+  const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
+  const tokenId = resolveLiveTokenId(credentials);
+  if (!privateKey) throw new Error("Live wallet configuration is missing.");
+  const k = await loadKaspa();
+  const key = new k.PrivateKey(privateKey);
+  const publicKey = key.toPublicKey();
+  const walletAddress = publicKey.toAddress(k.NetworkType.Mainnet).toString();
+  const traderPubkey = toBytes(publicKey.toXOnlyPublicKey().toString());
+  const registry = new kron.client.RegistryClient(API_URL);
+  const indexer = new kron.client.IndexerClient(INDEXER_URL);
+  const entry = (await registry.tokenlist({ all: true })).tokens.find(
+    (token2) => token2.covenantId.toLowerCase() === tokenId
+  );
+  if (!entry?.extensions.curveParams) {
+    throw new Error("Configured token is missing Kron template params.");
+  }
+  const token = unwrapIndexerRow(await indexer.token(entry.symbol.toLowerCase()));
+  if (!token) {
+    throw new RetryableTradeStateError(
+      "Indexer has no live state for this token yet; waiting to retry."
+    );
+  }
+  const graduated = Boolean(token.graduated || token.cpState?.graduated);
+  const poolCovidHex = (entry.extensions.poolCovenantId || token.poolCovenantId || "").toLowerCase() || null;
+  if (graduated) {
+    if (!poolCovidHex) {
+      throw new Error("This token has graduated but has no AMM pool covenant id.");
+    }
+    return runPoolSell({
+      lots,
+      submit,
+      privateKey,
+      key,
+      publicKey,
+      walletAddress,
+      traderPubkey,
+      entry,
+      token,
+      poolCovidHex,
+      indexer
+    });
+  }
+  if (!entry.extensions.curveCovenantId) {
+    throw new Error("Configured token has no active Kron bonding curve.");
+  }
+  if (!token.cpState) {
+    throw new RetryableTradeStateError(
+      "Bonding-curve state is temporarily unavailable; waiting to retry."
+    );
+  }
+  const sequence = await new kron.client.SequencerClient(
+    SEQUENCER_URL
+  ).curveHead(entry.extensions.curveCovenantId);
+  if (sequence.ok && sequence.head) {
+    throw new RetryableTradeStateError(
+      "The curve is busy with an in-flight sequenced trade; waiting before retrying."
+    );
+  }
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  const tokenCovid = toBytes(entry.covenantId);
+  const curveCovid = toBytes(entry.extensions.curveCovenantId);
+  const tokenReserve = BigInt(token.cpState.tokenReserve);
+  const totalTokenIn = lots.reduce((sum, lot) => sum + BigInt(lot.amount), 0n);
+  const state2 = { graduated: false, tokenCovid, tokenReserve };
+  const inventoryState = kron.kcc20.covenantIdOwned(curveCovid, tokenReserve, false);
+  const curveAddress = kron.curveCp.cpAddress(k, templates.curve, state2, NETWORK_ID);
+  const inventoryAddress = kron.kcc20.kcc20Address(
+    k,
+    templates.token,
+    inventoryState,
+    NETWORK_ID
+  );
+  const owned = await indexer.tokenUtxos(entry.symbol.toLowerCase(), walletAddress);
+  const preparedLots = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const sellerAddresses = [...new Set(preparedLots.map((item) => item.sellerAddress))];
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [
+      { entries: curveEntries },
+      { entries: inventoryEntries },
+      { entries: sellerEntries },
+      { entries: walletEntries }
+    ] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: [curveAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] })
+    ]);
+    if (curveEntries.length !== 1 || inventoryEntries.length !== 1) {
+      throw new RetryableTradeStateError(
+        "Live curve state is temporarily ambiguous; waiting before retrying."
+      );
+    }
+    const sellerTokens = preparedLots.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
+      );
+      if (!sellerEntry) throw new Error("Required sell UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state
+      };
+    });
+    if (!walletEntries.length) throw new Error("Required sell UTXO is missing.");
+    const p = entry.extensions.curveParams;
+    const quote = kron.curve.quoteCpSell(
+      {
+        realKas: BigInt(token.cpState.realKas),
+        tokenReserve,
+        vKas: BigInt(p.vKas),
+        graduationKas: BigInt(p.graduationKas),
+        creatorFeeBps: BigInt(p.creatorFeeBps),
+        platformFeeBps: BigInt(p.platformFeeBps),
+        devFundBps: BigInt(p.devFundBps ?? 0)
+      },
+      totalTokenIn
+    );
+    if (!quote?.net || quote.net <= 0n) throw new Error("Managed lots have no positive sell quote.");
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const curveEntry = curveEntries[0];
+    const inventoryEntry = inventoryEntries[0];
+    const presenceWitnessIdx = 2 + sellerTokens.length;
+    const spend3 = kron.curveCp.buildCpSell(
+      k,
+      templates.curve,
+      templates.token,
+      {
+        transactionId: curveEntry.outpoint.transactionId,
+        index: curveEntry.outpoint.index,
+        realKas: BigInt(curveEntry.amount),
+        state: state2
+      },
+      sellerTokens,
+      {
+        transactionId: inventoryEntry.outpoint.transactionId,
+        index: inventoryEntry.outpoint.index,
+        value: BigInt(inventoryEntry.amount),
+        amount: tokenReserve
+      },
+      curveCovid,
+      traderPubkey,
+      totalTokenIn,
+      quote.kasOut,
+      presenceWitnessIdx
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    const fundingTotal = BigInt(fundingEntries[0].amount);
+    const netCredit = assembly.change - fundingTotal;
+    if (netCredit <= 0n) throw new Error("Assembled sell does not produce a positive KAS credit.");
+    signTraderFunding(k, assembly, key, presenceWitnessIdx);
+    let result = null;
+    if (submit) {
+      try {
+        result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Sell submission failed with an unknown result.",
+          error
+        );
+      }
+    }
+    return {
+      transactionId: result?.transactionId,
+      tokenIn: Number(totalTokenIn),
+      lotCount: lots.length,
+      grossKas: toKas(quote.kasOut),
+      kronFeeKas: toKas(quote.fee),
+      networkFeeKas: toKas(networkFee),
+      netCreditKas: toKas(netCredit),
+      signed: true,
+      submitted: submit
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+  }
+}
+async function runPoolBuy(args) {
+  const {
+    submit,
+    signOnly,
+    automation,
+    enforceMinimumOutput,
+    key,
+    walletAddress,
+    buyerPubkey,
+    entry,
+    poolCovidHex,
+    indexer
+  } = args;
+  let workingKey = key;
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  if (!templates.pool) {
+    throw new Error("Configured token is missing a compiled AMM pool template.");
+  }
+  const tick = entry.symbol.toLowerCase();
+  const head = await resolvePoolHead(tick, indexer, submit);
+  const poolCovid = toBytes(poolCovidHex);
+  const tokenCovid = toBytes(entry.covenantId);
+  const poolState = {
+    kasReserve: BigInt(head.reserves.kasReserve),
+    tokenReserve: BigInt(head.reserves.tokenReserve),
+    tokenCovid,
+    totalShares: BigInt(head.reserves.totalShares),
+    lpCovid: toBytes(head.reserves.lpCovid || kron.genesis.ZERO_COVID)
+  };
+  const poolParams = poolParamsFromCurve(entry.extensions.curveParams);
+  const quote = kron.poolCpV3.quotePoolV3Buy(
+    poolState,
+    poolParams,
+    BigInt(LIVE_TEST_KAS) * SOMPI_PER_KAS
+  );
+  if (!quote?.tokenOut) {
+    throw new Error("Kron returned no executable AMM pool buy quote.");
+  }
+  const k = await loadKaspa();
+  const inventoryState = kron.kcc20.covenantIdOwned(poolCovid, poolState.tokenReserve, false);
+  const resolvedPoolAddress = kron.poolCpV3.poolCpV3Address(
+    k,
+    templates.pool,
+    poolState,
+    NETWORK_ID
+  );
+  const inventoryAddress = kron.kcc20.kcc20Address(
+    k,
+    templates.token,
+    inventoryState,
+    NETWORK_ID
+  );
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [
+      { entries: poolEntries },
+      { entries: inventoryEntries },
+      { entries: walletEntries },
+      tokenBalanceResponse
+    ] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: [resolvedPoolAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] }),
+      indexer.balance(tick, walletAddress)
+    ]);
+    const poolEntry = poolEntries.find(
+      (item) => item.outpoint.transactionId === head.pool.transactionId && item.outpoint.index === head.pool.index
+    ) ?? (poolEntries.length === 1 ? poolEntries[0] : null);
+    const inventoryEntry = inventoryEntries.find(
+      (item) => item.outpoint.transactionId === head.poolToken.transactionId && item.outpoint.index === head.poolToken.index
+    ) ?? (inventoryEntries.length === 1 ? inventoryEntries[0] : null);
+    if (!poolEntry || !inventoryEntry) {
+      throw new RetryableTradeStateError(
+        "Live AMM pool state is temporarily ambiguous; waiting before retrying."
+      );
+    }
+    assertPoolUtxoMatchesReserves(poolEntry, poolState.kasReserve);
+    if (!walletEntries.length) throw new Error("Bot wallet has no spendable KAS UTXOs.");
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const presenceWitnessIdx = 2;
+    const spend3 = kron.poolCpV3.buildPoolV3SwapKasForToken(
+      k,
+      templates.pool,
+      templates.token,
+      poolParams,
+      {
+        transactionId: poolEntry.outpoint.transactionId,
+        index: poolEntry.outpoint.index,
+        state: poolState,
+        tokenUtxo: {
+          transactionId: inventoryEntry.outpoint.transactionId,
+          index: inventoryEntry.outpoint.index,
+          value: BigInt(inventoryEntry.amount)
+        }
+      },
+      poolCovid,
+      buyerPubkey,
+      quote,
+      [],
+      presenceWitnessIdx
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    const fundingTotal = fundingEntries.reduce(
+      (sum, item) => sum + BigInt(item.amount),
+      0n
+    );
+    const walletBalance = walletEntries.reduce(
+      (sum, item) => sum + BigInt(item.amount),
+      0n
+    );
+    const maximumDebit = fundingTotal - assembly.change;
+    const recipientDust = maximumDebit - quote.total - networkFee;
+    if (maximumDebit > MAXIMUM_DEBIT_SOMPI) {
+      throw new Error(
+        `Maximum debit ${toKas(maximumDebit)} KAS exceeds the approved 22.75 KAS cap.`
+      );
+    }
+    if (!automation && walletBalance - maximumDebit < MINIMUM_RESERVE_SOMPI) {
+      throw new Error("Trade would breach the 25 KAS wallet reserve.");
+    }
+    if (enforceMinimumOutput && quote.tokenOut < 8n) {
+      throw new Error("Quote fell below the approved minimum output of 8 tokens.");
+    }
+    const rawTokenBalance = Array.isArray(tokenBalanceResponse) ? tokenBalanceResponse[0]?.balance : tokenBalanceResponse?.balance;
+    let transactionId;
+    let fundingSignatureScriptBytes;
+    if (submit || signOnly) {
+      fundingSignatureScriptBytes = signTraderFunding(k, assembly, workingKey, presenceWitnessIdx);
+    }
+    if (submit && !automation) {
+      await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
+      await writeFile(
+        EXECUTION_LOCK,
+        JSON.stringify({ status: "pending", createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
+        { flag: "wx" }
+      );
+      try {
+        const result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+        transactionId = result.transactionId;
+        await writeFile(
+          EXECUTION_LOCK,
+          JSON.stringify({
+            status: "submitted",
+            transactionId,
+            submittedAt: (/* @__PURE__ */ new Date()).toISOString(),
+            tokenId: entry.covenantId,
+            tradeKas: LIVE_TEST_KAS,
+            maximumDebitKas: toKas(maximumDebit),
+            venue: "pool"
+          })
+        );
+      } catch (error) {
+        await unlink(EXECUTION_LOCK).catch(() => void 0);
+        throw error;
+      }
+    } else if (submit) {
+      try {
+        const result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+        transactionId = result.transactionId;
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Pool buy submission failed with an unknown result.",
+          error
+        );
+      }
+    }
+    return {
+      tokenId: entry.covenantId,
+      symbol: entry.symbol,
+      tokenName: entry.name,
+      walletAddress,
+      walletKasBalance: toKas(walletBalance),
+      walletTokenBalance: Number(rawTokenBalance ?? 0),
+      tradeKas: LIVE_TEST_KAS,
+      tokenOut: Number(quote.tokenOut),
+      kronFeeKas: toKas(quote.creatorFee + quote.platformFee + quote.lpFee),
+      networkFeeKas: toKas(networkFee),
+      recipientDustKas: toKas(recipientDust),
+      maximumDebitKas: toKas(maximumDebit),
+      transactionBuilt: true,
+      signed: submit || signOnly,
+      submitted: submit,
+      transactionId,
+      fundingSignatureScriptBytes,
+      preparedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      venue: "pool",
+      warnings: [
+        "This preview is state-dependent and must be rebuilt immediately before execution.",
+        submit ? "The one-time live-test cap is now permanently consumed." : "No transaction was signed or submitted.",
+        "Live execution is available only from the private server command line."
+      ]
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+    workingKey = void 0;
+  }
+}
+async function runPoolSell(args) {
+  const {
+    lots,
+    submit,
+    key,
+    walletAddress,
+    traderPubkey,
+    entry,
+    poolCovidHex,
+    indexer
+  } = args;
+  if (!lots.length) throw new Error("No managed token lots were provided to sell.");
+  const templates = await kron.client.fetchCpTemplates({
+    baseUrl: API_URL,
+    tokenCovid: entry.covenantId,
+    curveParams: entry.extensions.curveParams,
+    templateVersion: entry.extensions.templateVersion ?? null
+  });
+  if (!templates.pool) {
+    throw new Error("Configured token is missing a compiled AMM pool template.");
+  }
+  const tick = entry.symbol.toLowerCase();
+  const head = await resolvePoolHead(tick, indexer, submit);
+  const poolCovid = toBytes(poolCovidHex);
+  const tokenCovid = toBytes(entry.covenantId);
+  const poolState = {
+    kasReserve: BigInt(head.reserves.kasReserve),
+    tokenReserve: BigInt(head.reserves.tokenReserve),
+    tokenCovid,
+    totalShares: BigInt(head.reserves.totalShares),
+    lpCovid: toBytes(head.reserves.lpCovid || kron.genesis.ZERO_COVID)
+  };
+  const poolParams = poolParamsFromCurve(entry.extensions.curveParams);
+  const k = await loadKaspa();
+  const inventoryState = kron.kcc20.covenantIdOwned(poolCovid, poolState.tokenReserve, false);
+  const resolvedPoolAddress = kron.poolCpV3.poolCpV3Address(
+    k,
+    templates.pool,
+    poolState,
+    NETWORK_ID
+  );
+  const inventoryAddress = kron.kcc20.kcc20Address(
+    k,
+    templates.token,
+    inventoryState,
+    NETWORK_ID
+  );
+  const owned = await indexer.tokenUtxos(tick, walletAddress);
+  const preparedLots = lots.map((lot) => {
+    const ownedLot = owned.find(
+      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
+    );
+    if (!ownedLot) throw new Error("Managed token lot is no longer spendable.");
+    const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
+    const sellerAddress = kron.kcc20.kcc20Address(
+      k,
+      decoded.template,
+      decoded.state,
+      NETWORK_ID
+    );
+    return { lot, decoded, sellerAddress };
+  });
+  const totalTokenIn = preparedLots.reduce(
+    (sum, item) => sum + BigInt(item.decoded.state.amount),
+    0n
+  );
+  const quote = kron.poolCpV3.quotePoolV3Sell(poolState, poolParams, totalTokenIn);
+  if (!quote?.net || quote.net <= 0n) {
+    throw new Error("Managed lots have no positive AMM pool sell quote.");
+  }
+  const sellerAddresses = [...new Set(preparedLots.map((item) => item.sellerAddress))];
+  const rpc = new k.RpcClient({
+    url: NODE_URL,
+    networkId: NETWORK_ID,
+    encoding: k.Encoding.Borsh
+  });
+  await rpc.connect();
+  try {
+    const [
+      { entries: poolEntries },
+      { entries: inventoryEntries },
+      { entries: sellerEntries },
+      { entries: walletEntries }
+    ] = await Promise.all([
+      rpc.getUtxosByAddresses({ addresses: [resolvedPoolAddress] }),
+      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
+      rpc.getUtxosByAddresses({ addresses: sellerAddresses }),
+      rpc.getUtxosByAddresses({ addresses: [walletAddress] })
+    ]);
+    const poolEntry = poolEntries.find(
+      (item) => item.outpoint.transactionId === head.pool.transactionId && item.outpoint.index === head.pool.index
+    ) ?? (poolEntries.length === 1 ? poolEntries[0] : null);
+    const inventoryEntry = inventoryEntries.find(
+      (item) => item.outpoint.transactionId === head.poolToken.transactionId && item.outpoint.index === head.poolToken.index
+    ) ?? (inventoryEntries.length === 1 ? inventoryEntries[0] : null);
+    if (!poolEntry || !inventoryEntry) {
+      throw new RetryableTradeStateError(
+        "Live AMM pool state is temporarily ambiguous; waiting before retrying."
+      );
+    }
+    assertPoolUtxoMatchesReserves(poolEntry, poolState.kasReserve);
+    const traderTokens = preparedLots.map(({ lot, decoded }) => {
+      const sellerEntry = sellerEntries.find(
+        (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
+      );
+      if (!sellerEntry) throw new Error("Required sell UTXO is missing.");
+      return {
+        transactionId: lot.transactionId,
+        index: lot.index,
+        value: BigInt(sellerEntry.amount),
+        state: decoded.state
+      };
+    });
+    if (!walletEntries.length) {
+      throw new Error("Required sell UTXO is missing.");
+    }
+    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
+    const presenceWitnessIdx = 2 + traderTokens.length;
+    const spend3 = kron.poolCpV3.buildPoolV3SwapTokenForKas(
+      k,
+      templates.pool,
+      templates.token,
+      poolParams,
+      {
+        transactionId: poolEntry.outpoint.transactionId,
+        index: poolEntry.outpoint.index,
+        state: poolState,
+        tokenUtxo: {
+          transactionId: inventoryEntry.outpoint.transactionId,
+          index: inventoryEntry.outpoint.index,
+          value: BigInt(inventoryEntry.amount)
+        }
+      },
+      poolCovid,
+      traderPubkey,
+      traderTokens,
+      quote,
+      presenceWitnessIdx
+    );
+    let assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee: 10000n
+    });
+    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
+    assembly = kron.spend.assembleNativeTx(k, {
+      spend: spend3,
+      fundingEntries,
+      changeAddress: walletAddress,
+      networkFee
+    });
+    const fundingTotal = BigInt(fundingEntries[0].amount);
+    const explicitTraderKas = templates.pool.recipientBound ? quote.kasOut - quote.creatorFee - quote.platformFee : 0n;
+    const netCredit = assembly.change - fundingTotal + explicitTraderKas;
+    if (netCredit <= 0n) {
+      throw new Error("Assembled pool sell does not produce a positive KAS credit.");
+    }
+    signTraderFunding(k, assembly, key, presenceWitnessIdx);
+    let result = null;
+    if (submit) {
+      try {
+        result = await rpc.submitTransaction({
+          transaction: assembly.transaction,
+          allowOrphan: false
+        });
+      } catch (error) {
+        throw new TradeSubmissionAttemptedError(
+          error instanceof Error ? error.message : "Pool sell submission failed with an unknown result.",
+          error
+        );
+      }
+    }
+    return {
+      transactionId: result?.transactionId,
+      tokenIn: Number(totalTokenIn),
+      lotCount: lots.length,
+      grossKas: toKas(quote.kasOut),
+      kronFeeKas: toKas(quote.creatorFee + quote.platformFee + quote.lpFee),
+      networkFeeKas: toKas(networkFee),
+      netCreditKas: toKas(netCredit),
+      signed: true,
+      submitted: submit,
+      venue: "pool"
+    };
+  } finally {
+    await rpc.disconnect().catch(() => void 0);
+  }
+}
+var API_URL, INDEXER_URL, NODE_URL, SEQUENCER_URL, NETWORK_ID, LIVE_TEST_KAS, SOMPI_PER_KAS, MAXIMUM_DEBIT_SOMPI, MINIMUM_RESERVE_SOMPI, EXECUTION_LOCK, TradeSubmissionAttemptedError, RetryableTradeStateError, toBytes, toKas, KCC20_SCALE;
+var init_kron_live_service = __esm({
+  "src/lib/kron-live-service.ts"() {
+    "use strict";
+    API_URL = "https://api.kron.technology";
+    INDEXER_URL = "https://idx.kron.technology/v1/kcc20";
+    NODE_URL = "wss://node.kron.technology";
+    SEQUENCER_URL = "https://seq.kron.technology";
+    NETWORK_ID = "mainnet";
+    LIVE_TEST_KAS = 21;
+    SOMPI_PER_KAS = 100000000n;
+    MAXIMUM_DEBIT_SOMPI = 2275000000n;
+    MINIMUM_RESERVE_SOMPI = 2500000000n;
+    EXECUTION_LOCK = path.resolve(process.cwd(), ".local/kron-live-buy.executed.json");
+    TradeSubmissionAttemptedError = class extends Error {
+      constructor(message, cause) {
+        super(message);
+        this.name = "TradeSubmissionAttemptedError";
+        this.cause = cause;
+      }
+    };
+    RetryableTradeStateError = class extends Error {
+      constructor(message) {
+        super(message);
+        this.name = "RetryableTradeStateError";
+      }
+    };
+    toBytes = (hex) => Uint8Array.from(Buffer.from(hex, "hex"));
+    toKas = (sompi) => Number(sompi) / Number(SOMPI_PER_KAS);
+    KCC20_SCALE = 1000000n;
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/entity.js
+function is(value, type) {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  if (value instanceof type) {
+    return true;
+  }
+  if (!Object.prototype.hasOwnProperty.call(type, entityKind)) {
+    throw new Error(
+      `Class "${type.name ?? "<unknown>"}" doesn't look like a Drizzle entity. If this is incorrect and the class is provided by Drizzle, please report this as a bug.`
+    );
+  }
+  let cls = Object.getPrototypeOf(value).constructor;
+  if (cls) {
+    while (cls) {
+      if (entityKind in cls && cls[entityKind] === type[entityKind]) {
+        return true;
+      }
+      cls = Object.getPrototypeOf(cls);
+    }
+  }
+  return false;
+}
+var entityKind;
+var init_entity = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/entity.js"() {
+    entityKind = /* @__PURE__ */ Symbol.for("drizzle:entityKind");
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/column.js
+var Column;
+var init_column = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/column.js"() {
+    init_entity();
+    Column = class {
+      constructor(table, config2) {
+        this.table = table;
+        this.config = config2;
+        this.name = config2.name;
+        this.keyAsName = config2.keyAsName;
+        this.notNull = config2.notNull;
+        this.default = config2.default;
+        this.defaultFn = config2.defaultFn;
+        this.onUpdateFn = config2.onUpdateFn;
+        this.hasDefault = config2.hasDefault;
+        this.primary = config2.primaryKey;
+        this.isUnique = config2.isUnique;
+        this.uniqueName = config2.uniqueName;
+        this.uniqueType = config2.uniqueType;
+        this.dataType = config2.dataType;
+        this.columnType = config2.columnType;
+        this.generated = config2.generated;
+        this.generatedIdentity = config2.generatedIdentity;
+      }
+      static [entityKind] = "Column";
+      name;
+      keyAsName;
+      primary;
+      notNull;
+      default;
+      defaultFn;
+      onUpdateFn;
+      hasDefault;
+      isUnique;
+      uniqueName;
+      uniqueType;
+      dataType;
+      columnType;
+      enumValues = void 0;
+      generated = void 0;
+      generatedIdentity = void 0;
+      config;
+      mapFromDriverValue(value) {
+        return value;
+      }
+      mapToDriverValue(value) {
+        return value;
+      }
+      // ** @internal */
+      shouldDisableInsert() {
+        return this.config.generated !== void 0 && this.config.generated.type !== "byDefault";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/column-builder.js
+var ColumnBuilder;
+var init_column_builder = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/column-builder.js"() {
+    init_entity();
+    ColumnBuilder = class {
+      static [entityKind] = "ColumnBuilder";
+      config;
+      constructor(name, dataType, columnType) {
+        this.config = {
+          name,
+          keyAsName: name === "",
+          notNull: false,
+          default: void 0,
+          hasDefault: false,
+          primaryKey: false,
+          isUnique: false,
+          uniqueName: void 0,
+          uniqueType: void 0,
+          dataType,
+          columnType,
+          generated: void 0
+        };
+      }
+      /**
+       * Changes the data type of the column. Commonly used with `json` columns. Also, useful for branded types.
+       *
+       * @example
+       * ```ts
+       * const users = pgTable('users', {
+       * 	id: integer('id').$type<UserId>().primaryKey(),
+       * 	details: json('details').$type<UserDetails>().notNull(),
+       * });
+       * ```
+       */
+      $type() {
+        return this;
+      }
+      /**
+       * Adds a `not null` clause to the column definition.
+       *
+       * Affects the `select` model of the table - columns *without* `not null` will be nullable on select.
+       */
+      notNull() {
+        this.config.notNull = true;
+        return this;
+      }
+      /**
+       * Adds a `default <value>` clause to the column definition.
+       *
+       * Affects the `insert` model of the table - columns *with* `default` are optional on insert.
+       *
+       * If you need to set a dynamic default value, use {@link $defaultFn} instead.
+       */
+      default(value) {
+        this.config.default = value;
+        this.config.hasDefault = true;
+        return this;
+      }
+      /**
+       * Adds a dynamic default value to the column.
+       * The function will be called when the row is inserted, and the returned value will be used as the column value.
+       *
+       * **Note:** This value does not affect the `drizzle-kit` behavior, it is only used at runtime in `drizzle-orm`.
+       */
+      $defaultFn(fn) {
+        this.config.defaultFn = fn;
+        this.config.hasDefault = true;
+        return this;
+      }
+      /**
+       * Alias for {@link $defaultFn}.
+       */
+      $default = this.$defaultFn;
+      /**
+       * Adds a dynamic update value to the column.
+       * The function will be called when the row is updated, and the returned value will be used as the column value if none is provided.
+       * If no `default` (or `$defaultFn`) value is provided, the function will be called when the row is inserted as well, and the returned value will be used as the column value.
+       *
+       * **Note:** This value does not affect the `drizzle-kit` behavior, it is only used at runtime in `drizzle-orm`.
+       */
+      $onUpdateFn(fn) {
+        this.config.onUpdateFn = fn;
+        this.config.hasDefault = true;
+        return this;
+      }
+      /**
+       * Alias for {@link $onUpdateFn}.
+       */
+      $onUpdate = this.$onUpdateFn;
+      /**
+       * Adds a `primary key` clause to the column definition. This implicitly makes the column `not null`.
+       *
+       * In SQLite, `integer primary key` implicitly makes the column auto-incrementing.
+       */
+      primaryKey() {
+        this.config.primaryKey = true;
+        this.config.notNull = true;
+        return this;
+      }
+      /** @internal Sets the name of the column to the key within the table definition if a name was not given. */
+      setName(name) {
+        if (this.config.name !== "") return;
+        this.config.name = name;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/table.utils.js
+var TableName;
+var init_table_utils = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/table.utils.js"() {
+    TableName = /* @__PURE__ */ Symbol.for("drizzle:Name");
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/foreign-keys.js
+var ForeignKeyBuilder, ForeignKey;
+var init_foreign_keys = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/foreign-keys.js"() {
+    init_entity();
+    init_table_utils();
+    ForeignKeyBuilder = class {
+      static [entityKind] = "PgForeignKeyBuilder";
+      /** @internal */
+      reference;
+      /** @internal */
+      _onUpdate = "no action";
+      /** @internal */
+      _onDelete = "no action";
+      constructor(config2, actions) {
+        this.reference = () => {
+          const { name, columns, foreignColumns } = config2();
+          return { name, columns, foreignTable: foreignColumns[0].table, foreignColumns };
+        };
+        if (actions) {
+          this._onUpdate = actions.onUpdate;
+          this._onDelete = actions.onDelete;
+        }
+      }
+      onUpdate(action) {
+        this._onUpdate = action === void 0 ? "no action" : action;
+        return this;
+      }
+      onDelete(action) {
+        this._onDelete = action === void 0 ? "no action" : action;
+        return this;
+      }
+      /** @internal */
+      build(table) {
+        return new ForeignKey(table, this);
+      }
+    };
+    ForeignKey = class {
+      constructor(table, builder) {
+        this.table = table;
+        this.reference = builder.reference;
+        this.onUpdate = builder._onUpdate;
+        this.onDelete = builder._onDelete;
+      }
+      static [entityKind] = "PgForeignKey";
+      reference;
+      onUpdate;
+      onDelete;
+      getName() {
+        const { name, columns, foreignColumns } = this.reference();
+        const columnNames = columns.map((column) => column.name);
+        const foreignColumnNames = foreignColumns.map((column) => column.name);
+        const chunks = [
+          this.table[TableName],
+          ...columnNames,
+          foreignColumns[0].table[TableName],
+          ...foreignColumnNames
+        ];
+        return name ?? `${chunks.join("_")}_fk`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/tracing-utils.js
+function iife(fn, ...args) {
+  return fn(...args);
+}
+var init_tracing_utils = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/tracing-utils.js"() {
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/unique-constraint.js
+function uniqueKeyName(table, columns) {
+  return `${table[TableName]}_${columns.join("_")}_unique`;
+}
+var UniqueConstraintBuilder, UniqueOnConstraintBuilder, UniqueConstraint;
+var init_unique_constraint = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/unique-constraint.js"() {
+    init_entity();
+    init_table_utils();
+    UniqueConstraintBuilder = class {
+      constructor(columns, name) {
+        this.name = name;
+        this.columns = columns;
+      }
+      static [entityKind] = "PgUniqueConstraintBuilder";
+      /** @internal */
+      columns;
+      /** @internal */
+      nullsNotDistinctConfig = false;
+      nullsNotDistinct() {
+        this.nullsNotDistinctConfig = true;
+        return this;
+      }
+      /** @internal */
+      build(table) {
+        return new UniqueConstraint(table, this.columns, this.nullsNotDistinctConfig, this.name);
+      }
+    };
+    UniqueOnConstraintBuilder = class {
+      static [entityKind] = "PgUniqueOnConstraintBuilder";
+      /** @internal */
+      name;
+      constructor(name) {
+        this.name = name;
+      }
+      on(...columns) {
+        return new UniqueConstraintBuilder(columns, this.name);
+      }
+    };
+    UniqueConstraint = class {
+      constructor(table, columns, nullsNotDistinct, name) {
+        this.table = table;
+        this.columns = columns;
+        this.name = name ?? uniqueKeyName(this.table, this.columns.map((column) => column.name));
+        this.nullsNotDistinct = nullsNotDistinct;
+      }
+      static [entityKind] = "PgUniqueConstraint";
+      columns;
+      name;
+      nullsNotDistinct = false;
+      getName() {
+        return this.name;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/utils/array.js
+function parsePgArrayValue(arrayString, startFrom, inQuotes) {
+  for (let i = startFrom; i < arrayString.length; i++) {
+    const char2 = arrayString[i];
+    if (char2 === "\\") {
+      i++;
+      continue;
+    }
+    if (char2 === '"') {
+      return [arrayString.slice(startFrom, i).replace(/\\/g, ""), i + 1];
+    }
+    if (inQuotes) {
+      continue;
+    }
+    if (char2 === "," || char2 === "}") {
+      return [arrayString.slice(startFrom, i).replace(/\\/g, ""), i];
+    }
+  }
+  return [arrayString.slice(startFrom).replace(/\\/g, ""), arrayString.length];
+}
+function parsePgNestedArray(arrayString, startFrom = 0) {
+  const result = [];
+  let i = startFrom;
+  let lastCharIsComma = false;
+  while (i < arrayString.length) {
+    const char2 = arrayString[i];
+    if (char2 === ",") {
+      if (lastCharIsComma || i === startFrom) {
+        result.push("");
+      }
+      lastCharIsComma = true;
+      i++;
+      continue;
+    }
+    lastCharIsComma = false;
+    if (char2 === "\\") {
+      i += 2;
+      continue;
+    }
+    if (char2 === '"') {
+      const [value2, startFrom2] = parsePgArrayValue(arrayString, i + 1, true);
+      result.push(value2);
+      i = startFrom2;
+      continue;
+    }
+    if (char2 === "}") {
+      return [result, i + 1];
+    }
+    if (char2 === "{") {
+      const [value2, startFrom2] = parsePgNestedArray(arrayString, i + 1);
+      result.push(value2);
+      i = startFrom2;
+      continue;
+    }
+    const [value, newStartFrom] = parsePgArrayValue(arrayString, i, false);
+    result.push(value);
+    i = newStartFrom;
+  }
+  return [result, i];
+}
+function parsePgArray(arrayString) {
+  const [result] = parsePgNestedArray(arrayString, 1);
+  return result;
+}
+function makePgArray(array) {
+  return `{${array.map((item) => {
+    if (Array.isArray(item)) {
+      return makePgArray(item);
+    }
+    if (typeof item === "string") {
+      return `"${item.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    }
+    return `${item}`;
+  }).join(",")}}`;
+}
+var init_array = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/utils/array.js"() {
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/common.js
+var PgColumnBuilder, PgColumn, ExtraConfigColumn, IndexedColumn, PgArrayBuilder, PgArray;
+var init_common = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/common.js"() {
+    init_column_builder();
+    init_column();
+    init_entity();
+    init_foreign_keys();
+    init_tracing_utils();
+    init_unique_constraint();
+    init_array();
+    PgColumnBuilder = class extends ColumnBuilder {
+      foreignKeyConfigs = [];
+      static [entityKind] = "PgColumnBuilder";
+      array(size) {
+        return new PgArrayBuilder(this.config.name, this, size);
+      }
+      references(ref, actions = {}) {
+        this.foreignKeyConfigs.push({ ref, actions });
+        return this;
+      }
+      unique(name, config2) {
+        this.config.isUnique = true;
+        this.config.uniqueName = name;
+        this.config.uniqueType = config2?.nulls;
+        return this;
+      }
+      generatedAlwaysAs(as) {
+        this.config.generated = {
+          as,
+          type: "always",
+          mode: "stored"
+        };
+        return this;
+      }
+      /** @internal */
+      buildForeignKeys(column, table) {
+        return this.foreignKeyConfigs.map(({ ref, actions }) => {
+          return iife(
+            (ref2, actions2) => {
+              const builder = new ForeignKeyBuilder(() => {
+                const foreignColumn = ref2();
+                return { columns: [column], foreignColumns: [foreignColumn] };
+              });
+              if (actions2.onUpdate) {
+                builder.onUpdate(actions2.onUpdate);
+              }
+              if (actions2.onDelete) {
+                builder.onDelete(actions2.onDelete);
+              }
+              return builder.build(table);
+            },
+            ref,
+            actions
+          );
+        });
+      }
+      /** @internal */
+      buildExtraConfigColumn(table) {
+        return new ExtraConfigColumn(table, this.config);
+      }
+    };
+    PgColumn = class extends Column {
+      constructor(table, config2) {
+        if (!config2.uniqueName) {
+          config2.uniqueName = uniqueKeyName(table, [config2.name]);
+        }
+        super(table, config2);
+        this.table = table;
+      }
+      static [entityKind] = "PgColumn";
+    };
+    ExtraConfigColumn = class extends PgColumn {
+      static [entityKind] = "ExtraConfigColumn";
+      getSQLType() {
+        return this.getSQLType();
+      }
+      indexConfig = {
+        order: this.config.order ?? "asc",
+        nulls: this.config.nulls ?? "last",
+        opClass: this.config.opClass
+      };
+      defaultConfig = {
+        order: "asc",
+        nulls: "last",
+        opClass: void 0
+      };
+      asc() {
+        this.indexConfig.order = "asc";
+        return this;
+      }
+      desc() {
+        this.indexConfig.order = "desc";
+        return this;
+      }
+      nullsFirst() {
+        this.indexConfig.nulls = "first";
+        return this;
+      }
+      nullsLast() {
+        this.indexConfig.nulls = "last";
+        return this;
+      }
+      /**
+       * ### PostgreSQL documentation quote
+       *
+       * > An operator class with optional parameters can be specified for each column of an index.
+       * The operator class identifies the operators to be used by the index for that column.
+       * For example, a B-tree index on four-byte integers would use the int4_ops class;
+       * this operator class includes comparison functions for four-byte integers.
+       * In practice the default operator class for the column's data type is usually sufficient.
+       * The main point of having operator classes is that for some data types, there could be more than one meaningful ordering.
+       * For example, we might want to sort a complex-number data type either by absolute value or by real part.
+       * We could do this by defining two operator classes for the data type and then selecting the proper class when creating an index.
+       * More information about operator classes check:
+       *
+       * ### Useful links
+       * https://www.postgresql.org/docs/current/sql-createindex.html
+       *
+       * https://www.postgresql.org/docs/current/indexes-opclass.html
+       *
+       * https://www.postgresql.org/docs/current/xindex.html
+       *
+       * ### Additional types
+       * If you have the `pg_vector` extension installed in your database, you can use the
+       * `vector_l2_ops`, `vector_ip_ops`, `vector_cosine_ops`, `vector_l1_ops`, `bit_hamming_ops`, `bit_jaccard_ops`, `halfvec_l2_ops`, `sparsevec_l2_ops` options, which are predefined types.
+       *
+       * **You can always specify any string you want in the operator class, in case Drizzle doesn't have it natively in its types**
+       *
+       * @param opClass
+       * @returns
+       */
+      op(opClass) {
+        this.indexConfig.opClass = opClass;
+        return this;
+      }
+    };
+    IndexedColumn = class {
+      static [entityKind] = "IndexedColumn";
+      constructor(name, keyAsName, type, indexConfig) {
+        this.name = name;
+        this.keyAsName = keyAsName;
+        this.type = type;
+        this.indexConfig = indexConfig;
+      }
+      name;
+      keyAsName;
+      type;
+      indexConfig;
+    };
+    PgArrayBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgArrayBuilder";
+      constructor(name, baseBuilder, size) {
+        super(name, "array", "PgArray");
+        this.config.baseBuilder = baseBuilder;
+        this.config.size = size;
+      }
+      /** @internal */
+      build(table) {
+        const baseColumn = this.config.baseBuilder.build(table);
+        return new PgArray(
+          table,
+          this.config,
+          baseColumn
+        );
+      }
+    };
+    PgArray = class _PgArray extends PgColumn {
+      constructor(table, config2, baseColumn, range) {
+        super(table, config2);
+        this.baseColumn = baseColumn;
+        this.range = range;
+        this.size = config2.size;
+      }
+      size;
+      static [entityKind] = "PgArray";
+      getSQLType() {
+        return `${this.baseColumn.getSQLType()}[${typeof this.size === "number" ? this.size : ""}]`;
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") {
+          value = parsePgArray(value);
+        }
+        return value.map((v) => this.baseColumn.mapFromDriverValue(v));
+      }
+      mapToDriverValue(value, isNestedArray = false) {
+        const a = value.map(
+          (v) => v === null ? null : is(this.baseColumn, _PgArray) ? this.baseColumn.mapToDriverValue(v, true) : this.baseColumn.mapToDriverValue(v)
+        );
+        if (isNestedArray) return a;
+        return makePgArray(a);
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/enum.js
+function isPgEnum(obj) {
+  return !!obj && typeof obj === "function" && isPgEnumSym in obj && obj[isPgEnumSym] === true;
+}
+function pgEnum(enumName, input) {
+  return Array.isArray(input) ? pgEnumWithSchema(enumName, [...input], void 0) : pgEnumObjectWithSchema(enumName, input, void 0);
+}
+function pgEnumWithSchema(enumName, values, schema) {
+  const enumInstance = Object.assign(
+    (name) => new PgEnumColumnBuilder(name ?? "", enumInstance),
+    {
+      enumName,
+      enumValues: values,
+      schema,
+      [isPgEnumSym]: true
+    }
+  );
+  return enumInstance;
+}
+function pgEnumObjectWithSchema(enumName, values, schema) {
+  const enumInstance = Object.assign(
+    (name) => new PgEnumObjectColumnBuilder(name ?? "", enumInstance),
+    {
+      enumName,
+      enumValues: Object.values(values),
+      schema,
+      [isPgEnumSym]: true
+    }
+  );
+  return enumInstance;
+}
+var PgEnumObjectColumnBuilder, PgEnumObjectColumn, isPgEnumSym, PgEnumColumnBuilder, PgEnumColumn;
+var init_enum = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/enum.js"() {
+    init_entity();
+    init_common();
+    PgEnumObjectColumnBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgEnumObjectColumnBuilder";
+      constructor(name, enumInstance) {
+        super(name, "string", "PgEnumObjectColumn");
+        this.config.enum = enumInstance;
+      }
+      /** @internal */
+      build(table) {
+        return new PgEnumObjectColumn(
+          table,
+          this.config
+        );
+      }
+    };
+    PgEnumObjectColumn = class extends PgColumn {
+      static [entityKind] = "PgEnumObjectColumn";
+      enum;
+      enumValues = this.config.enum.enumValues;
+      constructor(table, config2) {
+        super(table, config2);
+        this.enum = config2.enum;
+      }
+      getSQLType() {
+        return this.enum.enumName;
+      }
+    };
+    isPgEnumSym = /* @__PURE__ */ Symbol.for("drizzle:isPgEnum");
+    PgEnumColumnBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgEnumColumnBuilder";
+      constructor(name, enumInstance) {
+        super(name, "string", "PgEnumColumn");
+        this.config.enum = enumInstance;
+      }
+      /** @internal */
+      build(table) {
+        return new PgEnumColumn(
+          table,
+          this.config
+        );
+      }
+    };
+    PgEnumColumn = class extends PgColumn {
+      static [entityKind] = "PgEnumColumn";
+      enum = this.config.enum;
+      enumValues = this.config.enum.enumValues;
+      constructor(table, config2) {
+        super(table, config2);
+        this.enum = config2.enum;
+      }
+      getSQLType() {
+        return this.enum.enumName;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/subquery.js
+var Subquery, WithSubquery;
+var init_subquery = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/subquery.js"() {
+    init_entity();
+    Subquery = class {
+      static [entityKind] = "Subquery";
+      constructor(sql2, fields, alias, isWith = false, usedTables = []) {
+        this._ = {
+          brand: "Subquery",
+          sql: sql2,
+          selectedFields: fields,
+          alias,
+          isWith,
+          usedTables
+        };
+      }
+      // getSQL(): SQL<unknown> {
+      // 	return new SQL([this]);
+      // }
+    };
+    WithSubquery = class extends Subquery {
+      static [entityKind] = "WithSubquery";
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/version.js
+var version;
+var init_version = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/version.js"() {
+    version = "0.45.2";
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/tracing.js
+var otel, rawTracer, tracer;
+var init_tracing = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/tracing.js"() {
+    init_tracing_utils();
+    init_version();
+    tracer = {
+      startActiveSpan(name, fn) {
+        if (!otel) {
+          return fn();
+        }
+        if (!rawTracer) {
+          rawTracer = otel.trace.getTracer("drizzle-orm", version);
+        }
+        return iife(
+          (otel2, rawTracer2) => rawTracer2.startActiveSpan(
+            name,
+            (span) => {
+              try {
+                return fn(span);
+              } catch (e) {
+                span.setStatus({
+                  code: otel2.SpanStatusCode.ERROR,
+                  message: e instanceof Error ? e.message : "Unknown error"
+                  // eslint-disable-line no-instanceof/no-instanceof
+                });
+                throw e;
+              } finally {
+                span.end();
+              }
+            }
+          ),
+          otel,
+          rawTracer
+        );
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/view-common.js
+var ViewBaseConfig;
+var init_view_common = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/view-common.js"() {
+    ViewBaseConfig = /* @__PURE__ */ Symbol.for("drizzle:ViewBaseConfig");
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/table.js
+function getTableName(table) {
+  return table[TableName];
+}
+function getTableUniqueName(table) {
+  return `${table[Schema] ?? "public"}.${table[TableName]}`;
+}
+var Schema, Columns, ExtraConfigColumns, OriginalName, BaseName, IsAlias, ExtraConfigBuilder, IsDrizzleTable, Table;
+var init_table = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/table.js"() {
+    init_entity();
+    init_table_utils();
+    Schema = /* @__PURE__ */ Symbol.for("drizzle:Schema");
+    Columns = /* @__PURE__ */ Symbol.for("drizzle:Columns");
+    ExtraConfigColumns = /* @__PURE__ */ Symbol.for("drizzle:ExtraConfigColumns");
+    OriginalName = /* @__PURE__ */ Symbol.for("drizzle:OriginalName");
+    BaseName = /* @__PURE__ */ Symbol.for("drizzle:BaseName");
+    IsAlias = /* @__PURE__ */ Symbol.for("drizzle:IsAlias");
+    ExtraConfigBuilder = /* @__PURE__ */ Symbol.for("drizzle:ExtraConfigBuilder");
+    IsDrizzleTable = /* @__PURE__ */ Symbol.for("drizzle:IsDrizzleTable");
+    Table = class {
+      static [entityKind] = "Table";
+      /** @internal */
+      static Symbol = {
+        Name: TableName,
+        Schema,
+        OriginalName,
+        Columns,
+        ExtraConfigColumns,
+        BaseName,
+        IsAlias,
+        ExtraConfigBuilder
+      };
+      /**
+       * @internal
+       * Can be changed if the table is aliased.
+       */
+      [TableName];
+      /**
+       * @internal
+       * Used to store the original name of the table, before any aliasing.
+       */
+      [OriginalName];
+      /** @internal */
+      [Schema];
+      /** @internal */
+      [Columns];
+      /** @internal */
+      [ExtraConfigColumns];
+      /**
+       *  @internal
+       * Used to store the table name before the transformation via the `tableCreator` functions.
+       */
+      [BaseName];
+      /** @internal */
+      [IsAlias] = false;
+      /** @internal */
+      [IsDrizzleTable] = true;
+      /** @internal */
+      [ExtraConfigBuilder] = void 0;
+      constructor(name, schema, baseName) {
+        this[TableName] = this[OriginalName] = name;
+        this[Schema] = schema;
+        this[BaseName] = baseName;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/sql.js
+function isSQLWrapper(value) {
+  return value !== null && value !== void 0 && typeof value.getSQL === "function";
+}
+function mergeQueries(queries) {
+  const result = { sql: "", params: [] };
+  for (const query of queries) {
+    result.sql += query.sql;
+    result.params.push(...query.params);
+    if (query.typings?.length) {
+      if (!result.typings) {
+        result.typings = [];
+      }
+      result.typings.push(...query.typings);
+    }
+  }
+  return result;
+}
+function isDriverValueEncoder(value) {
+  return typeof value === "object" && value !== null && "mapToDriverValue" in value && typeof value.mapToDriverValue === "function";
+}
+function sql(strings, ...params) {
+  const queryChunks = [];
+  if (params.length > 0 || strings.length > 0 && strings[0] !== "") {
+    queryChunks.push(new StringChunk(strings[0]));
+  }
+  for (const [paramIndex, param2] of params.entries()) {
+    queryChunks.push(param2, new StringChunk(strings[paramIndex + 1]));
+  }
+  return new SQL(queryChunks);
+}
+function fillPlaceholders(params, values) {
+  return params.map((p) => {
+    if (is(p, Placeholder)) {
+      if (!(p.name in values)) {
+        throw new Error(`No value for placeholder "${p.name}" was provided`);
+      }
+      return values[p.name];
+    }
+    if (is(p, Param) && is(p.value, Placeholder)) {
+      if (!(p.value.name in values)) {
+        throw new Error(`No value for placeholder "${p.value.name}" was provided`);
+      }
+      return p.encoder.mapToDriverValue(values[p.value.name]);
+    }
+    return p;
+  });
+}
+var FakePrimitiveParam, StringChunk, SQL, Name, noopDecoder, noopEncoder, noopMapper, Param, Placeholder, IsDrizzleView, View;
+var init_sql = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/sql.js"() {
+    init_entity();
+    init_enum();
+    init_subquery();
+    init_tracing();
+    init_view_common();
+    init_column();
+    init_table();
+    FakePrimitiveParam = class {
+      static [entityKind] = "FakePrimitiveParam";
+    };
+    StringChunk = class {
+      static [entityKind] = "StringChunk";
+      value;
+      constructor(value) {
+        this.value = Array.isArray(value) ? value : [value];
+      }
+      getSQL() {
+        return new SQL([this]);
+      }
+    };
+    SQL = class _SQL {
+      constructor(queryChunks) {
+        this.queryChunks = queryChunks;
+        for (const chunk of queryChunks) {
+          if (is(chunk, Table)) {
+            const schemaName = chunk[Table.Symbol.Schema];
+            this.usedTables.push(
+              schemaName === void 0 ? chunk[Table.Symbol.Name] : schemaName + "." + chunk[Table.Symbol.Name]
+            );
+          }
+        }
+      }
+      static [entityKind] = "SQL";
+      /** @internal */
+      decoder = noopDecoder;
+      shouldInlineParams = false;
+      /** @internal */
+      usedTables = [];
+      append(query) {
+        this.queryChunks.push(...query.queryChunks);
+        return this;
+      }
+      toQuery(config2) {
+        return tracer.startActiveSpan("drizzle.buildSQL", (span) => {
+          const query = this.buildQueryFromSourceParams(this.queryChunks, config2);
+          span?.setAttributes({
+            "drizzle.query.text": query.sql,
+            "drizzle.query.params": JSON.stringify(query.params)
+          });
+          return query;
+        });
+      }
+      buildQueryFromSourceParams(chunks, _config) {
+        const config2 = Object.assign({}, _config, {
+          inlineParams: _config.inlineParams || this.shouldInlineParams,
+          paramStartIndex: _config.paramStartIndex || { value: 0 }
+        });
+        const {
+          casing,
+          escapeName,
+          escapeParam,
+          prepareTyping,
+          inlineParams,
+          paramStartIndex
+        } = config2;
+        return mergeQueries(chunks.map((chunk) => {
+          if (is(chunk, StringChunk)) {
+            return { sql: chunk.value.join(""), params: [] };
+          }
+          if (is(chunk, Name)) {
+            return { sql: escapeName(chunk.value), params: [] };
+          }
+          if (chunk === void 0) {
+            return { sql: "", params: [] };
+          }
+          if (Array.isArray(chunk)) {
+            const result = [new StringChunk("(")];
+            for (const [i, p] of chunk.entries()) {
+              result.push(p);
+              if (i < chunk.length - 1) {
+                result.push(new StringChunk(", "));
+              }
+            }
+            result.push(new StringChunk(")"));
+            return this.buildQueryFromSourceParams(result, config2);
+          }
+          if (is(chunk, _SQL)) {
+            return this.buildQueryFromSourceParams(chunk.queryChunks, {
+              ...config2,
+              inlineParams: inlineParams || chunk.shouldInlineParams
+            });
+          }
+          if (is(chunk, Table)) {
+            const schemaName = chunk[Table.Symbol.Schema];
+            const tableName = chunk[Table.Symbol.Name];
+            return {
+              sql: schemaName === void 0 || chunk[IsAlias] ? escapeName(tableName) : escapeName(schemaName) + "." + escapeName(tableName),
+              params: []
+            };
+          }
+          if (is(chunk, Column)) {
+            const columnName = casing.getColumnCasing(chunk);
+            if (_config.invokeSource === "indexes") {
+              return { sql: escapeName(columnName), params: [] };
+            }
+            const schemaName = chunk.table[Table.Symbol.Schema];
+            return {
+              sql: chunk.table[IsAlias] || schemaName === void 0 ? escapeName(chunk.table[Table.Symbol.Name]) + "." + escapeName(columnName) : escapeName(schemaName) + "." + escapeName(chunk.table[Table.Symbol.Name]) + "." + escapeName(columnName),
+              params: []
+            };
+          }
+          if (is(chunk, View)) {
+            const schemaName = chunk[ViewBaseConfig].schema;
+            const viewName = chunk[ViewBaseConfig].name;
+            return {
+              sql: schemaName === void 0 || chunk[ViewBaseConfig].isAlias ? escapeName(viewName) : escapeName(schemaName) + "." + escapeName(viewName),
+              params: []
+            };
+          }
+          if (is(chunk, Param)) {
+            if (is(chunk.value, Placeholder)) {
+              return { sql: escapeParam(paramStartIndex.value++, chunk), params: [chunk], typings: ["none"] };
+            }
+            const mappedValue = chunk.value === null ? null : chunk.encoder.mapToDriverValue(chunk.value);
+            if (is(mappedValue, _SQL)) {
+              return this.buildQueryFromSourceParams([mappedValue], config2);
+            }
+            if (inlineParams) {
+              return { sql: this.mapInlineParam(mappedValue, config2), params: [] };
+            }
+            let typings = ["none"];
+            if (prepareTyping) {
+              typings = [prepareTyping(chunk.encoder)];
+            }
+            return { sql: escapeParam(paramStartIndex.value++, mappedValue), params: [mappedValue], typings };
+          }
+          if (is(chunk, Placeholder)) {
+            return { sql: escapeParam(paramStartIndex.value++, chunk), params: [chunk], typings: ["none"] };
+          }
+          if (is(chunk, _SQL.Aliased) && chunk.fieldAlias !== void 0) {
+            return { sql: escapeName(chunk.fieldAlias), params: [] };
+          }
+          if (is(chunk, Subquery)) {
+            if (chunk._.isWith) {
+              return { sql: escapeName(chunk._.alias), params: [] };
+            }
+            return this.buildQueryFromSourceParams([
+              new StringChunk("("),
+              chunk._.sql,
+              new StringChunk(") "),
+              new Name(chunk._.alias)
+            ], config2);
+          }
+          if (isPgEnum(chunk)) {
+            if (chunk.schema) {
+              return { sql: escapeName(chunk.schema) + "." + escapeName(chunk.enumName), params: [] };
+            }
+            return { sql: escapeName(chunk.enumName), params: [] };
+          }
+          if (isSQLWrapper(chunk)) {
+            if (chunk.shouldOmitSQLParens?.()) {
+              return this.buildQueryFromSourceParams([chunk.getSQL()], config2);
+            }
+            return this.buildQueryFromSourceParams([
+              new StringChunk("("),
+              chunk.getSQL(),
+              new StringChunk(")")
+            ], config2);
+          }
+          if (inlineParams) {
+            return { sql: this.mapInlineParam(chunk, config2), params: [] };
+          }
+          return { sql: escapeParam(paramStartIndex.value++, chunk), params: [chunk], typings: ["none"] };
+        }));
+      }
+      mapInlineParam(chunk, { escapeString }) {
+        if (chunk === null) {
+          return "null";
+        }
+        if (typeof chunk === "number" || typeof chunk === "boolean") {
+          return chunk.toString();
+        }
+        if (typeof chunk === "string") {
+          return escapeString(chunk);
+        }
+        if (typeof chunk === "object") {
+          const mappedValueAsString = chunk.toString();
+          if (mappedValueAsString === "[object Object]") {
+            return escapeString(JSON.stringify(chunk));
+          }
+          return escapeString(mappedValueAsString);
+        }
+        throw new Error("Unexpected param value: " + chunk);
+      }
+      getSQL() {
+        return this;
+      }
+      as(alias) {
+        if (alias === void 0) {
+          return this;
+        }
+        return new _SQL.Aliased(this, alias);
+      }
+      mapWith(decoder) {
+        this.decoder = typeof decoder === "function" ? { mapFromDriverValue: decoder } : decoder;
+        return this;
+      }
+      inlineParams() {
+        this.shouldInlineParams = true;
+        return this;
+      }
+      /**
+       * This method is used to conditionally include a part of the query.
+       *
+       * @param condition - Condition to check
+       * @returns itself if the condition is `true`, otherwise `undefined`
+       */
+      if(condition) {
+        return condition ? this : void 0;
+      }
+    };
+    Name = class {
+      constructor(value) {
+        this.value = value;
+      }
+      static [entityKind] = "Name";
+      brand;
+      getSQL() {
+        return new SQL([this]);
+      }
+    };
+    noopDecoder = {
+      mapFromDriverValue: (value) => value
+    };
+    noopEncoder = {
+      mapToDriverValue: (value) => value
+    };
+    noopMapper = {
+      ...noopDecoder,
+      ...noopEncoder
+    };
+    Param = class {
+      /**
+       * @param value - Parameter value
+       * @param encoder - Encoder to convert the value to a driver parameter
+       */
+      constructor(value, encoder = noopEncoder) {
+        this.value = value;
+        this.encoder = encoder;
+      }
+      static [entityKind] = "Param";
+      brand;
+      getSQL() {
+        return new SQL([this]);
+      }
+    };
+    ((sql2) => {
+      function empty() {
+        return new SQL([]);
+      }
+      sql2.empty = empty;
+      function fromList(list) {
+        return new SQL(list);
+      }
+      sql2.fromList = fromList;
+      function raw(str) {
+        return new SQL([new StringChunk(str)]);
+      }
+      sql2.raw = raw;
+      function join(chunks, separator) {
+        const result = [];
+        for (const [i, chunk] of chunks.entries()) {
+          if (i > 0 && separator !== void 0) {
+            result.push(separator);
+          }
+          result.push(chunk);
+        }
+        return new SQL(result);
+      }
+      sql2.join = join;
+      function identifier(value) {
+        return new Name(value);
+      }
+      sql2.identifier = identifier;
+      function placeholder2(name2) {
+        return new Placeholder(name2);
+      }
+      sql2.placeholder = placeholder2;
+      function param2(value, encoder) {
+        return new Param(value, encoder);
+      }
+      sql2.param = param2;
+    })(sql || (sql = {}));
+    ((SQL2) => {
+      class Aliased {
+        constructor(sql2, fieldAlias) {
+          this.sql = sql2;
+          this.fieldAlias = fieldAlias;
+        }
+        static [entityKind] = "SQL.Aliased";
+        /** @internal */
+        isSelectionField = false;
+        getSQL() {
+          return this.sql;
+        }
+        /** @internal */
+        clone() {
+          return new Aliased(this.sql, this.fieldAlias);
+        }
+      }
+      SQL2.Aliased = Aliased;
+    })(SQL || (SQL = {}));
+    Placeholder = class {
+      constructor(name2) {
+        this.name = name2;
+      }
+      static [entityKind] = "Placeholder";
+      getSQL() {
+        return new SQL([this]);
+      }
+    };
+    IsDrizzleView = /* @__PURE__ */ Symbol.for("drizzle:IsDrizzleView");
+    View = class {
+      static [entityKind] = "View";
+      /** @internal */
+      [ViewBaseConfig];
+      /** @internal */
+      [IsDrizzleView] = true;
+      constructor({ name: name2, schema, selectedFields, query }) {
+        this[ViewBaseConfig] = {
+          name: name2,
+          originalName: name2,
+          schema,
+          selectedFields,
+          query,
+          isExisting: !query,
+          isAlias: false
+        };
+      }
+      getSQL() {
+        return new SQL([this]);
+      }
+    };
+    Column.prototype.getSQL = function() {
+      return new SQL([this]);
+    };
+    Table.prototype.getSQL = function() {
+      return new SQL([this]);
+    };
+    Subquery.prototype.getSQL = function() {
+      return new SQL([this]);
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/alias.js
+function aliasedTable(table, tableAlias) {
+  return new Proxy(table, new TableAliasProxyHandler(tableAlias, false));
+}
+function aliasedTableColumn(column, tableAlias) {
+  return new Proxy(
+    column,
+    new ColumnAliasProxyHandler(new Proxy(column.table, new TableAliasProxyHandler(tableAlias, false)))
+  );
+}
+function mapColumnsInAliasedSQLToAlias(query, alias) {
+  return new SQL.Aliased(mapColumnsInSQLToAlias(query.sql, alias), query.fieldAlias);
+}
+function mapColumnsInSQLToAlias(query, alias) {
+  return sql.join(query.queryChunks.map((c) => {
+    if (is(c, Column)) {
+      return aliasedTableColumn(c, alias);
+    }
+    if (is(c, SQL)) {
+      return mapColumnsInSQLToAlias(c, alias);
+    }
+    if (is(c, SQL.Aliased)) {
+      return mapColumnsInAliasedSQLToAlias(c, alias);
+    }
+    return c;
+  }));
+}
+var ColumnAliasProxyHandler, TableAliasProxyHandler, RelationTableAliasProxyHandler;
+var init_alias = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/alias.js"() {
+    init_column();
+    init_entity();
+    init_sql();
+    init_table();
+    init_view_common();
+    ColumnAliasProxyHandler = class {
+      constructor(table) {
+        this.table = table;
+      }
+      static [entityKind] = "ColumnAliasProxyHandler";
+      get(columnObj, prop) {
+        if (prop === "table") {
+          return this.table;
+        }
+        return columnObj[prop];
+      }
+    };
+    TableAliasProxyHandler = class {
+      constructor(alias, replaceOriginalName) {
+        this.alias = alias;
+        this.replaceOriginalName = replaceOriginalName;
+      }
+      static [entityKind] = "TableAliasProxyHandler";
+      get(target, prop) {
+        if (prop === Table.Symbol.IsAlias) {
+          return true;
+        }
+        if (prop === Table.Symbol.Name) {
+          return this.alias;
+        }
+        if (this.replaceOriginalName && prop === Table.Symbol.OriginalName) {
+          return this.alias;
+        }
+        if (prop === ViewBaseConfig) {
+          return {
+            ...target[ViewBaseConfig],
+            name: this.alias,
+            isAlias: true
+          };
+        }
+        if (prop === Table.Symbol.Columns) {
+          const columns = target[Table.Symbol.Columns];
+          if (!columns) {
+            return columns;
+          }
+          const proxiedColumns = {};
+          Object.keys(columns).map((key) => {
+            proxiedColumns[key] = new Proxy(
+              columns[key],
+              new ColumnAliasProxyHandler(new Proxy(target, this))
+            );
+          });
+          return proxiedColumns;
+        }
+        const value = target[prop];
+        if (is(value, Column)) {
+          return new Proxy(value, new ColumnAliasProxyHandler(new Proxy(target, this)));
+        }
+        return value;
+      }
+    };
+    RelationTableAliasProxyHandler = class {
+      constructor(alias) {
+        this.alias = alias;
+      }
+      static [entityKind] = "RelationTableAliasProxyHandler";
+      get(target, prop) {
+        if (prop === "sourceTable") {
+          return aliasedTable(target.sourceTable, this.alias);
+        }
+        return target[prop];
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/errors.js
+var DrizzleError, DrizzleQueryError, TransactionRollbackError;
+var init_errors = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/errors.js"() {
+    init_entity();
+    DrizzleError = class extends Error {
+      static [entityKind] = "DrizzleError";
+      constructor({ message, cause }) {
+        super(message);
+        this.name = "DrizzleError";
+        this.cause = cause;
+      }
+    };
+    DrizzleQueryError = class _DrizzleQueryError extends Error {
+      constructor(query, params, cause) {
+        super(`Failed query: ${query}
+params: ${params}`);
+        this.query = query;
+        this.params = params;
+        this.cause = cause;
+        Error.captureStackTrace(this, _DrizzleQueryError);
+        if (cause) this.cause = cause;
+      }
+    };
+    TransactionRollbackError = class extends DrizzleError {
+      static [entityKind] = "TransactionRollbackError";
+      constructor() {
+        super({ message: "Rollback" });
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/logger.js
+var ConsoleLogWriter, DefaultLogger, NoopLogger;
+var init_logger2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/logger.js"() {
+    init_entity();
+    ConsoleLogWriter = class {
+      static [entityKind] = "ConsoleLogWriter";
+      write(message) {
+        console.log(message);
+      }
+    };
+    DefaultLogger = class {
+      static [entityKind] = "DefaultLogger";
+      writer;
+      constructor(config2) {
+        this.writer = config2?.writer ?? new ConsoleLogWriter();
+      }
+      logQuery(query, params) {
+        const stringifiedParams = params.map((p) => {
+          try {
+            return JSON.stringify(p);
+          } catch {
+            return String(p);
+          }
+        });
+        const paramsStr = stringifiedParams.length ? ` -- params: [${stringifiedParams.join(", ")}]` : "";
+        this.writer.write(`Query: ${query}${paramsStr}`);
+      }
+    };
+    NoopLogger = class {
+      static [entityKind] = "NoopLogger";
+      logQuery() {
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/operations.js
+var init_operations = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/operations.js"() {
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/query-promise.js
+var QueryPromise;
+var init_query_promise = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/query-promise.js"() {
+    init_entity();
+    QueryPromise = class {
+      static [entityKind] = "QueryPromise";
+      [Symbol.toStringTag] = "QueryPromise";
+      catch(onRejected) {
+        return this.then(void 0, onRejected);
+      }
+      finally(onFinally) {
+        return this.then(
+          (value) => {
+            onFinally?.();
+            return value;
+          },
+          (reason) => {
+            onFinally?.();
+            throw reason;
+          }
+        );
+      }
+      then(onFulfilled, onRejected) {
+        return this.execute().then(onFulfilled, onRejected);
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/utils.js
+function mapResultRow(columns, row, joinsNotNullableMap) {
+  const nullifyMap = {};
+  const result = columns.reduce(
+    (result2, { path: path2, field }, columnIndex) => {
+      let decoder;
+      if (is(field, Column)) {
+        decoder = field;
+      } else if (is(field, SQL)) {
+        decoder = field.decoder;
+      } else if (is(field, Subquery)) {
+        decoder = field._.sql.decoder;
+      } else {
+        decoder = field.sql.decoder;
+      }
+      let node = result2;
+      for (const [pathChunkIndex, pathChunk] of path2.entries()) {
+        if (pathChunkIndex < path2.length - 1) {
+          if (!(pathChunk in node)) {
+            node[pathChunk] = {};
+          }
+          node = node[pathChunk];
+        } else {
+          const rawValue = row[columnIndex];
+          const value = node[pathChunk] = rawValue === null ? null : decoder.mapFromDriverValue(rawValue);
+          if (joinsNotNullableMap && is(field, Column) && path2.length === 2) {
+            const objectName = path2[0];
+            if (!(objectName in nullifyMap)) {
+              nullifyMap[objectName] = value === null ? getTableName(field.table) : false;
+            } else if (typeof nullifyMap[objectName] === "string" && nullifyMap[objectName] !== getTableName(field.table)) {
+              nullifyMap[objectName] = false;
+            }
+          }
+        }
+      }
+      return result2;
+    },
+    {}
+  );
+  if (joinsNotNullableMap && Object.keys(nullifyMap).length > 0) {
+    for (const [objectName, tableName] of Object.entries(nullifyMap)) {
+      if (typeof tableName === "string" && !joinsNotNullableMap[tableName]) {
+        result[objectName] = null;
+      }
+    }
+  }
+  return result;
+}
+function orderSelectedFields(fields, pathPrefix) {
+  return Object.entries(fields).reduce((result, [name, field]) => {
+    if (typeof name !== "string") {
+      return result;
+    }
+    const newPath = pathPrefix ? [...pathPrefix, name] : [name];
+    if (is(field, Column) || is(field, SQL) || is(field, SQL.Aliased) || is(field, Subquery)) {
+      result.push({ path: newPath, field });
+    } else if (is(field, Table)) {
+      result.push(...orderSelectedFields(field[Table.Symbol.Columns], newPath));
+    } else {
+      result.push(...orderSelectedFields(field, newPath));
+    }
+    return result;
+  }, []);
+}
+function haveSameKeys(left, right) {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+  for (const [index, key] of leftKeys.entries()) {
+    if (key !== rightKeys[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+function mapUpdateSet(table, values) {
+  const entries = Object.entries(values).filter(([, value]) => value !== void 0).map(([key, value]) => {
+    if (is(value, SQL) || is(value, Column)) {
+      return [key, value];
+    } else {
+      return [key, new Param(value, table[Table.Symbol.Columns][key])];
+    }
+  });
+  if (entries.length === 0) {
+    throw new Error("No values to set");
+  }
+  return Object.fromEntries(entries);
+}
+function applyMixins(baseClass, extendedClasses) {
+  for (const extendedClass of extendedClasses) {
+    for (const name of Object.getOwnPropertyNames(extendedClass.prototype)) {
+      if (name === "constructor") continue;
+      Object.defineProperty(
+        baseClass.prototype,
+        name,
+        Object.getOwnPropertyDescriptor(extendedClass.prototype, name) || /* @__PURE__ */ Object.create(null)
+      );
+    }
+  }
+}
+function getTableColumns(table) {
+  return table[Table.Symbol.Columns];
+}
+function getTableLikeName(table) {
+  return is(table, Subquery) ? table._.alias : is(table, View) ? table[ViewBaseConfig].name : is(table, SQL) ? void 0 : table[Table.Symbol.IsAlias] ? table[Table.Symbol.Name] : table[Table.Symbol.BaseName];
+}
+function getColumnNameAndConfig(a, b) {
+  return {
+    name: typeof a === "string" && a.length > 0 ? a : "",
+    config: typeof a === "object" ? a : b
+  };
+}
+function isConfig(data) {
+  if (typeof data !== "object" || data === null) return false;
+  if (data.constructor.name !== "Object") return false;
+  if ("logger" in data) {
+    const type = typeof data["logger"];
+    if (type !== "boolean" && (type !== "object" || typeof data["logger"]["logQuery"] !== "function") && type !== "undefined") return false;
+    return true;
+  }
+  if ("schema" in data) {
+    const type = typeof data["schema"];
+    if (type !== "object" && type !== "undefined") return false;
+    return true;
+  }
+  if ("casing" in data) {
+    const type = typeof data["casing"];
+    if (type !== "string" && type !== "undefined") return false;
+    return true;
+  }
+  if ("mode" in data) {
+    if (data["mode"] !== "default" || data["mode"] !== "planetscale" || data["mode"] !== void 0) return false;
+    return true;
+  }
+  if ("connection" in data) {
+    const type = typeof data["connection"];
+    if (type !== "string" && type !== "object" && type !== "undefined") return false;
+    return true;
+  }
+  if ("client" in data) {
+    const type = typeof data["client"];
+    if (type !== "object" && type !== "function" && type !== "undefined") return false;
+    return true;
+  }
+  if (Object.keys(data).length === 0) return true;
+  return false;
+}
+var textDecoder;
+var init_utils = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/utils.js"() {
+    init_column();
+    init_entity();
+    init_sql();
+    init_subquery();
+    init_table();
+    init_view_common();
+    textDecoder = typeof TextDecoder === "undefined" ? null : new TextDecoder();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/int.common.js
+var PgIntColumnBaseBuilder;
+var init_int_common = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/int.common.js"() {
+    init_entity();
+    init_common();
+    PgIntColumnBaseBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgIntColumnBaseBuilder";
+      generatedAlwaysAsIdentity(sequence) {
+        if (sequence) {
+          const { name, ...options } = sequence;
+          this.config.generatedIdentity = {
+            type: "always",
+            sequenceName: name,
+            sequenceOptions: options
+          };
+        } else {
+          this.config.generatedIdentity = {
+            type: "always"
+          };
+        }
+        this.config.hasDefault = true;
+        this.config.notNull = true;
+        return this;
+      }
+      generatedByDefaultAsIdentity(sequence) {
+        if (sequence) {
+          const { name, ...options } = sequence;
+          this.config.generatedIdentity = {
+            type: "byDefault",
+            sequenceName: name,
+            sequenceOptions: options
+          };
+        } else {
+          this.config.generatedIdentity = {
+            type: "byDefault"
+          };
+        }
+        this.config.hasDefault = true;
+        this.config.notNull = true;
+        return this;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/bigint.js
+function bigint(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  if (config2.mode === "number") {
+    return new PgBigInt53Builder(name);
+  }
+  return new PgBigInt64Builder(name);
+}
+var PgBigInt53Builder, PgBigInt53, PgBigInt64Builder, PgBigInt64;
+var init_bigint = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/bigint.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    init_int_common();
+    PgBigInt53Builder = class extends PgIntColumnBaseBuilder {
+      static [entityKind] = "PgBigInt53Builder";
+      constructor(name) {
+        super(name, "number", "PgBigInt53");
+      }
+      /** @internal */
+      build(table) {
+        return new PgBigInt53(table, this.config);
+      }
+    };
+    PgBigInt53 = class extends PgColumn {
+      static [entityKind] = "PgBigInt53";
+      getSQLType() {
+        return "bigint";
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "number") {
+          return value;
+        }
+        return Number(value);
+      }
+    };
+    PgBigInt64Builder = class extends PgIntColumnBaseBuilder {
+      static [entityKind] = "PgBigInt64Builder";
+      constructor(name) {
+        super(name, "bigint", "PgBigInt64");
+      }
+      /** @internal */
+      build(table) {
+        return new PgBigInt64(
+          table,
+          this.config
+        );
+      }
+    };
+    PgBigInt64 = class extends PgColumn {
+      static [entityKind] = "PgBigInt64";
+      getSQLType() {
+        return "bigint";
+      }
+      // eslint-disable-next-line unicorn/prefer-native-coercion-functions
+      mapFromDriverValue(value) {
+        return BigInt(value);
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/bigserial.js
+function bigserial(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  if (config2.mode === "number") {
+    return new PgBigSerial53Builder(name);
+  }
+  return new PgBigSerial64Builder(name);
+}
+var PgBigSerial53Builder, PgBigSerial53, PgBigSerial64Builder, PgBigSerial64;
+var init_bigserial = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/bigserial.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgBigSerial53Builder = class extends PgColumnBuilder {
+      static [entityKind] = "PgBigSerial53Builder";
+      constructor(name) {
+        super(name, "number", "PgBigSerial53");
+        this.config.hasDefault = true;
+        this.config.notNull = true;
+      }
+      /** @internal */
+      build(table) {
+        return new PgBigSerial53(
+          table,
+          this.config
+        );
+      }
+    };
+    PgBigSerial53 = class extends PgColumn {
+      static [entityKind] = "PgBigSerial53";
+      getSQLType() {
+        return "bigserial";
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "number") {
+          return value;
+        }
+        return Number(value);
+      }
+    };
+    PgBigSerial64Builder = class extends PgColumnBuilder {
+      static [entityKind] = "PgBigSerial64Builder";
+      constructor(name) {
+        super(name, "bigint", "PgBigSerial64");
+        this.config.hasDefault = true;
+      }
+      /** @internal */
+      build(table) {
+        return new PgBigSerial64(
+          table,
+          this.config
+        );
+      }
+    };
+    PgBigSerial64 = class extends PgColumn {
+      static [entityKind] = "PgBigSerial64";
+      getSQLType() {
+        return "bigserial";
+      }
+      // eslint-disable-next-line unicorn/prefer-native-coercion-functions
+      mapFromDriverValue(value) {
+        return BigInt(value);
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/boolean.js
+function boolean(name) {
+  return new PgBooleanBuilder(name ?? "");
+}
+var PgBooleanBuilder, PgBoolean;
+var init_boolean = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/boolean.js"() {
+    init_entity();
+    init_common();
+    PgBooleanBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgBooleanBuilder";
+      constructor(name) {
+        super(name, "boolean", "PgBoolean");
+      }
+      /** @internal */
+      build(table) {
+        return new PgBoolean(table, this.config);
+      }
+    };
+    PgBoolean = class extends PgColumn {
+      static [entityKind] = "PgBoolean";
+      getSQLType() {
+        return "boolean";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/char.js
+function char(a, b = {}) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  return new PgCharBuilder(name, config2);
+}
+var PgCharBuilder, PgChar;
+var init_char = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/char.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgCharBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgCharBuilder";
+      constructor(name, config2) {
+        super(name, "string", "PgChar");
+        this.config.length = config2.length;
+        this.config.enumValues = config2.enum;
+      }
+      /** @internal */
+      build(table) {
+        return new PgChar(
+          table,
+          this.config
+        );
+      }
+    };
+    PgChar = class extends PgColumn {
+      static [entityKind] = "PgChar";
+      length = this.config.length;
+      enumValues = this.config.enumValues;
+      getSQLType() {
+        return this.length === void 0 ? `char` : `char(${this.length})`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/cidr.js
+function cidr(name) {
+  return new PgCidrBuilder(name ?? "");
+}
+var PgCidrBuilder, PgCidr;
+var init_cidr = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/cidr.js"() {
+    init_entity();
+    init_common();
+    PgCidrBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgCidrBuilder";
+      constructor(name) {
+        super(name, "string", "PgCidr");
+      }
+      /** @internal */
+      build(table) {
+        return new PgCidr(table, this.config);
+      }
+    };
+    PgCidr = class extends PgColumn {
+      static [entityKind] = "PgCidr";
+      getSQLType() {
+        return "cidr";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/custom.js
+function customType(customTypeParams) {
+  return (a, b) => {
+    const { name, config: config2 } = getColumnNameAndConfig(a, b);
+    return new PgCustomColumnBuilder(name, config2, customTypeParams);
+  };
+}
+var PgCustomColumnBuilder, PgCustomColumn;
+var init_custom = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/custom.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgCustomColumnBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgCustomColumnBuilder";
+      constructor(name, fieldConfig, customTypeParams) {
+        super(name, "custom", "PgCustomColumn");
+        this.config.fieldConfig = fieldConfig;
+        this.config.customTypeParams = customTypeParams;
+      }
+      /** @internal */
+      build(table) {
+        return new PgCustomColumn(
+          table,
+          this.config
+        );
+      }
+    };
+    PgCustomColumn = class extends PgColumn {
+      static [entityKind] = "PgCustomColumn";
+      sqlName;
+      mapTo;
+      mapFrom;
+      constructor(table, config2) {
+        super(table, config2);
+        this.sqlName = config2.customTypeParams.dataType(config2.fieldConfig);
+        this.mapTo = config2.customTypeParams.toDriver;
+        this.mapFrom = config2.customTypeParams.fromDriver;
+      }
+      getSQLType() {
+        return this.sqlName;
+      }
+      mapFromDriverValue(value) {
+        return typeof this.mapFrom === "function" ? this.mapFrom(value) : value;
+      }
+      mapToDriverValue(value) {
+        return typeof this.mapTo === "function" ? this.mapTo(value) : value;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/date.common.js
+var PgDateColumnBaseBuilder;
+var init_date_common = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/date.common.js"() {
+    init_entity();
+    init_sql();
+    init_common();
+    PgDateColumnBaseBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgDateColumnBaseBuilder";
+      defaultNow() {
+        return this.default(sql`now()`);
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/date.js
+function date(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  if (config2?.mode === "date") {
+    return new PgDateBuilder(name);
+  }
+  return new PgDateStringBuilder(name);
+}
+var PgDateBuilder, PgDate, PgDateStringBuilder, PgDateString;
+var init_date = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/date.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    init_date_common();
+    PgDateBuilder = class extends PgDateColumnBaseBuilder {
+      static [entityKind] = "PgDateBuilder";
+      constructor(name) {
+        super(name, "date", "PgDate");
+      }
+      /** @internal */
+      build(table) {
+        return new PgDate(table, this.config);
+      }
+    };
+    PgDate = class extends PgColumn {
+      static [entityKind] = "PgDate";
+      getSQLType() {
+        return "date";
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") return new Date(value);
+        return value;
+      }
+      mapToDriverValue(value) {
+        return value.toISOString();
+      }
+    };
+    PgDateStringBuilder = class extends PgDateColumnBaseBuilder {
+      static [entityKind] = "PgDateStringBuilder";
+      constructor(name) {
+        super(name, "string", "PgDateString");
+      }
+      /** @internal */
+      build(table) {
+        return new PgDateString(
+          table,
+          this.config
+        );
+      }
+    };
+    PgDateString = class extends PgColumn {
+      static [entityKind] = "PgDateString";
+      getSQLType() {
+        return "date";
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") return value;
+        return value.toISOString().slice(0, -14);
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/double-precision.js
+function doublePrecision(name) {
+  return new PgDoublePrecisionBuilder(name ?? "");
+}
+var PgDoublePrecisionBuilder, PgDoublePrecision;
+var init_double_precision = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/double-precision.js"() {
+    init_entity();
+    init_common();
+    PgDoublePrecisionBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgDoublePrecisionBuilder";
+      constructor(name) {
+        super(name, "number", "PgDoublePrecision");
+      }
+      /** @internal */
+      build(table) {
+        return new PgDoublePrecision(
+          table,
+          this.config
+        );
+      }
+    };
+    PgDoublePrecision = class extends PgColumn {
+      static [entityKind] = "PgDoublePrecision";
+      getSQLType() {
+        return "double precision";
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") {
+          return Number.parseFloat(value);
+        }
+        return value;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/inet.js
+function inet(name) {
+  return new PgInetBuilder(name ?? "");
+}
+var PgInetBuilder, PgInet;
+var init_inet = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/inet.js"() {
+    init_entity();
+    init_common();
+    PgInetBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgInetBuilder";
+      constructor(name) {
+        super(name, "string", "PgInet");
+      }
+      /** @internal */
+      build(table) {
+        return new PgInet(table, this.config);
+      }
+    };
+    PgInet = class extends PgColumn {
+      static [entityKind] = "PgInet";
+      getSQLType() {
+        return "inet";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/integer.js
+function integer(name) {
+  return new PgIntegerBuilder(name ?? "");
+}
+var PgIntegerBuilder, PgInteger;
+var init_integer = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/integer.js"() {
+    init_entity();
+    init_common();
+    init_int_common();
+    PgIntegerBuilder = class extends PgIntColumnBaseBuilder {
+      static [entityKind] = "PgIntegerBuilder";
+      constructor(name) {
+        super(name, "number", "PgInteger");
+      }
+      /** @internal */
+      build(table) {
+        return new PgInteger(table, this.config);
+      }
+    };
+    PgInteger = class extends PgColumn {
+      static [entityKind] = "PgInteger";
+      getSQLType() {
+        return "integer";
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") {
+          return Number.parseInt(value);
+        }
+        return value;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/interval.js
+function interval(a, b = {}) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  return new PgIntervalBuilder(name, config2);
+}
+var PgIntervalBuilder, PgInterval;
+var init_interval = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/interval.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgIntervalBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgIntervalBuilder";
+      constructor(name, intervalConfig) {
+        super(name, "string", "PgInterval");
+        this.config.intervalConfig = intervalConfig;
+      }
+      /** @internal */
+      build(table) {
+        return new PgInterval(table, this.config);
+      }
+    };
+    PgInterval = class extends PgColumn {
+      static [entityKind] = "PgInterval";
+      fields = this.config.intervalConfig.fields;
+      precision = this.config.intervalConfig.precision;
+      getSQLType() {
+        const fields = this.fields ? ` ${this.fields}` : "";
+        const precision = this.precision ? `(${this.precision})` : "";
+        return `interval${fields}${precision}`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/json.js
+function json(name) {
+  return new PgJsonBuilder(name ?? "");
+}
+var PgJsonBuilder, PgJson;
+var init_json = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/json.js"() {
+    init_entity();
+    init_common();
+    PgJsonBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgJsonBuilder";
+      constructor(name) {
+        super(name, "json", "PgJson");
+      }
+      /** @internal */
+      build(table) {
+        return new PgJson(table, this.config);
+      }
+    };
+    PgJson = class extends PgColumn {
+      static [entityKind] = "PgJson";
+      constructor(table, config2) {
+        super(table, config2);
+      }
+      getSQLType() {
+        return "json";
+      }
+      mapToDriverValue(value) {
+        return JSON.stringify(value);
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") {
+          try {
+            return JSON.parse(value);
+          } catch {
+            return value;
+          }
+        }
+        return value;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/jsonb.js
+function jsonb(name) {
+  return new PgJsonbBuilder(name ?? "");
+}
+var PgJsonbBuilder, PgJsonb;
+var init_jsonb = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/jsonb.js"() {
+    init_entity();
+    init_common();
+    PgJsonbBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgJsonbBuilder";
+      constructor(name) {
+        super(name, "json", "PgJsonb");
+      }
+      /** @internal */
+      build(table) {
+        return new PgJsonb(table, this.config);
+      }
+    };
+    PgJsonb = class extends PgColumn {
+      static [entityKind] = "PgJsonb";
+      constructor(table, config2) {
+        super(table, config2);
+      }
+      getSQLType() {
+        return "jsonb";
+      }
+      mapToDriverValue(value) {
+        return JSON.stringify(value);
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") {
+          try {
+            return JSON.parse(value);
+          } catch {
+            return value;
+          }
+        }
+        return value;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/line.js
+function line(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  if (!config2?.mode || config2.mode === "tuple") {
+    return new PgLineBuilder(name);
+  }
+  return new PgLineABCBuilder(name);
+}
+var PgLineBuilder, PgLineTuple, PgLineABCBuilder, PgLineABC;
+var init_line = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/line.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgLineBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgLineBuilder";
+      constructor(name) {
+        super(name, "array", "PgLine");
+      }
+      /** @internal */
+      build(table) {
+        return new PgLineTuple(
+          table,
+          this.config
+        );
+      }
+    };
+    PgLineTuple = class extends PgColumn {
+      static [entityKind] = "PgLine";
+      getSQLType() {
+        return "line";
+      }
+      mapFromDriverValue(value) {
+        const [a, b, c] = value.slice(1, -1).split(",");
+        return [Number.parseFloat(a), Number.parseFloat(b), Number.parseFloat(c)];
+      }
+      mapToDriverValue(value) {
+        return `{${value[0]},${value[1]},${value[2]}}`;
+      }
+    };
+    PgLineABCBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgLineABCBuilder";
+      constructor(name) {
+        super(name, "json", "PgLineABC");
+      }
+      /** @internal */
+      build(table) {
+        return new PgLineABC(
+          table,
+          this.config
+        );
+      }
+    };
+    PgLineABC = class extends PgColumn {
+      static [entityKind] = "PgLineABC";
+      getSQLType() {
+        return "line";
+      }
+      mapFromDriverValue(value) {
+        const [a, b, c] = value.slice(1, -1).split(",");
+        return { a: Number.parseFloat(a), b: Number.parseFloat(b), c: Number.parseFloat(c) };
+      }
+      mapToDriverValue(value) {
+        return `{${value.a},${value.b},${value.c}}`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/macaddr.js
+function macaddr(name) {
+  return new PgMacaddrBuilder(name ?? "");
+}
+var PgMacaddrBuilder, PgMacaddr;
+var init_macaddr = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/macaddr.js"() {
+    init_entity();
+    init_common();
+    PgMacaddrBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgMacaddrBuilder";
+      constructor(name) {
+        super(name, "string", "PgMacaddr");
+      }
+      /** @internal */
+      build(table) {
+        return new PgMacaddr(table, this.config);
+      }
+    };
+    PgMacaddr = class extends PgColumn {
+      static [entityKind] = "PgMacaddr";
+      getSQLType() {
+        return "macaddr";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/macaddr8.js
+function macaddr8(name) {
+  return new PgMacaddr8Builder(name ?? "");
+}
+var PgMacaddr8Builder, PgMacaddr8;
+var init_macaddr8 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/macaddr8.js"() {
+    init_entity();
+    init_common();
+    PgMacaddr8Builder = class extends PgColumnBuilder {
+      static [entityKind] = "PgMacaddr8Builder";
+      constructor(name) {
+        super(name, "string", "PgMacaddr8");
+      }
+      /** @internal */
+      build(table) {
+        return new PgMacaddr8(table, this.config);
+      }
+    };
+    PgMacaddr8 = class extends PgColumn {
+      static [entityKind] = "PgMacaddr8";
+      getSQLType() {
+        return "macaddr8";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/numeric.js
+function numeric(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  const mode = config2?.mode;
+  return mode === "number" ? new PgNumericNumberBuilder(name, config2?.precision, config2?.scale) : mode === "bigint" ? new PgNumericBigIntBuilder(name, config2?.precision, config2?.scale) : new PgNumericBuilder(name, config2?.precision, config2?.scale);
+}
+var PgNumericBuilder, PgNumeric, PgNumericNumberBuilder, PgNumericNumber, PgNumericBigIntBuilder, PgNumericBigInt;
+var init_numeric = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/numeric.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgNumericBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgNumericBuilder";
+      constructor(name, precision, scale) {
+        super(name, "string", "PgNumeric");
+        this.config.precision = precision;
+        this.config.scale = scale;
+      }
+      /** @internal */
+      build(table) {
+        return new PgNumeric(table, this.config);
+      }
+    };
+    PgNumeric = class extends PgColumn {
+      static [entityKind] = "PgNumeric";
+      precision;
+      scale;
+      constructor(table, config2) {
+        super(table, config2);
+        this.precision = config2.precision;
+        this.scale = config2.scale;
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") return value;
+        return String(value);
+      }
+      getSQLType() {
+        if (this.precision !== void 0 && this.scale !== void 0) {
+          return `numeric(${this.precision}, ${this.scale})`;
+        } else if (this.precision === void 0) {
+          return "numeric";
+        } else {
+          return `numeric(${this.precision})`;
+        }
+      }
+    };
+    PgNumericNumberBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgNumericNumberBuilder";
+      constructor(name, precision, scale) {
+        super(name, "number", "PgNumericNumber");
+        this.config.precision = precision;
+        this.config.scale = scale;
+      }
+      /** @internal */
+      build(table) {
+        return new PgNumericNumber(
+          table,
+          this.config
+        );
+      }
+    };
+    PgNumericNumber = class extends PgColumn {
+      static [entityKind] = "PgNumericNumber";
+      precision;
+      scale;
+      constructor(table, config2) {
+        super(table, config2);
+        this.precision = config2.precision;
+        this.scale = config2.scale;
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "number") return value;
+        return Number(value);
+      }
+      mapToDriverValue = String;
+      getSQLType() {
+        if (this.precision !== void 0 && this.scale !== void 0) {
+          return `numeric(${this.precision}, ${this.scale})`;
+        } else if (this.precision === void 0) {
+          return "numeric";
+        } else {
+          return `numeric(${this.precision})`;
+        }
+      }
+    };
+    PgNumericBigIntBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgNumericBigIntBuilder";
+      constructor(name, precision, scale) {
+        super(name, "bigint", "PgNumericBigInt");
+        this.config.precision = precision;
+        this.config.scale = scale;
+      }
+      /** @internal */
+      build(table) {
+        return new PgNumericBigInt(
+          table,
+          this.config
+        );
+      }
+    };
+    PgNumericBigInt = class extends PgColumn {
+      static [entityKind] = "PgNumericBigInt";
+      precision;
+      scale;
+      constructor(table, config2) {
+        super(table, config2);
+        this.precision = config2.precision;
+        this.scale = config2.scale;
+      }
+      mapFromDriverValue = BigInt;
+      mapToDriverValue = String;
+      getSQLType() {
+        if (this.precision !== void 0 && this.scale !== void 0) {
+          return `numeric(${this.precision}, ${this.scale})`;
+        } else if (this.precision === void 0) {
+          return "numeric";
+        } else {
+          return `numeric(${this.precision})`;
+        }
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/point.js
+function point(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  if (!config2?.mode || config2.mode === "tuple") {
+    return new PgPointTupleBuilder(name);
+  }
+  return new PgPointObjectBuilder(name);
+}
+var PgPointTupleBuilder, PgPointTuple, PgPointObjectBuilder, PgPointObject;
+var init_point = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/point.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgPointTupleBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgPointTupleBuilder";
+      constructor(name) {
+        super(name, "array", "PgPointTuple");
+      }
+      /** @internal */
+      build(table) {
+        return new PgPointTuple(
+          table,
+          this.config
+        );
+      }
+    };
+    PgPointTuple = class extends PgColumn {
+      static [entityKind] = "PgPointTuple";
+      getSQLType() {
+        return "point";
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") {
+          const [x, y] = value.slice(1, -1).split(",");
+          return [Number.parseFloat(x), Number.parseFloat(y)];
+        }
+        return [value.x, value.y];
+      }
+      mapToDriverValue(value) {
+        return `(${value[0]},${value[1]})`;
+      }
+    };
+    PgPointObjectBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgPointObjectBuilder";
+      constructor(name) {
+        super(name, "json", "PgPointObject");
+      }
+      /** @internal */
+      build(table) {
+        return new PgPointObject(
+          table,
+          this.config
+        );
+      }
+    };
+    PgPointObject = class extends PgColumn {
+      static [entityKind] = "PgPointObject";
+      getSQLType() {
+        return "point";
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") {
+          const [x, y] = value.slice(1, -1).split(",");
+          return { x: Number.parseFloat(x), y: Number.parseFloat(y) };
+        }
+        return value;
+      }
+      mapToDriverValue(value) {
+        return `(${value.x},${value.y})`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/postgis_extension/utils.js
+function hexToBytes(hex) {
+  const bytes = [];
+  for (let c = 0; c < hex.length; c += 2) {
+    bytes.push(Number.parseInt(hex.slice(c, c + 2), 16));
+  }
+  return new Uint8Array(bytes);
+}
+function bytesToFloat64(bytes, offset) {
+  const buffer = new ArrayBuffer(8);
+  const view = new DataView(buffer);
+  for (let i = 0; i < 8; i++) {
+    view.setUint8(i, bytes[offset + i]);
+  }
+  return view.getFloat64(0, true);
+}
+function parseEWKB(hex) {
+  const bytes = hexToBytes(hex);
+  let offset = 0;
+  const byteOrder = bytes[offset];
+  offset += 1;
+  const view = new DataView(bytes.buffer);
+  const geomType = view.getUint32(offset, byteOrder === 1);
+  offset += 4;
+  let _srid;
+  if (geomType & 536870912) {
+    _srid = view.getUint32(offset, byteOrder === 1);
+    offset += 4;
+  }
+  if ((geomType & 65535) === 1) {
+    const x = bytesToFloat64(bytes, offset);
+    offset += 8;
+    const y = bytesToFloat64(bytes, offset);
+    offset += 8;
+    return [x, y];
+  }
+  throw new Error("Unsupported geometry type");
+}
+var init_utils2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/postgis_extension/utils.js"() {
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/postgis_extension/geometry.js
+function geometry(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  if (!config2?.mode || config2.mode === "tuple") {
+    return new PgGeometryBuilder(name);
+  }
+  return new PgGeometryObjectBuilder(name);
+}
+var PgGeometryBuilder, PgGeometry, PgGeometryObjectBuilder, PgGeometryObject;
+var init_geometry = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/postgis_extension/geometry.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    init_utils2();
+    PgGeometryBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgGeometryBuilder";
+      constructor(name) {
+        super(name, "array", "PgGeometry");
+      }
+      /** @internal */
+      build(table) {
+        return new PgGeometry(
+          table,
+          this.config
+        );
+      }
+    };
+    PgGeometry = class extends PgColumn {
+      static [entityKind] = "PgGeometry";
+      getSQLType() {
+        return "geometry(point)";
+      }
+      mapFromDriverValue(value) {
+        return parseEWKB(value);
+      }
+      mapToDriverValue(value) {
+        return `point(${value[0]} ${value[1]})`;
+      }
+    };
+    PgGeometryObjectBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgGeometryObjectBuilder";
+      constructor(name) {
+        super(name, "json", "PgGeometryObject");
+      }
+      /** @internal */
+      build(table) {
+        return new PgGeometryObject(
+          table,
+          this.config
+        );
+      }
+    };
+    PgGeometryObject = class extends PgColumn {
+      static [entityKind] = "PgGeometryObject";
+      getSQLType() {
+        return "geometry(point)";
+      }
+      mapFromDriverValue(value) {
+        const parsed = parseEWKB(value);
+        return { x: parsed[0], y: parsed[1] };
+      }
+      mapToDriverValue(value) {
+        return `point(${value.x} ${value.y})`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/real.js
+function real(name) {
+  return new PgRealBuilder(name ?? "");
+}
+var PgRealBuilder, PgReal;
+var init_real = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/real.js"() {
+    init_entity();
+    init_common();
+    PgRealBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgRealBuilder";
+      constructor(name, length) {
+        super(name, "number", "PgReal");
+        this.config.length = length;
+      }
+      /** @internal */
+      build(table) {
+        return new PgReal(table, this.config);
+      }
+    };
+    PgReal = class extends PgColumn {
+      static [entityKind] = "PgReal";
+      constructor(table, config2) {
+        super(table, config2);
+      }
+      getSQLType() {
+        return "real";
+      }
+      mapFromDriverValue = (value) => {
+        if (typeof value === "string") {
+          return Number.parseFloat(value);
+        }
+        return value;
+      };
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/serial.js
+function serial(name) {
+  return new PgSerialBuilder(name ?? "");
+}
+var PgSerialBuilder, PgSerial;
+var init_serial = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/serial.js"() {
+    init_entity();
+    init_common();
+    PgSerialBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgSerialBuilder";
+      constructor(name) {
+        super(name, "number", "PgSerial");
+        this.config.hasDefault = true;
+        this.config.notNull = true;
+      }
+      /** @internal */
+      build(table) {
+        return new PgSerial(table, this.config);
+      }
+    };
+    PgSerial = class extends PgColumn {
+      static [entityKind] = "PgSerial";
+      getSQLType() {
+        return "serial";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/smallint.js
+function smallint(name) {
+  return new PgSmallIntBuilder(name ?? "");
+}
+var PgSmallIntBuilder, PgSmallInt;
+var init_smallint = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/smallint.js"() {
+    init_entity();
+    init_common();
+    init_int_common();
+    PgSmallIntBuilder = class extends PgIntColumnBaseBuilder {
+      static [entityKind] = "PgSmallIntBuilder";
+      constructor(name) {
+        super(name, "number", "PgSmallInt");
+      }
+      /** @internal */
+      build(table) {
+        return new PgSmallInt(table, this.config);
+      }
+    };
+    PgSmallInt = class extends PgColumn {
+      static [entityKind] = "PgSmallInt";
+      getSQLType() {
+        return "smallint";
+      }
+      mapFromDriverValue = (value) => {
+        if (typeof value === "string") {
+          return Number(value);
+        }
+        return value;
+      };
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/smallserial.js
+function smallserial(name) {
+  return new PgSmallSerialBuilder(name ?? "");
+}
+var PgSmallSerialBuilder, PgSmallSerial;
+var init_smallserial = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/smallserial.js"() {
+    init_entity();
+    init_common();
+    PgSmallSerialBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgSmallSerialBuilder";
+      constructor(name) {
+        super(name, "number", "PgSmallSerial");
+        this.config.hasDefault = true;
+        this.config.notNull = true;
+      }
+      /** @internal */
+      build(table) {
+        return new PgSmallSerial(
+          table,
+          this.config
+        );
+      }
+    };
+    PgSmallSerial = class extends PgColumn {
+      static [entityKind] = "PgSmallSerial";
+      getSQLType() {
+        return "smallserial";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/text.js
+function text(a, b = {}) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  return new PgTextBuilder(name, config2);
+}
+var PgTextBuilder, PgText;
+var init_text = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/text.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgTextBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgTextBuilder";
+      constructor(name, config2) {
+        super(name, "string", "PgText");
+        this.config.enumValues = config2.enum;
+      }
+      /** @internal */
+      build(table) {
+        return new PgText(table, this.config);
+      }
+    };
+    PgText = class extends PgColumn {
+      static [entityKind] = "PgText";
+      enumValues = this.config.enumValues;
+      getSQLType() {
+        return "text";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/time.js
+function time(a, b = {}) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  return new PgTimeBuilder(name, config2.withTimezone ?? false, config2.precision);
+}
+var PgTimeBuilder, PgTime;
+var init_time = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/time.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    init_date_common();
+    PgTimeBuilder = class extends PgDateColumnBaseBuilder {
+      constructor(name, withTimezone, precision) {
+        super(name, "string", "PgTime");
+        this.withTimezone = withTimezone;
+        this.precision = precision;
+        this.config.withTimezone = withTimezone;
+        this.config.precision = precision;
+      }
+      static [entityKind] = "PgTimeBuilder";
+      /** @internal */
+      build(table) {
+        return new PgTime(table, this.config);
+      }
+    };
+    PgTime = class extends PgColumn {
+      static [entityKind] = "PgTime";
+      withTimezone;
+      precision;
+      constructor(table, config2) {
+        super(table, config2);
+        this.withTimezone = config2.withTimezone;
+        this.precision = config2.precision;
+      }
+      getSQLType() {
+        const precision = this.precision === void 0 ? "" : `(${this.precision})`;
+        return `time${precision}${this.withTimezone ? " with time zone" : ""}`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/timestamp.js
+function timestamp(a, b = {}) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  if (config2?.mode === "string") {
+    return new PgTimestampStringBuilder(name, config2.withTimezone ?? false, config2.precision);
+  }
+  return new PgTimestampBuilder(name, config2?.withTimezone ?? false, config2?.precision);
+}
+var PgTimestampBuilder, PgTimestamp, PgTimestampStringBuilder, PgTimestampString;
+var init_timestamp = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/timestamp.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    init_date_common();
+    PgTimestampBuilder = class extends PgDateColumnBaseBuilder {
+      static [entityKind] = "PgTimestampBuilder";
+      constructor(name, withTimezone, precision) {
+        super(name, "date", "PgTimestamp");
+        this.config.withTimezone = withTimezone;
+        this.config.precision = precision;
+      }
+      /** @internal */
+      build(table) {
+        return new PgTimestamp(table, this.config);
+      }
+    };
+    PgTimestamp = class extends PgColumn {
+      static [entityKind] = "PgTimestamp";
+      withTimezone;
+      precision;
+      constructor(table, config2) {
+        super(table, config2);
+        this.withTimezone = config2.withTimezone;
+        this.precision = config2.precision;
+      }
+      getSQLType() {
+        const precision = this.precision === void 0 ? "" : ` (${this.precision})`;
+        return `timestamp${precision}${this.withTimezone ? " with time zone" : ""}`;
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") return new Date(this.withTimezone ? value : value + "+0000");
+        return value;
+      }
+      mapToDriverValue = (value) => {
+        return value.toISOString();
+      };
+    };
+    PgTimestampStringBuilder = class extends PgDateColumnBaseBuilder {
+      static [entityKind] = "PgTimestampStringBuilder";
+      constructor(name, withTimezone, precision) {
+        super(name, "string", "PgTimestampString");
+        this.config.withTimezone = withTimezone;
+        this.config.precision = precision;
+      }
+      /** @internal */
+      build(table) {
+        return new PgTimestampString(
+          table,
+          this.config
+        );
+      }
+    };
+    PgTimestampString = class extends PgColumn {
+      static [entityKind] = "PgTimestampString";
+      withTimezone;
+      precision;
+      constructor(table, config2) {
+        super(table, config2);
+        this.withTimezone = config2.withTimezone;
+        this.precision = config2.precision;
+      }
+      getSQLType() {
+        const precision = this.precision === void 0 ? "" : `(${this.precision})`;
+        return `timestamp${precision}${this.withTimezone ? " with time zone" : ""}`;
+      }
+      mapFromDriverValue(value) {
+        if (typeof value === "string") return value;
+        const shortened = value.toISOString().slice(0, -1).replace("T", " ");
+        if (this.withTimezone) {
+          const offset = value.getTimezoneOffset();
+          const sign = offset <= 0 ? "+" : "-";
+          return `${shortened}${sign}${Math.floor(Math.abs(offset) / 60).toString().padStart(2, "0")}`;
+        }
+        return shortened;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/uuid.js
+function uuid(name) {
+  return new PgUUIDBuilder(name ?? "");
+}
+var PgUUIDBuilder, PgUUID;
+var init_uuid = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/uuid.js"() {
+    init_entity();
+    init_sql();
+    init_common();
+    PgUUIDBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgUUIDBuilder";
+      constructor(name) {
+        super(name, "string", "PgUUID");
+      }
+      /**
+       * Adds `default gen_random_uuid()` to the column definition.
+       */
+      defaultRandom() {
+        return this.default(sql`gen_random_uuid()`);
+      }
+      /** @internal */
+      build(table) {
+        return new PgUUID(table, this.config);
+      }
+    };
+    PgUUID = class extends PgColumn {
+      static [entityKind] = "PgUUID";
+      getSQLType() {
+        return "uuid";
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/varchar.js
+function varchar(a, b = {}) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  return new PgVarcharBuilder(name, config2);
+}
+var PgVarcharBuilder, PgVarchar;
+var init_varchar = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/varchar.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgVarcharBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgVarcharBuilder";
+      constructor(name, config2) {
+        super(name, "string", "PgVarchar");
+        this.config.length = config2.length;
+        this.config.enumValues = config2.enum;
+      }
+      /** @internal */
+      build(table) {
+        return new PgVarchar(
+          table,
+          this.config
+        );
+      }
+    };
+    PgVarchar = class extends PgColumn {
+      static [entityKind] = "PgVarchar";
+      length = this.config.length;
+      enumValues = this.config.enumValues;
+      getSQLType() {
+        return this.length === void 0 ? `varchar` : `varchar(${this.length})`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/bit.js
+function bit(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  return new PgBinaryVectorBuilder(name, config2);
+}
+var PgBinaryVectorBuilder, PgBinaryVector;
+var init_bit = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/bit.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgBinaryVectorBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgBinaryVectorBuilder";
+      constructor(name, config2) {
+        super(name, "string", "PgBinaryVector");
+        this.config.dimensions = config2.dimensions;
+      }
+      /** @internal */
+      build(table) {
+        return new PgBinaryVector(
+          table,
+          this.config
+        );
+      }
+    };
+    PgBinaryVector = class extends PgColumn {
+      static [entityKind] = "PgBinaryVector";
+      dimensions = this.config.dimensions;
+      getSQLType() {
+        return `bit(${this.dimensions})`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/halfvec.js
+function halfvec(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  return new PgHalfVectorBuilder(name, config2);
+}
+var PgHalfVectorBuilder, PgHalfVector;
+var init_halfvec = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/halfvec.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgHalfVectorBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgHalfVectorBuilder";
+      constructor(name, config2) {
+        super(name, "array", "PgHalfVector");
+        this.config.dimensions = config2.dimensions;
+      }
+      /** @internal */
+      build(table) {
+        return new PgHalfVector(
+          table,
+          this.config
+        );
+      }
+    };
+    PgHalfVector = class extends PgColumn {
+      static [entityKind] = "PgHalfVector";
+      dimensions = this.config.dimensions;
+      getSQLType() {
+        return `halfvec(${this.dimensions})`;
+      }
+      mapToDriverValue(value) {
+        return JSON.stringify(value);
+      }
+      mapFromDriverValue(value) {
+        return value.slice(1, -1).split(",").map((v) => Number.parseFloat(v));
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/sparsevec.js
+function sparsevec(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  return new PgSparseVectorBuilder(name, config2);
+}
+var PgSparseVectorBuilder, PgSparseVector;
+var init_sparsevec = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/sparsevec.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgSparseVectorBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgSparseVectorBuilder";
+      constructor(name, config2) {
+        super(name, "string", "PgSparseVector");
+        this.config.dimensions = config2.dimensions;
+      }
+      /** @internal */
+      build(table) {
+        return new PgSparseVector(
+          table,
+          this.config
+        );
+      }
+    };
+    PgSparseVector = class extends PgColumn {
+      static [entityKind] = "PgSparseVector";
+      dimensions = this.config.dimensions;
+      getSQLType() {
+        return `sparsevec(${this.dimensions})`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/vector.js
+function vector(a, b) {
+  const { name, config: config2 } = getColumnNameAndConfig(a, b);
+  return new PgVectorBuilder(name, config2);
+}
+var PgVectorBuilder, PgVector;
+var init_vector = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/vector.js"() {
+    init_entity();
+    init_utils();
+    init_common();
+    PgVectorBuilder = class extends PgColumnBuilder {
+      static [entityKind] = "PgVectorBuilder";
+      constructor(name, config2) {
+        super(name, "array", "PgVector");
+        this.config.dimensions = config2.dimensions;
+      }
+      /** @internal */
+      build(table) {
+        return new PgVector(
+          table,
+          this.config
+        );
+      }
+    };
+    PgVector = class extends PgColumn {
+      static [entityKind] = "PgVector";
+      dimensions = this.config.dimensions;
+      getSQLType() {
+        return `vector(${this.dimensions})`;
+      }
+      mapToDriverValue(value) {
+        return JSON.stringify(value);
+      }
+      mapFromDriverValue(value) {
+        return value.slice(1, -1).split(",").map((v) => Number.parseFloat(v));
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/all.js
+function getPgColumnBuilders() {
+  return {
+    bigint,
+    bigserial,
+    boolean,
+    char,
+    cidr,
+    customType,
+    date,
+    doublePrecision,
+    inet,
+    integer,
+    interval,
+    json,
+    jsonb,
+    line,
+    macaddr,
+    macaddr8,
+    numeric,
+    point,
+    geometry,
+    real,
+    serial,
+    smallint,
+    smallserial,
+    text,
+    time,
+    timestamp,
+    uuid,
+    varchar,
+    bit,
+    halfvec,
+    sparsevec,
+    vector
+  };
+}
+var init_all = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/all.js"() {
+    init_bigint();
+    init_bigserial();
+    init_boolean();
+    init_char();
+    init_cidr();
+    init_custom();
+    init_date();
+    init_double_precision();
+    init_inet();
+    init_integer();
+    init_interval();
+    init_json();
+    init_jsonb();
+    init_line();
+    init_macaddr();
+    init_macaddr8();
+    init_numeric();
+    init_point();
+    init_geometry();
+    init_real();
+    init_serial();
+    init_smallint();
+    init_smallserial();
+    init_text();
+    init_time();
+    init_timestamp();
+    init_uuid();
+    init_varchar();
+    init_bit();
+    init_halfvec();
+    init_sparsevec();
+    init_vector();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/table.js
+function pgTableWithSchema(name, columns, extraConfig, schema, baseName = name) {
+  const rawTable = new PgTable(name, schema, baseName);
+  const parsedColumns = typeof columns === "function" ? columns(getPgColumnBuilders()) : columns;
+  const builtColumns = Object.fromEntries(
+    Object.entries(parsedColumns).map(([name2, colBuilderBase]) => {
+      const colBuilder = colBuilderBase;
+      colBuilder.setName(name2);
+      const column = colBuilder.build(rawTable);
+      rawTable[InlineForeignKeys].push(...colBuilder.buildForeignKeys(column, rawTable));
+      return [name2, column];
+    })
+  );
+  const builtColumnsForExtraConfig = Object.fromEntries(
+    Object.entries(parsedColumns).map(([name2, colBuilderBase]) => {
+      const colBuilder = colBuilderBase;
+      colBuilder.setName(name2);
+      const column = colBuilder.buildExtraConfigColumn(rawTable);
+      return [name2, column];
+    })
+  );
+  const table = Object.assign(rawTable, builtColumns);
+  table[Table.Symbol.Columns] = builtColumns;
+  table[Table.Symbol.ExtraConfigColumns] = builtColumnsForExtraConfig;
+  if (extraConfig) {
+    table[PgTable.Symbol.ExtraConfigBuilder] = extraConfig;
+  }
+  return Object.assign(table, {
+    enableRLS: () => {
+      table[PgTable.Symbol.EnableRLS] = true;
+      return table;
+    }
+  });
+}
+var InlineForeignKeys, EnableRLS, PgTable, pgTable;
+var init_table2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/table.js"() {
+    init_entity();
+    init_table();
+    init_all();
+    InlineForeignKeys = /* @__PURE__ */ Symbol.for("drizzle:PgInlineForeignKeys");
+    EnableRLS = /* @__PURE__ */ Symbol.for("drizzle:EnableRLS");
+    PgTable = class extends Table {
+      static [entityKind] = "PgTable";
+      /** @internal */
+      static Symbol = Object.assign({}, Table.Symbol, {
+        InlineForeignKeys,
+        EnableRLS
+      });
+      /**@internal */
+      [InlineForeignKeys] = [];
+      /** @internal */
+      [EnableRLS] = false;
+      /** @internal */
+      [Table.Symbol.ExtraConfigBuilder] = void 0;
+      /** @internal */
+      [Table.Symbol.ExtraConfigColumns] = {};
+    };
+    pgTable = (name, columns, extraConfig) => {
+      return pgTableWithSchema(name, columns, extraConfig, void 0);
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/primary-keys.js
+var PrimaryKeyBuilder, PrimaryKey;
+var init_primary_keys = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/primary-keys.js"() {
+    init_entity();
+    init_table2();
+    PrimaryKeyBuilder = class {
+      static [entityKind] = "PgPrimaryKeyBuilder";
+      /** @internal */
+      columns;
+      /** @internal */
+      name;
+      constructor(columns, name) {
+        this.columns = columns;
+        this.name = name;
+      }
+      /** @internal */
+      build(table) {
+        return new PrimaryKey(table, this.columns, this.name);
+      }
+    };
+    PrimaryKey = class {
+      constructor(table, columns, name) {
+        this.table = table;
+        this.columns = columns;
+        this.name = name;
+      }
+      static [entityKind] = "PgPrimaryKey";
+      columns;
+      name;
+      getName() {
+        return this.name ?? `${this.table[PgTable.Symbol.Name]}_${this.columns.map((column) => column.name).join("_")}_pk`;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/expressions/conditions.js
+function bindIfParam(value, column) {
+  if (isDriverValueEncoder(column) && !isSQLWrapper(value) && !is(value, Param) && !is(value, Placeholder) && !is(value, Column) && !is(value, Table) && !is(value, View)) {
+    return new Param(value, column);
+  }
+  return value;
+}
+function and(...unfilteredConditions) {
+  const conditions = unfilteredConditions.filter(
+    (c) => c !== void 0
+  );
+  if (conditions.length === 0) {
+    return void 0;
+  }
+  if (conditions.length === 1) {
+    return new SQL(conditions);
+  }
+  return new SQL([
+    new StringChunk("("),
+    sql.join(conditions, new StringChunk(" and ")),
+    new StringChunk(")")
+  ]);
+}
+function or(...unfilteredConditions) {
+  const conditions = unfilteredConditions.filter(
+    (c) => c !== void 0
+  );
+  if (conditions.length === 0) {
+    return void 0;
+  }
+  if (conditions.length === 1) {
+    return new SQL(conditions);
+  }
+  return new SQL([
+    new StringChunk("("),
+    sql.join(conditions, new StringChunk(" or ")),
+    new StringChunk(")")
+  ]);
+}
+function not(condition) {
+  return sql`not ${condition}`;
+}
+function inArray(column, values) {
+  if (Array.isArray(values)) {
+    if (values.length === 0) {
+      return sql`false`;
+    }
+    return sql`${column} in ${values.map((v) => bindIfParam(v, column))}`;
+  }
+  return sql`${column} in ${bindIfParam(values, column)}`;
+}
+function notInArray(column, values) {
+  if (Array.isArray(values)) {
+    if (values.length === 0) {
+      return sql`true`;
+    }
+    return sql`${column} not in ${values.map((v) => bindIfParam(v, column))}`;
+  }
+  return sql`${column} not in ${bindIfParam(values, column)}`;
+}
+function isNull(value) {
+  return sql`${value} is null`;
+}
+function isNotNull(value) {
+  return sql`${value} is not null`;
+}
+function exists(subquery) {
+  return sql`exists ${subquery}`;
+}
+function notExists(subquery) {
+  return sql`not exists ${subquery}`;
+}
+function between(column, min, max) {
+  return sql`${column} between ${bindIfParam(min, column)} and ${bindIfParam(
+    max,
+    column
+  )}`;
+}
+function notBetween(column, min, max) {
+  return sql`${column} not between ${bindIfParam(
+    min,
+    column
+  )} and ${bindIfParam(max, column)}`;
+}
+function like(column, value) {
+  return sql`${column} like ${value}`;
+}
+function notLike(column, value) {
+  return sql`${column} not like ${value}`;
+}
+function ilike(column, value) {
+  return sql`${column} ilike ${value}`;
+}
+function notIlike(column, value) {
+  return sql`${column} not ilike ${value}`;
+}
+var eq, ne, gt, gte, lt, lte;
+var init_conditions = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/expressions/conditions.js"() {
+    init_column();
+    init_entity();
+    init_table();
+    init_sql();
+    eq = (left, right) => {
+      return sql`${left} = ${bindIfParam(right, left)}`;
+    };
+    ne = (left, right) => {
+      return sql`${left} <> ${bindIfParam(right, left)}`;
+    };
+    gt = (left, right) => {
+      return sql`${left} > ${bindIfParam(right, left)}`;
+    };
+    gte = (left, right) => {
+      return sql`${left} >= ${bindIfParam(right, left)}`;
+    };
+    lt = (left, right) => {
+      return sql`${left} < ${bindIfParam(right, left)}`;
+    };
+    lte = (left, right) => {
+      return sql`${left} <= ${bindIfParam(right, left)}`;
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/expressions/select.js
+function asc(column) {
+  return sql`${column} asc`;
+}
+function desc(column) {
+  return sql`${column} desc`;
+}
+var init_select = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/expressions/select.js"() {
+    init_sql();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/expressions/index.js
+var init_expressions = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/expressions/index.js"() {
+    init_conditions();
+    init_select();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/relations.js
+function getOperators() {
+  return {
+    and,
+    between,
+    eq,
+    exists,
+    gt,
+    gte,
+    ilike,
+    inArray,
+    isNull,
+    isNotNull,
+    like,
+    lt,
+    lte,
+    ne,
+    not,
+    notBetween,
+    notExists,
+    notLike,
+    notIlike,
+    notInArray,
+    or,
+    sql
+  };
+}
+function getOrderByOperators() {
+  return {
+    sql,
+    asc,
+    desc
+  };
+}
+function extractTablesRelationalConfig(schema, configHelpers) {
+  if (Object.keys(schema).length === 1 && "default" in schema && !is(schema["default"], Table)) {
+    schema = schema["default"];
+  }
+  const tableNamesMap = {};
+  const relationsBuffer = {};
+  const tablesConfig = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (is(value, Table)) {
+      const dbName = getTableUniqueName(value);
+      const bufferedRelations = relationsBuffer[dbName];
+      tableNamesMap[dbName] = key;
+      tablesConfig[key] = {
+        tsName: key,
+        dbName: value[Table.Symbol.Name],
+        schema: value[Table.Symbol.Schema],
+        columns: value[Table.Symbol.Columns],
+        relations: bufferedRelations?.relations ?? {},
+        primaryKey: bufferedRelations?.primaryKey ?? []
+      };
+      for (const column of Object.values(
+        value[Table.Symbol.Columns]
+      )) {
+        if (column.primary) {
+          tablesConfig[key].primaryKey.push(column);
+        }
+      }
+      const extraConfig = value[Table.Symbol.ExtraConfigBuilder]?.(value[Table.Symbol.ExtraConfigColumns]);
+      if (extraConfig) {
+        for (const configEntry of Object.values(extraConfig)) {
+          if (is(configEntry, PrimaryKeyBuilder)) {
+            tablesConfig[key].primaryKey.push(...configEntry.columns);
+          }
+        }
+      }
+    } else if (is(value, Relations)) {
+      const dbName = getTableUniqueName(value.table);
+      const tableName = tableNamesMap[dbName];
+      const relations2 = value.config(
+        configHelpers(value.table)
+      );
+      let primaryKey;
+      for (const [relationName, relation] of Object.entries(relations2)) {
+        if (tableName) {
+          const tableConfig = tablesConfig[tableName];
+          tableConfig.relations[relationName] = relation;
+          if (primaryKey) {
+            tableConfig.primaryKey.push(...primaryKey);
+          }
+        } else {
+          if (!(dbName in relationsBuffer)) {
+            relationsBuffer[dbName] = {
+              relations: {},
+              primaryKey
+            };
+          }
+          relationsBuffer[dbName].relations[relationName] = relation;
+        }
+      }
+    }
+  }
+  return { tables: tablesConfig, tableNamesMap };
+}
+function createOne(sourceTable) {
+  return function one(table, config2) {
+    return new One(
+      sourceTable,
+      table,
+      config2,
+      config2?.fields.reduce((res, f) => res && f.notNull, true) ?? false
+    );
+  };
+}
+function createMany(sourceTable) {
+  return function many(referencedTable, config2) {
+    return new Many(sourceTable, referencedTable, config2);
+  };
+}
+function normalizeRelation(schema, tableNamesMap, relation) {
+  if (is(relation, One) && relation.config) {
+    return {
+      fields: relation.config.fields,
+      references: relation.config.references
+    };
+  }
+  const referencedTableTsName = tableNamesMap[getTableUniqueName(relation.referencedTable)];
+  if (!referencedTableTsName) {
+    throw new Error(
+      `Table "${relation.referencedTable[Table.Symbol.Name]}" not found in schema`
+    );
+  }
+  const referencedTableConfig = schema[referencedTableTsName];
+  if (!referencedTableConfig) {
+    throw new Error(`Table "${referencedTableTsName}" not found in schema`);
+  }
+  const sourceTable = relation.sourceTable;
+  const sourceTableTsName = tableNamesMap[getTableUniqueName(sourceTable)];
+  if (!sourceTableTsName) {
+    throw new Error(
+      `Table "${sourceTable[Table.Symbol.Name]}" not found in schema`
+    );
+  }
+  const reverseRelations = [];
+  for (const referencedTableRelation of Object.values(
+    referencedTableConfig.relations
+  )) {
+    if (relation.relationName && relation !== referencedTableRelation && referencedTableRelation.relationName === relation.relationName || !relation.relationName && referencedTableRelation.referencedTable === relation.sourceTable) {
+      reverseRelations.push(referencedTableRelation);
+    }
+  }
+  if (reverseRelations.length > 1) {
+    throw relation.relationName ? new Error(
+      `There are multiple relations with name "${relation.relationName}" in table "${referencedTableTsName}"`
+    ) : new Error(
+      `There are multiple relations between "${referencedTableTsName}" and "${relation.sourceTable[Table.Symbol.Name]}". Please specify relation name`
+    );
+  }
+  if (reverseRelations[0] && is(reverseRelations[0], One) && reverseRelations[0].config) {
+    return {
+      fields: reverseRelations[0].config.references,
+      references: reverseRelations[0].config.fields
+    };
+  }
+  throw new Error(
+    `There is not enough information to infer relation "${sourceTableTsName}.${relation.fieldName}"`
+  );
+}
+function createTableRelationsHelpers(sourceTable) {
+  return {
+    one: createOne(sourceTable),
+    many: createMany(sourceTable)
+  };
+}
+function mapRelationalRow(tablesConfig, tableConfig, row, buildQueryResultSelection, mapColumnValue = (value) => value) {
+  const result = {};
+  for (const [
+    selectionItemIndex,
+    selectionItem
+  ] of buildQueryResultSelection.entries()) {
+    if (selectionItem.isJson) {
+      const relation = tableConfig.relations[selectionItem.tsKey];
+      const rawSubRows = row[selectionItemIndex];
+      const subRows = typeof rawSubRows === "string" ? JSON.parse(rawSubRows) : rawSubRows;
+      result[selectionItem.tsKey] = is(relation, One) ? subRows && mapRelationalRow(
+        tablesConfig,
+        tablesConfig[selectionItem.relationTableTsKey],
+        subRows,
+        selectionItem.selection,
+        mapColumnValue
+      ) : subRows.map(
+        (subRow) => mapRelationalRow(
+          tablesConfig,
+          tablesConfig[selectionItem.relationTableTsKey],
+          subRow,
+          selectionItem.selection,
+          mapColumnValue
+        )
+      );
+    } else {
+      const value = mapColumnValue(row[selectionItemIndex]);
+      const field = selectionItem.field;
+      let decoder;
+      if (is(field, Column)) {
+        decoder = field;
+      } else if (is(field, SQL)) {
+        decoder = field.decoder;
+      } else {
+        decoder = field.sql.decoder;
+      }
+      result[selectionItem.tsKey] = value === null ? null : decoder.mapFromDriverValue(value);
+    }
+  }
+  return result;
+}
+var Relation, Relations, One, Many;
+var init_relations = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/relations.js"() {
+    init_table();
+    init_column();
+    init_entity();
+    init_primary_keys();
+    init_expressions();
+    init_sql();
+    Relation = class {
+      constructor(sourceTable, referencedTable, relationName) {
+        this.sourceTable = sourceTable;
+        this.referencedTable = referencedTable;
+        this.relationName = relationName;
+        this.referencedTableName = referencedTable[Table.Symbol.Name];
+      }
+      static [entityKind] = "Relation";
+      referencedTableName;
+      fieldName;
+    };
+    Relations = class {
+      constructor(table, config2) {
+        this.table = table;
+        this.config = config2;
+      }
+      static [entityKind] = "Relations";
+    };
+    One = class _One extends Relation {
+      constructor(sourceTable, referencedTable, config2, isNullable) {
+        super(sourceTable, referencedTable, config2?.relationName);
+        this.config = config2;
+        this.isNullable = isNullable;
+      }
+      static [entityKind] = "One";
+      withFieldName(fieldName) {
+        const relation = new _One(
+          this.sourceTable,
+          this.referencedTable,
+          this.config,
+          this.isNullable
+        );
+        relation.fieldName = fieldName;
+        return relation;
+      }
+    };
+    Many = class _Many extends Relation {
+      constructor(sourceTable, referencedTable, config2) {
+        super(sourceTable, referencedTable, config2?.relationName);
+        this.config = config2;
+      }
+      static [entityKind] = "Many";
+      withFieldName(fieldName) {
+        const relation = new _Many(
+          this.sourceTable,
+          this.referencedTable,
+          this.config
+        );
+        relation.fieldName = fieldName;
+        return relation;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/functions/aggregate.js
+var init_aggregate = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/functions/aggregate.js"() {
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/functions/vector.js
+var init_vector2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/functions/vector.js"() {
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/functions/index.js
+var init_functions = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/functions/index.js"() {
+    init_aggregate();
+    init_vector2();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/index.js
+var init_sql2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/index.js"() {
+    init_expressions();
+    init_functions();
+    init_sql();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/index.js
+var init_drizzle_orm = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/index.js"() {
+    init_alias();
+    init_column_builder();
+    init_column();
+    init_entity();
+    init_errors();
+    init_logger2();
+    init_operations();
+    init_query_promise();
+    init_relations();
+    init_sql2();
+    init_subquery();
+    init_table();
+    init_utils();
+    init_view_common();
+  }
+});
+
 // ../../node_modules/.pnpm/postgres-array@2.0.0/node_modules/postgres-array/index.js
 var require_postgres_array = __commonJS({
   "../../node_modules/.pnpm/postgres-array@2.0.0/node_modules/postgres-array/index.js"(exports) {
@@ -29503,11 +34556,11 @@ var require_binaryParsers = __commonJS({
         var array = [];
         var i2;
         if (dimension.length > 1) {
-          var count2 = dimension.shift();
-          for (i2 = 0; i2 < count2; i2++) {
+          var count = dimension.shift();
+          for (i2 = 0; i2 < count; i2++) {
             array[i2] = parse(dimension, elementType2);
           }
-          dimension.unshift(count2);
+          dimension.unshift(count);
         } else {
           for (i2 = 0; i2 < dimension[0]; i2++) {
             array[i2] = parseElement(elementType2);
@@ -33997,6 +39050,5699 @@ var require_lib5 = __commonJS({
         return native;
       }
     });
+  }
+});
+
+// ../../node_modules/.pnpm/pg@8.23.0/node_modules/pg/esm/index.mjs
+var import_lib, Client, Pool, Connection, types, Query, DatabaseError, escapeIdentifier, escapeLiteral, Result, TypeOverrides, defaults, esm_default;
+var init_esm = __esm({
+  "../../node_modules/.pnpm/pg@8.23.0/node_modules/pg/esm/index.mjs"() {
+    import_lib = __toESM(require_lib5(), 1);
+    Client = import_lib.default.Client;
+    Pool = import_lib.default.Pool;
+    Connection = import_lib.default.Connection;
+    types = import_lib.default.types;
+    Query = import_lib.default.Query;
+    DatabaseError = import_lib.default.DatabaseError;
+    escapeIdentifier = import_lib.default.escapeIdentifier;
+    escapeLiteral = import_lib.default.escapeLiteral;
+    Result = import_lib.default.Result;
+    TypeOverrides = import_lib.default.TypeOverrides;
+    defaults = import_lib.default.defaults;
+    esm_default = import_lib.default;
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/selection-proxy.js
+var SelectionProxyHandler;
+var init_selection_proxy = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/selection-proxy.js"() {
+    init_alias();
+    init_column();
+    init_entity();
+    init_sql();
+    init_subquery();
+    init_view_common();
+    SelectionProxyHandler = class _SelectionProxyHandler {
+      static [entityKind] = "SelectionProxyHandler";
+      config;
+      constructor(config2) {
+        this.config = { ...config2 };
+      }
+      get(subquery, prop) {
+        if (prop === "_") {
+          return {
+            ...subquery["_"],
+            selectedFields: new Proxy(
+              subquery._.selectedFields,
+              this
+            )
+          };
+        }
+        if (prop === ViewBaseConfig) {
+          return {
+            ...subquery[ViewBaseConfig],
+            selectedFields: new Proxy(
+              subquery[ViewBaseConfig].selectedFields,
+              this
+            )
+          };
+        }
+        if (typeof prop === "symbol") {
+          return subquery[prop];
+        }
+        const columns = is(subquery, Subquery) ? subquery._.selectedFields : is(subquery, View) ? subquery[ViewBaseConfig].selectedFields : subquery;
+        const value = columns[prop];
+        if (is(value, SQL.Aliased)) {
+          if (this.config.sqlAliasedBehavior === "sql" && !value.isSelectionField) {
+            return value.sql;
+          }
+          const newValue = value.clone();
+          newValue.isSelectionField = true;
+          return newValue;
+        }
+        if (is(value, SQL)) {
+          if (this.config.sqlBehavior === "sql") {
+            return value;
+          }
+          throw new Error(
+            `You tried to reference "${prop}" field from a subquery, which is a raw SQL field, but it doesn't have an alias declared. Please add an alias to the field using ".as('alias')" method.`
+          );
+        }
+        if (is(value, Column)) {
+          if (this.config.alias) {
+            return new Proxy(
+              value,
+              new ColumnAliasProxyHandler(
+                new Proxy(
+                  value.table,
+                  new TableAliasProxyHandler(this.config.alias, this.config.replaceOriginalName ?? false)
+                )
+              )
+            );
+          }
+          return value;
+        }
+        if (typeof value !== "object" || value === null) {
+          return value;
+        }
+        return new Proxy(value, new _SelectionProxyHandler(this.config));
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/checks.js
+var CheckBuilder, Check;
+var init_checks = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/checks.js"() {
+    init_entity();
+    CheckBuilder = class {
+      constructor(name, value) {
+        this.name = name;
+        this.value = value;
+      }
+      static [entityKind] = "PgCheckBuilder";
+      brand;
+      /** @internal */
+      build(table) {
+        return new Check(table, this);
+      }
+    };
+    Check = class {
+      constructor(table, builder) {
+        this.table = table;
+        this.name = builder.name;
+        this.value = builder.value;
+      }
+      static [entityKind] = "PgCheck";
+      name;
+      value;
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/index.js
+var init_columns = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/index.js"() {
+    init_bigint();
+    init_bigserial();
+    init_boolean();
+    init_char();
+    init_cidr();
+    init_common();
+    init_custom();
+    init_date();
+    init_double_precision();
+    init_enum();
+    init_inet();
+    init_int_common();
+    init_integer();
+    init_interval();
+    init_json();
+    init_jsonb();
+    init_line();
+    init_macaddr();
+    init_macaddr8();
+    init_numeric();
+    init_point();
+    init_geometry();
+    init_real();
+    init_serial();
+    init_smallint();
+    init_smallserial();
+    init_text();
+    init_time();
+    init_timestamp();
+    init_uuid();
+    init_varchar();
+    init_bit();
+    init_halfvec();
+    init_sparsevec();
+    init_vector();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/indexes.js
+function uniqueIndex(name) {
+  return new IndexBuilderOn(true, name);
+}
+var IndexBuilderOn, IndexBuilder, Index;
+var init_indexes = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/indexes.js"() {
+    init_sql();
+    init_entity();
+    init_columns();
+    IndexBuilderOn = class {
+      constructor(unique, name) {
+        this.unique = unique;
+        this.name = name;
+      }
+      static [entityKind] = "PgIndexBuilderOn";
+      on(...columns) {
+        return new IndexBuilder(
+          columns.map((it) => {
+            if (is(it, SQL)) {
+              return it;
+            }
+            it = it;
+            const clonedIndexedColumn = new IndexedColumn(it.name, !!it.keyAsName, it.columnType, it.indexConfig);
+            it.indexConfig = JSON.parse(JSON.stringify(it.defaultConfig));
+            return clonedIndexedColumn;
+          }),
+          this.unique,
+          false,
+          this.name
+        );
+      }
+      onOnly(...columns) {
+        return new IndexBuilder(
+          columns.map((it) => {
+            if (is(it, SQL)) {
+              return it;
+            }
+            it = it;
+            const clonedIndexedColumn = new IndexedColumn(it.name, !!it.keyAsName, it.columnType, it.indexConfig);
+            it.indexConfig = it.defaultConfig;
+            return clonedIndexedColumn;
+          }),
+          this.unique,
+          true,
+          this.name
+        );
+      }
+      /**
+       * Specify what index method to use. Choices are `btree`, `hash`, `gist`, `spgist`, `gin`, `brin`, or user-installed access methods like `bloom`. The default method is `btree.
+       *
+       * If you have the `pg_vector` extension installed in your database, you can use the `hnsw` and `ivfflat` options, which are predefined types.
+       *
+       * **You can always specify any string you want in the method, in case Drizzle doesn't have it natively in its types**
+       *
+       * @param method The name of the index method to be used
+       * @param columns
+       * @returns
+       */
+      using(method, ...columns) {
+        return new IndexBuilder(
+          columns.map((it) => {
+            if (is(it, SQL)) {
+              return it;
+            }
+            it = it;
+            const clonedIndexedColumn = new IndexedColumn(it.name, !!it.keyAsName, it.columnType, it.indexConfig);
+            it.indexConfig = JSON.parse(JSON.stringify(it.defaultConfig));
+            return clonedIndexedColumn;
+          }),
+          this.unique,
+          true,
+          this.name,
+          method
+        );
+      }
+    };
+    IndexBuilder = class {
+      static [entityKind] = "PgIndexBuilder";
+      /** @internal */
+      config;
+      constructor(columns, unique, only, name, method = "btree") {
+        this.config = {
+          name,
+          columns,
+          unique,
+          only,
+          method
+        };
+      }
+      concurrently() {
+        this.config.concurrently = true;
+        return this;
+      }
+      with(obj) {
+        this.config.with = obj;
+        return this;
+      }
+      where(condition) {
+        this.config.where = condition;
+        return this;
+      }
+      /** @internal */
+      build(table) {
+        return new Index(this.config, table);
+      }
+    };
+    Index = class {
+      static [entityKind] = "PgIndex";
+      config;
+      constructor(config2, table) {
+        this.config = { ...config2, table };
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/policies.js
+var PgPolicy;
+var init_policies = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/policies.js"() {
+    init_entity();
+    PgPolicy = class {
+      constructor(name, config2) {
+        this.name = name;
+        if (config2) {
+          this.as = config2.as;
+          this.for = config2.for;
+          this.to = config2.to;
+          this.using = config2.using;
+          this.withCheck = config2.withCheck;
+        }
+      }
+      static [entityKind] = "PgPolicy";
+      as;
+      for;
+      to;
+      using;
+      withCheck;
+      /** @internal */
+      _linkedTable;
+      link(table) {
+        this._linkedTable = table;
+        return this;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/view-common.js
+var PgViewConfig;
+var init_view_common2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/view-common.js"() {
+    PgViewConfig = /* @__PURE__ */ Symbol.for("drizzle:PgViewConfig");
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/casing.js
+function toSnakeCase(input) {
+  const words = input.replace(/['\u2019]/g, "").match(/[\da-z]+|[A-Z]+(?![a-z])|[A-Z][\da-z]+/g) ?? [];
+  return words.map((word) => word.toLowerCase()).join("_");
+}
+function toCamelCase(input) {
+  const words = input.replace(/['\u2019]/g, "").match(/[\da-z]+|[A-Z]+(?![a-z])|[A-Z][\da-z]+/g) ?? [];
+  return words.reduce((acc, word, i) => {
+    const formattedWord = i === 0 ? word.toLowerCase() : `${word[0].toUpperCase()}${word.slice(1)}`;
+    return acc + formattedWord;
+  }, "");
+}
+function noopCase(input) {
+  return input;
+}
+var CasingCache;
+var init_casing = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/casing.js"() {
+    init_entity();
+    init_table();
+    CasingCache = class {
+      static [entityKind] = "CasingCache";
+      /** @internal */
+      cache = {};
+      cachedTables = {};
+      convert;
+      constructor(casing) {
+        this.convert = casing === "snake_case" ? toSnakeCase : casing === "camelCase" ? toCamelCase : noopCase;
+      }
+      getColumnCasing(column) {
+        if (!column.keyAsName) return column.name;
+        const schema = column.table[Table.Symbol.Schema] ?? "public";
+        const tableName = column.table[Table.Symbol.OriginalName];
+        const key = `${schema}.${tableName}.${column.name}`;
+        if (!this.cache[key]) {
+          this.cacheTable(column.table);
+        }
+        return this.cache[key];
+      }
+      cacheTable(table) {
+        const schema = table[Table.Symbol.Schema] ?? "public";
+        const tableName = table[Table.Symbol.OriginalName];
+        const tableKey = `${schema}.${tableName}`;
+        if (!this.cachedTables[tableKey]) {
+          for (const column of Object.values(table[Table.Symbol.Columns])) {
+            const columnKey = `${tableKey}.${column.name}`;
+            this.cache[columnKey] = this.convert(column.name);
+          }
+          this.cachedTables[tableKey] = true;
+        }
+      }
+      clearCache() {
+        this.cache = {};
+        this.cachedTables = {};
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/view-base.js
+var PgViewBase;
+var init_view_base = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/view-base.js"() {
+    init_entity();
+    init_sql();
+    PgViewBase = class extends View {
+      static [entityKind] = "PgViewBase";
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/dialect.js
+var PgDialect;
+var init_dialect = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/dialect.js"() {
+    init_alias();
+    init_casing();
+    init_column();
+    init_entity();
+    init_errors();
+    init_columns();
+    init_table2();
+    init_relations();
+    init_sql2();
+    init_sql();
+    init_subquery();
+    init_table();
+    init_utils();
+    init_view_common();
+    init_view_base();
+    PgDialect = class {
+      static [entityKind] = "PgDialect";
+      /** @internal */
+      casing;
+      constructor(config2) {
+        this.casing = new CasingCache(config2?.casing);
+      }
+      async migrate(migrations, session, config2) {
+        const migrationsTable = typeof config2 === "string" ? "__drizzle_migrations" : config2.migrationsTable ?? "__drizzle_migrations";
+        const migrationsSchema = typeof config2 === "string" ? "drizzle" : config2.migrationsSchema ?? "drizzle";
+        const migrationTableCreate = sql`
+			CREATE TABLE IF NOT EXISTS ${sql.identifier(migrationsSchema)}.${sql.identifier(migrationsTable)} (
+				id SERIAL PRIMARY KEY,
+				hash text NOT NULL,
+				created_at bigint
+			)
+		`;
+        await session.execute(sql`CREATE SCHEMA IF NOT EXISTS ${sql.identifier(migrationsSchema)}`);
+        await session.execute(migrationTableCreate);
+        const dbMigrations = await session.all(
+          sql`select id, hash, created_at from ${sql.identifier(migrationsSchema)}.${sql.identifier(migrationsTable)} order by created_at desc limit 1`
+        );
+        const lastDbMigration = dbMigrations[0];
+        await session.transaction(async (tx) => {
+          for await (const migration of migrations) {
+            if (!lastDbMigration || Number(lastDbMigration.created_at) < migration.folderMillis) {
+              for (const stmt of migration.sql) {
+                await tx.execute(sql.raw(stmt));
+              }
+              await tx.execute(
+                sql`insert into ${sql.identifier(migrationsSchema)}.${sql.identifier(migrationsTable)} ("hash", "created_at") values(${migration.hash}, ${migration.folderMillis})`
+              );
+            }
+          }
+        });
+      }
+      escapeName(name) {
+        return `"${name.replace(/"/g, '""')}"`;
+      }
+      escapeParam(num) {
+        return `$${num + 1}`;
+      }
+      escapeString(str) {
+        return `'${str.replace(/'/g, "''")}'`;
+      }
+      buildWithCTE(queries) {
+        if (!queries?.length) return void 0;
+        const withSqlChunks = [sql`with `];
+        for (const [i, w] of queries.entries()) {
+          withSqlChunks.push(sql`${sql.identifier(w._.alias)} as (${w._.sql})`);
+          if (i < queries.length - 1) {
+            withSqlChunks.push(sql`, `);
+          }
+        }
+        withSqlChunks.push(sql` `);
+        return sql.join(withSqlChunks);
+      }
+      buildDeleteQuery({ table, where, returning, withList }) {
+        const withSql = this.buildWithCTE(withList);
+        const returningSql = returning ? sql` returning ${this.buildSelection(returning, { isSingleTable: true })}` : void 0;
+        const whereSql = where ? sql` where ${where}` : void 0;
+        return sql`${withSql}delete from ${table}${whereSql}${returningSql}`;
+      }
+      buildUpdateSet(table, set) {
+        const tableColumns = table[Table.Symbol.Columns];
+        const columnNames = Object.keys(tableColumns).filter(
+          (colName) => set[colName] !== void 0 || tableColumns[colName]?.onUpdateFn !== void 0
+        );
+        const setSize = columnNames.length;
+        return sql.join(columnNames.flatMap((colName, i) => {
+          const col = tableColumns[colName];
+          const onUpdateFnResult = col.onUpdateFn?.();
+          const value = set[colName] ?? (is(onUpdateFnResult, SQL) ? onUpdateFnResult : sql.param(onUpdateFnResult, col));
+          const res = sql`${sql.identifier(this.casing.getColumnCasing(col))} = ${value}`;
+          if (i < setSize - 1) {
+            return [res, sql.raw(", ")];
+          }
+          return [res];
+        }));
+      }
+      buildUpdateQuery({ table, set, where, returning, withList, from, joins }) {
+        const withSql = this.buildWithCTE(withList);
+        const tableName = table[PgTable.Symbol.Name];
+        const tableSchema = table[PgTable.Symbol.Schema];
+        const origTableName = table[PgTable.Symbol.OriginalName];
+        const alias = tableName === origTableName ? void 0 : tableName;
+        const tableSql = sql`${tableSchema ? sql`${sql.identifier(tableSchema)}.` : void 0}${sql.identifier(origTableName)}${alias && sql` ${sql.identifier(alias)}`}`;
+        const setSql = this.buildUpdateSet(table, set);
+        const fromSql = from && sql.join([sql.raw(" from "), this.buildFromTable(from)]);
+        const joinsSql = this.buildJoins(joins);
+        const returningSql = returning ? sql` returning ${this.buildSelection(returning, { isSingleTable: !from })}` : void 0;
+        const whereSql = where ? sql` where ${where}` : void 0;
+        return sql`${withSql}update ${tableSql} set ${setSql}${fromSql}${joinsSql}${whereSql}${returningSql}`;
+      }
+      /**
+       * Builds selection SQL with provided fields/expressions
+       *
+       * Examples:
+       *
+       * `select <selection> from`
+       *
+       * `insert ... returning <selection>`
+       *
+       * If `isSingleTable` is true, then columns won't be prefixed with table name
+       */
+      buildSelection(fields, { isSingleTable = false } = {}) {
+        const columnsLen = fields.length;
+        const chunks = fields.flatMap(({ field }, i) => {
+          const chunk = [];
+          if (is(field, SQL.Aliased) && field.isSelectionField) {
+            chunk.push(sql.identifier(field.fieldAlias));
+          } else if (is(field, SQL.Aliased) || is(field, SQL)) {
+            const query = is(field, SQL.Aliased) ? field.sql : field;
+            if (isSingleTable) {
+              chunk.push(
+                new SQL(
+                  query.queryChunks.map((c) => {
+                    if (is(c, PgColumn)) {
+                      return sql.identifier(this.casing.getColumnCasing(c));
+                    }
+                    return c;
+                  })
+                )
+              );
+            } else {
+              chunk.push(query);
+            }
+            if (is(field, SQL.Aliased)) {
+              chunk.push(sql` as ${sql.identifier(field.fieldAlias)}`);
+            }
+          } else if (is(field, Column)) {
+            if (isSingleTable) {
+              chunk.push(sql.identifier(this.casing.getColumnCasing(field)));
+            } else {
+              chunk.push(field);
+            }
+          } else if (is(field, Subquery)) {
+            const entries = Object.entries(field._.selectedFields);
+            if (entries.length === 1) {
+              const entry = entries[0][1];
+              const fieldDecoder = is(entry, SQL) ? entry.decoder : is(entry, Column) ? { mapFromDriverValue: (v) => entry.mapFromDriverValue(v) } : entry.sql.decoder;
+              if (fieldDecoder) {
+                field._.sql.decoder = fieldDecoder;
+              }
+            }
+            chunk.push(field);
+          }
+          if (i < columnsLen - 1) {
+            chunk.push(sql`, `);
+          }
+          return chunk;
+        });
+        return sql.join(chunks);
+      }
+      buildJoins(joins) {
+        if (!joins || joins.length === 0) {
+          return void 0;
+        }
+        const joinsArray = [];
+        for (const [index, joinMeta] of joins.entries()) {
+          if (index === 0) {
+            joinsArray.push(sql` `);
+          }
+          const table = joinMeta.table;
+          const lateralSql = joinMeta.lateral ? sql` lateral` : void 0;
+          const onSql = joinMeta.on ? sql` on ${joinMeta.on}` : void 0;
+          if (is(table, PgTable)) {
+            const tableName = table[PgTable.Symbol.Name];
+            const tableSchema = table[PgTable.Symbol.Schema];
+            const origTableName = table[PgTable.Symbol.OriginalName];
+            const alias = tableName === origTableName ? void 0 : joinMeta.alias;
+            joinsArray.push(
+              sql`${sql.raw(joinMeta.joinType)} join${lateralSql} ${tableSchema ? sql`${sql.identifier(tableSchema)}.` : void 0}${sql.identifier(origTableName)}${alias && sql` ${sql.identifier(alias)}`}${onSql}`
+            );
+          } else if (is(table, View)) {
+            const viewName = table[ViewBaseConfig].name;
+            const viewSchema = table[ViewBaseConfig].schema;
+            const origViewName = table[ViewBaseConfig].originalName;
+            const alias = viewName === origViewName ? void 0 : joinMeta.alias;
+            joinsArray.push(
+              sql`${sql.raw(joinMeta.joinType)} join${lateralSql} ${viewSchema ? sql`${sql.identifier(viewSchema)}.` : void 0}${sql.identifier(origViewName)}${alias && sql` ${sql.identifier(alias)}`}${onSql}`
+            );
+          } else {
+            joinsArray.push(
+              sql`${sql.raw(joinMeta.joinType)} join${lateralSql} ${table}${onSql}`
+            );
+          }
+          if (index < joins.length - 1) {
+            joinsArray.push(sql` `);
+          }
+        }
+        return sql.join(joinsArray);
+      }
+      buildFromTable(table) {
+        if (is(table, Table) && table[Table.Symbol.IsAlias]) {
+          let fullName = sql`${sql.identifier(table[Table.Symbol.OriginalName])}`;
+          if (table[Table.Symbol.Schema]) {
+            fullName = sql`${sql.identifier(table[Table.Symbol.Schema])}.${fullName}`;
+          }
+          return sql`${fullName} ${sql.identifier(table[Table.Symbol.Name])}`;
+        }
+        return table;
+      }
+      buildSelectQuery({
+        withList,
+        fields,
+        fieldsFlat,
+        where,
+        having,
+        table,
+        joins,
+        orderBy,
+        groupBy,
+        limit,
+        offset,
+        lockingClause,
+        distinct,
+        setOperators
+      }) {
+        const fieldsList = fieldsFlat ?? orderSelectedFields(fields);
+        for (const f of fieldsList) {
+          if (is(f.field, Column) && getTableName(f.field.table) !== (is(table, Subquery) ? table._.alias : is(table, PgViewBase) ? table[ViewBaseConfig].name : is(table, SQL) ? void 0 : getTableName(table)) && !((table2) => joins?.some(
+            ({ alias }) => alias === (table2[Table.Symbol.IsAlias] ? getTableName(table2) : table2[Table.Symbol.BaseName])
+          ))(f.field.table)) {
+            const tableName = getTableName(f.field.table);
+            throw new Error(
+              `Your "${f.path.join("->")}" field references a column "${tableName}"."${f.field.name}", but the table "${tableName}" is not part of the query! Did you forget to join it?`
+            );
+          }
+        }
+        const isSingleTable = !joins || joins.length === 0;
+        const withSql = this.buildWithCTE(withList);
+        let distinctSql;
+        if (distinct) {
+          distinctSql = distinct === true ? sql` distinct` : sql` distinct on (${sql.join(distinct.on, sql`, `)})`;
+        }
+        const selection = this.buildSelection(fieldsList, { isSingleTable });
+        const tableSql = this.buildFromTable(table);
+        const joinsSql = this.buildJoins(joins);
+        const whereSql = where ? sql` where ${where}` : void 0;
+        const havingSql = having ? sql` having ${having}` : void 0;
+        let orderBySql;
+        if (orderBy && orderBy.length > 0) {
+          orderBySql = sql` order by ${sql.join(orderBy, sql`, `)}`;
+        }
+        let groupBySql;
+        if (groupBy && groupBy.length > 0) {
+          groupBySql = sql` group by ${sql.join(groupBy, sql`, `)}`;
+        }
+        const limitSql = typeof limit === "object" || typeof limit === "number" && limit >= 0 ? sql` limit ${limit}` : void 0;
+        const offsetSql = offset ? sql` offset ${offset}` : void 0;
+        const lockingClauseSql = sql.empty();
+        if (lockingClause) {
+          const clauseSql = sql` for ${sql.raw(lockingClause.strength)}`;
+          if (lockingClause.config.of) {
+            clauseSql.append(
+              sql` of ${sql.join(
+                Array.isArray(lockingClause.config.of) ? lockingClause.config.of : [lockingClause.config.of],
+                sql`, `
+              )}`
+            );
+          }
+          if (lockingClause.config.noWait) {
+            clauseSql.append(sql` nowait`);
+          } else if (lockingClause.config.skipLocked) {
+            clauseSql.append(sql` skip locked`);
+          }
+          lockingClauseSql.append(clauseSql);
+        }
+        const finalQuery = sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
+        if (setOperators.length > 0) {
+          return this.buildSetOperations(finalQuery, setOperators);
+        }
+        return finalQuery;
+      }
+      buildSetOperations(leftSelect, setOperators) {
+        const [setOperator, ...rest] = setOperators;
+        if (!setOperator) {
+          throw new Error("Cannot pass undefined values to any set operator");
+        }
+        if (rest.length === 0) {
+          return this.buildSetOperationQuery({ leftSelect, setOperator });
+        }
+        return this.buildSetOperations(
+          this.buildSetOperationQuery({ leftSelect, setOperator }),
+          rest
+        );
+      }
+      buildSetOperationQuery({
+        leftSelect,
+        setOperator: { type, isAll, rightSelect, limit, orderBy, offset }
+      }) {
+        const leftChunk = sql`(${leftSelect.getSQL()}) `;
+        const rightChunk = sql`(${rightSelect.getSQL()})`;
+        let orderBySql;
+        if (orderBy && orderBy.length > 0) {
+          const orderByValues = [];
+          for (const singleOrderBy of orderBy) {
+            if (is(singleOrderBy, PgColumn)) {
+              orderByValues.push(sql.identifier(singleOrderBy.name));
+            } else if (is(singleOrderBy, SQL)) {
+              for (let i = 0; i < singleOrderBy.queryChunks.length; i++) {
+                const chunk = singleOrderBy.queryChunks[i];
+                if (is(chunk, PgColumn)) {
+                  singleOrderBy.queryChunks[i] = sql.identifier(chunk.name);
+                }
+              }
+              orderByValues.push(sql`${singleOrderBy}`);
+            } else {
+              orderByValues.push(sql`${singleOrderBy}`);
+            }
+          }
+          orderBySql = sql` order by ${sql.join(orderByValues, sql`, `)} `;
+        }
+        const limitSql = typeof limit === "object" || typeof limit === "number" && limit >= 0 ? sql` limit ${limit}` : void 0;
+        const operatorChunk = sql.raw(`${type} ${isAll ? "all " : ""}`);
+        const offsetSql = offset ? sql` offset ${offset}` : void 0;
+        return sql`${leftChunk}${operatorChunk}${rightChunk}${orderBySql}${limitSql}${offsetSql}`;
+      }
+      buildInsertQuery({ table, values: valuesOrSelect, onConflict, returning, withList, select, overridingSystemValue_ }) {
+        const valuesSqlList = [];
+        const columns = table[Table.Symbol.Columns];
+        const colEntries = Object.entries(columns).filter(([_, col]) => !col.shouldDisableInsert());
+        const insertOrder = colEntries.map(
+          ([, column]) => sql.identifier(this.casing.getColumnCasing(column))
+        );
+        if (select) {
+          const select2 = valuesOrSelect;
+          if (is(select2, SQL)) {
+            valuesSqlList.push(select2);
+          } else {
+            valuesSqlList.push(select2.getSQL());
+          }
+        } else {
+          const values = valuesOrSelect;
+          valuesSqlList.push(sql.raw("values "));
+          for (const [valueIndex, value] of values.entries()) {
+            const valueList = [];
+            for (const [fieldName, col] of colEntries) {
+              const colValue = value[fieldName];
+              if (colValue === void 0 || is(colValue, Param) && colValue.value === void 0) {
+                if (col.defaultFn !== void 0) {
+                  const defaultFnResult = col.defaultFn();
+                  const defaultValue = is(defaultFnResult, SQL) ? defaultFnResult : sql.param(defaultFnResult, col);
+                  valueList.push(defaultValue);
+                } else if (!col.default && col.onUpdateFn !== void 0) {
+                  const onUpdateFnResult = col.onUpdateFn();
+                  const newValue = is(onUpdateFnResult, SQL) ? onUpdateFnResult : sql.param(onUpdateFnResult, col);
+                  valueList.push(newValue);
+                } else {
+                  valueList.push(sql`default`);
+                }
+              } else {
+                valueList.push(colValue);
+              }
+            }
+            valuesSqlList.push(valueList);
+            if (valueIndex < values.length - 1) {
+              valuesSqlList.push(sql`, `);
+            }
+          }
+        }
+        const withSql = this.buildWithCTE(withList);
+        const valuesSql = sql.join(valuesSqlList);
+        const returningSql = returning ? sql` returning ${this.buildSelection(returning, { isSingleTable: true })}` : void 0;
+        const onConflictSql = onConflict ? sql` on conflict ${onConflict}` : void 0;
+        const overridingSql = overridingSystemValue_ === true ? sql`overriding system value ` : void 0;
+        return sql`${withSql}insert into ${table} ${insertOrder} ${overridingSql}${valuesSql}${onConflictSql}${returningSql}`;
+      }
+      buildRefreshMaterializedViewQuery({ view, concurrently, withNoData }) {
+        const concurrentlySql = concurrently ? sql` concurrently` : void 0;
+        const withNoDataSql = withNoData ? sql` with no data` : void 0;
+        return sql`refresh materialized view${concurrentlySql} ${view}${withNoDataSql}`;
+      }
+      prepareTyping(encoder) {
+        if (is(encoder, PgJsonb) || is(encoder, PgJson)) {
+          return "json";
+        } else if (is(encoder, PgNumeric)) {
+          return "decimal";
+        } else if (is(encoder, PgTime)) {
+          return "time";
+        } else if (is(encoder, PgTimestamp) || is(encoder, PgTimestampString)) {
+          return "timestamp";
+        } else if (is(encoder, PgDate) || is(encoder, PgDateString)) {
+          return "date";
+        } else if (is(encoder, PgUUID)) {
+          return "uuid";
+        } else {
+          return "none";
+        }
+      }
+      sqlToQuery(sql2, invokeSource) {
+        return sql2.toQuery({
+          casing: this.casing,
+          escapeName: this.escapeName,
+          escapeParam: this.escapeParam,
+          escapeString: this.escapeString,
+          prepareTyping: this.prepareTyping,
+          invokeSource
+        });
+      }
+      // buildRelationalQueryWithPK({
+      // 	fullSchema,
+      // 	schema,
+      // 	tableNamesMap,
+      // 	table,
+      // 	tableConfig,
+      // 	queryConfig: config,
+      // 	tableAlias,
+      // 	isRoot = false,
+      // 	joinOn,
+      // }: {
+      // 	fullSchema: Record<string, unknown>;
+      // 	schema: TablesRelationalConfig;
+      // 	tableNamesMap: Record<string, string>;
+      // 	table: PgTable;
+      // 	tableConfig: TableRelationalConfig;
+      // 	queryConfig: true | DBQueryConfig<'many', true>;
+      // 	tableAlias: string;
+      // 	isRoot?: boolean;
+      // 	joinOn?: SQL;
+      // }): BuildRelationalQueryResult<PgTable, PgColumn> {
+      // 	// For { "<relation>": true }, return a table with selection of all columns
+      // 	if (config === true) {
+      // 		const selectionEntries = Object.entries(tableConfig.columns);
+      // 		const selection: BuildRelationalQueryResult<PgTable, PgColumn>['selection'] = selectionEntries.map((
+      // 			[key, value],
+      // 		) => ({
+      // 			dbKey: value.name,
+      // 			tsKey: key,
+      // 			field: value as PgColumn,
+      // 			relationTableTsKey: undefined,
+      // 			isJson: false,
+      // 			selection: [],
+      // 		}));
+      // 		return {
+      // 			tableTsKey: tableConfig.tsName,
+      // 			sql: table,
+      // 			selection,
+      // 		};
+      // 	}
+      // 	// let selection: BuildRelationalQueryResult<PgTable, PgColumn>['selection'] = [];
+      // 	// let selectionForBuild = selection;
+      // 	const aliasedColumns = Object.fromEntries(
+      // 		Object.entries(tableConfig.columns).map(([key, value]) => [key, aliasedTableColumn(value, tableAlias)]),
+      // 	);
+      // 	const aliasedRelations = Object.fromEntries(
+      // 		Object.entries(tableConfig.relations).map(([key, value]) => [key, aliasedRelation(value, tableAlias)]),
+      // 	);
+      // 	const aliasedFields = Object.assign({}, aliasedColumns, aliasedRelations);
+      // 	let where, hasUserDefinedWhere;
+      // 	if (config.where) {
+      // 		const whereSql = typeof config.where === 'function' ? config.where(aliasedFields, operators) : config.where;
+      // 		where = whereSql && mapColumnsInSQLToAlias(whereSql, tableAlias);
+      // 		hasUserDefinedWhere = !!where;
+      // 	}
+      // 	where = and(joinOn, where);
+      // 	// const fieldsSelection: { tsKey: string; value: PgColumn | SQL.Aliased; isExtra?: boolean }[] = [];
+      // 	let joins: Join[] = [];
+      // 	let selectedColumns: string[] = [];
+      // 	// Figure out which columns to select
+      // 	if (config.columns) {
+      // 		let isIncludeMode = false;
+      // 		for (const [field, value] of Object.entries(config.columns)) {
+      // 			if (value === undefined) {
+      // 				continue;
+      // 			}
+      // 			if (field in tableConfig.columns) {
+      // 				if (!isIncludeMode && value === true) {
+      // 					isIncludeMode = true;
+      // 				}
+      // 				selectedColumns.push(field);
+      // 			}
+      // 		}
+      // 		if (selectedColumns.length > 0) {
+      // 			selectedColumns = isIncludeMode
+      // 				? selectedColumns.filter((c) => config.columns?.[c] === true)
+      // 				: Object.keys(tableConfig.columns).filter((key) => !selectedColumns.includes(key));
+      // 		}
+      // 	} else {
+      // 		// Select all columns if selection is not specified
+      // 		selectedColumns = Object.keys(tableConfig.columns);
+      // 	}
+      // 	// for (const field of selectedColumns) {
+      // 	// 	const column = tableConfig.columns[field]! as PgColumn;
+      // 	// 	fieldsSelection.push({ tsKey: field, value: column });
+      // 	// }
+      // 	let initiallySelectedRelations: {
+      // 		tsKey: string;
+      // 		queryConfig: true | DBQueryConfig<'many', false>;
+      // 		relation: Relation;
+      // 	}[] = [];
+      // 	// let selectedRelations: BuildRelationalQueryResult<PgTable, PgColumn>['selection'] = [];
+      // 	// Figure out which relations to select
+      // 	if (config.with) {
+      // 		initiallySelectedRelations = Object.entries(config.with)
+      // 			.filter((entry): entry is [typeof entry[0], NonNullable<typeof entry[1]>] => !!entry[1])
+      // 			.map(([tsKey, queryConfig]) => ({ tsKey, queryConfig, relation: tableConfig.relations[tsKey]! }));
+      // 	}
+      // 	const manyRelations = initiallySelectedRelations.filter((r) =>
+      // 		is(r.relation, Many)
+      // 		&& (schema[tableNamesMap[r.relation.referencedTable[Table.Symbol.Name]]!]?.primaryKey.length ?? 0) > 0
+      // 	);
+      // 	// If this is the last Many relation (or there are no Many relations), we are on the innermost subquery level
+      // 	const isInnermostQuery = manyRelations.length < 2;
+      // 	const selectedExtras: {
+      // 		tsKey: string;
+      // 		value: SQL.Aliased;
+      // 	}[] = [];
+      // 	// Figure out which extras to select
+      // 	if (isInnermostQuery && config.extras) {
+      // 		const extras = typeof config.extras === 'function'
+      // 			? config.extras(aliasedFields, { sql })
+      // 			: config.extras;
+      // 		for (const [tsKey, value] of Object.entries(extras)) {
+      // 			selectedExtras.push({
+      // 				tsKey,
+      // 				value: mapColumnsInAliasedSQLToAlias(value, tableAlias),
+      // 			});
+      // 		}
+      // 	}
+      // 	// Transform `fieldsSelection` into `selection`
+      // 	// `fieldsSelection` shouldn't be used after this point
+      // 	// for (const { tsKey, value, isExtra } of fieldsSelection) {
+      // 	// 	selection.push({
+      // 	// 		dbKey: is(value, SQL.Aliased) ? value.fieldAlias : tableConfig.columns[tsKey]!.name,
+      // 	// 		tsKey,
+      // 	// 		field: is(value, Column) ? aliasedTableColumn(value, tableAlias) : value,
+      // 	// 		relationTableTsKey: undefined,
+      // 	// 		isJson: false,
+      // 	// 		isExtra,
+      // 	// 		selection: [],
+      // 	// 	});
+      // 	// }
+      // 	let orderByOrig = typeof config.orderBy === 'function'
+      // 		? config.orderBy(aliasedFields, orderByOperators)
+      // 		: config.orderBy ?? [];
+      // 	if (!Array.isArray(orderByOrig)) {
+      // 		orderByOrig = [orderByOrig];
+      // 	}
+      // 	const orderBy = orderByOrig.map((orderByValue) => {
+      // 		if (is(orderByValue, Column)) {
+      // 			return aliasedTableColumn(orderByValue, tableAlias) as PgColumn;
+      // 		}
+      // 		return mapColumnsInSQLToAlias(orderByValue, tableAlias);
+      // 	});
+      // 	const limit = isInnermostQuery ? config.limit : undefined;
+      // 	const offset = isInnermostQuery ? config.offset : undefined;
+      // 	// For non-root queries without additional config except columns, return a table with selection
+      // 	if (
+      // 		!isRoot
+      // 		&& initiallySelectedRelations.length === 0
+      // 		&& selectedExtras.length === 0
+      // 		&& !where
+      // 		&& orderBy.length === 0
+      // 		&& limit === undefined
+      // 		&& offset === undefined
+      // 	) {
+      // 		return {
+      // 			tableTsKey: tableConfig.tsName,
+      // 			sql: table,
+      // 			selection: selectedColumns.map((key) => ({
+      // 				dbKey: tableConfig.columns[key]!.name,
+      // 				tsKey: key,
+      // 				field: tableConfig.columns[key] as PgColumn,
+      // 				relationTableTsKey: undefined,
+      // 				isJson: false,
+      // 				selection: [],
+      // 			})),
+      // 		};
+      // 	}
+      // 	const selectedRelationsWithoutPK:
+      // 	// Process all relations without primary keys, because they need to be joined differently and will all be on the same query level
+      // 	for (
+      // 		const {
+      // 			tsKey: selectedRelationTsKey,
+      // 			queryConfig: selectedRelationConfigValue,
+      // 			relation,
+      // 		} of initiallySelectedRelations
+      // 	) {
+      // 		const normalizedRelation = normalizeRelation(schema, tableNamesMap, relation);
+      // 		const relationTableName = relation.referencedTable[Table.Symbol.Name];
+      // 		const relationTableTsName = tableNamesMap[relationTableName]!;
+      // 		const relationTable = schema[relationTableTsName]!;
+      // 		if (relationTable.primaryKey.length > 0) {
+      // 			continue;
+      // 		}
+      // 		const relationTableAlias = `${tableAlias}_${selectedRelationTsKey}`;
+      // 		const joinOn = and(
+      // 			...normalizedRelation.fields.map((field, i) =>
+      // 				eq(
+      // 					aliasedTableColumn(normalizedRelation.references[i]!, relationTableAlias),
+      // 					aliasedTableColumn(field, tableAlias),
+      // 				)
+      // 			),
+      // 		);
+      // 		const builtRelation = this.buildRelationalQueryWithoutPK({
+      // 			fullSchema,
+      // 			schema,
+      // 			tableNamesMap,
+      // 			table: fullSchema[relationTableTsName] as PgTable,
+      // 			tableConfig: schema[relationTableTsName]!,
+      // 			queryConfig: selectedRelationConfigValue,
+      // 			tableAlias: relationTableAlias,
+      // 			joinOn,
+      // 			nestedQueryRelation: relation,
+      // 		});
+      // 		const field = sql`${sql.identifier(relationTableAlias)}.${sql.identifier('data')}`.as(selectedRelationTsKey);
+      // 		joins.push({
+      // 			on: sql`true`,
+      // 			table: new Subquery(builtRelation.sql as SQL, {}, relationTableAlias),
+      // 			alias: relationTableAlias,
+      // 			joinType: 'left',
+      // 			lateral: true,
+      // 		});
+      // 		selectedRelations.push({
+      // 			dbKey: selectedRelationTsKey,
+      // 			tsKey: selectedRelationTsKey,
+      // 			field,
+      // 			relationTableTsKey: relationTableTsName,
+      // 			isJson: true,
+      // 			selection: builtRelation.selection,
+      // 		});
+      // 	}
+      // 	const oneRelations = initiallySelectedRelations.filter((r): r is typeof r & { relation: One } =>
+      // 		is(r.relation, One)
+      // 	);
+      // 	// Process all One relations with PKs, because they can all be joined on the same level
+      // 	for (
+      // 		const {
+      // 			tsKey: selectedRelationTsKey,
+      // 			queryConfig: selectedRelationConfigValue,
+      // 			relation,
+      // 		} of oneRelations
+      // 	) {
+      // 		const normalizedRelation = normalizeRelation(schema, tableNamesMap, relation);
+      // 		const relationTableName = relation.referencedTable[Table.Symbol.Name];
+      // 		const relationTableTsName = tableNamesMap[relationTableName]!;
+      // 		const relationTableAlias = `${tableAlias}_${selectedRelationTsKey}`;
+      // 		const relationTable = schema[relationTableTsName]!;
+      // 		if (relationTable.primaryKey.length === 0) {
+      // 			continue;
+      // 		}
+      // 		const joinOn = and(
+      // 			...normalizedRelation.fields.map((field, i) =>
+      // 				eq(
+      // 					aliasedTableColumn(normalizedRelation.references[i]!, relationTableAlias),
+      // 					aliasedTableColumn(field, tableAlias),
+      // 				)
+      // 			),
+      // 		);
+      // 		const builtRelation = this.buildRelationalQueryWithPK({
+      // 			fullSchema,
+      // 			schema,
+      // 			tableNamesMap,
+      // 			table: fullSchema[relationTableTsName] as PgTable,
+      // 			tableConfig: schema[relationTableTsName]!,
+      // 			queryConfig: selectedRelationConfigValue,
+      // 			tableAlias: relationTableAlias,
+      // 			joinOn,
+      // 		});
+      // 		const field = sql`case when ${sql.identifier(relationTableAlias)} is null then null else json_build_array(${
+      // 			sql.join(
+      // 				builtRelation.selection.map(({ field }) =>
+      // 					is(field, SQL.Aliased)
+      // 						? sql`${sql.identifier(relationTableAlias)}.${sql.identifier(field.fieldAlias)}`
+      // 						: is(field, Column)
+      // 						? aliasedTableColumn(field, relationTableAlias)
+      // 						: field
+      // 				),
+      // 				sql`, `,
+      // 			)
+      // 		}) end`.as(selectedRelationTsKey);
+      // 		const isLateralJoin = is(builtRelation.sql, SQL);
+      // 		joins.push({
+      // 			on: isLateralJoin ? sql`true` : joinOn,
+      // 			table: is(builtRelation.sql, SQL)
+      // 				? new Subquery(builtRelation.sql, {}, relationTableAlias)
+      // 				: aliasedTable(builtRelation.sql, relationTableAlias),
+      // 			alias: relationTableAlias,
+      // 			joinType: 'left',
+      // 			lateral: is(builtRelation.sql, SQL),
+      // 		});
+      // 		selectedRelations.push({
+      // 			dbKey: selectedRelationTsKey,
+      // 			tsKey: selectedRelationTsKey,
+      // 			field,
+      // 			relationTableTsKey: relationTableTsName,
+      // 			isJson: true,
+      // 			selection: builtRelation.selection,
+      // 		});
+      // 	}
+      // 	let distinct: PgSelectConfig['distinct'];
+      // 	let tableFrom: PgTable | Subquery = table;
+      // 	// Process first Many relation - each one requires a nested subquery
+      // 	const manyRelation = manyRelations[0];
+      // 	if (manyRelation) {
+      // 		const {
+      // 			tsKey: selectedRelationTsKey,
+      // 			queryConfig: selectedRelationQueryConfig,
+      // 			relation,
+      // 		} = manyRelation;
+      // 		distinct = {
+      // 			on: tableConfig.primaryKey.map((c) => aliasedTableColumn(c as PgColumn, tableAlias)),
+      // 		};
+      // 		const normalizedRelation = normalizeRelation(schema, tableNamesMap, relation);
+      // 		const relationTableName = relation.referencedTable[Table.Symbol.Name];
+      // 		const relationTableTsName = tableNamesMap[relationTableName]!;
+      // 		const relationTableAlias = `${tableAlias}_${selectedRelationTsKey}`;
+      // 		const joinOn = and(
+      // 			...normalizedRelation.fields.map((field, i) =>
+      // 				eq(
+      // 					aliasedTableColumn(normalizedRelation.references[i]!, relationTableAlias),
+      // 					aliasedTableColumn(field, tableAlias),
+      // 				)
+      // 			),
+      // 		);
+      // 		const builtRelationJoin = this.buildRelationalQueryWithPK({
+      // 			fullSchema,
+      // 			schema,
+      // 			tableNamesMap,
+      // 			table: fullSchema[relationTableTsName] as PgTable,
+      // 			tableConfig: schema[relationTableTsName]!,
+      // 			queryConfig: selectedRelationQueryConfig,
+      // 			tableAlias: relationTableAlias,
+      // 			joinOn,
+      // 		});
+      // 		const builtRelationSelectionField = sql`case when ${
+      // 			sql.identifier(relationTableAlias)
+      // 		} is null then '[]' else json_agg(json_build_array(${
+      // 			sql.join(
+      // 				builtRelationJoin.selection.map(({ field }) =>
+      // 					is(field, SQL.Aliased)
+      // 						? sql`${sql.identifier(relationTableAlias)}.${sql.identifier(field.fieldAlias)}`
+      // 						: is(field, Column)
+      // 						? aliasedTableColumn(field, relationTableAlias)
+      // 						: field
+      // 				),
+      // 				sql`, `,
+      // 			)
+      // 		})) over (partition by ${sql.join(distinct.on, sql`, `)}) end`.as(selectedRelationTsKey);
+      // 		const isLateralJoin = is(builtRelationJoin.sql, SQL);
+      // 		joins.push({
+      // 			on: isLateralJoin ? sql`true` : joinOn,
+      // 			table: isLateralJoin
+      // 				? new Subquery(builtRelationJoin.sql as SQL, {}, relationTableAlias)
+      // 				: aliasedTable(builtRelationJoin.sql as PgTable, relationTableAlias),
+      // 			alias: relationTableAlias,
+      // 			joinType: 'left',
+      // 			lateral: isLateralJoin,
+      // 		});
+      // 		// Build the "from" subquery with the remaining Many relations
+      // 		const builtTableFrom = this.buildRelationalQueryWithPK({
+      // 			fullSchema,
+      // 			schema,
+      // 			tableNamesMap,
+      // 			table,
+      // 			tableConfig,
+      // 			queryConfig: {
+      // 				...config,
+      // 				where: undefined,
+      // 				orderBy: undefined,
+      // 				limit: undefined,
+      // 				offset: undefined,
+      // 				with: manyRelations.slice(1).reduce<NonNullable<typeof config['with']>>(
+      // 					(result, { tsKey, queryConfig: configValue }) => {
+      // 						result[tsKey] = configValue;
+      // 						return result;
+      // 					},
+      // 					{},
+      // 				),
+      // 			},
+      // 			tableAlias,
+      // 		});
+      // 		selectedRelations.push({
+      // 			dbKey: selectedRelationTsKey,
+      // 			tsKey: selectedRelationTsKey,
+      // 			field: builtRelationSelectionField,
+      // 			relationTableTsKey: relationTableTsName,
+      // 			isJson: true,
+      // 			selection: builtRelationJoin.selection,
+      // 		});
+      // 		// selection = builtTableFrom.selection.map((item) =>
+      // 		// 	is(item.field, SQL.Aliased)
+      // 		// 		? { ...item, field: sql`${sql.identifier(tableAlias)}.${sql.identifier(item.field.fieldAlias)}` }
+      // 		// 		: item
+      // 		// );
+      // 		// selectionForBuild = [{
+      // 		// 	dbKey: '*',
+      // 		// 	tsKey: '*',
+      // 		// 	field: sql`${sql.identifier(tableAlias)}.*`,
+      // 		// 	selection: [],
+      // 		// 	isJson: false,
+      // 		// 	relationTableTsKey: undefined,
+      // 		// }];
+      // 		// const newSelectionItem: (typeof selection)[number] = {
+      // 		// 	dbKey: selectedRelationTsKey,
+      // 		// 	tsKey: selectedRelationTsKey,
+      // 		// 	field,
+      // 		// 	relationTableTsKey: relationTableTsName,
+      // 		// 	isJson: true,
+      // 		// 	selection: builtRelationJoin.selection,
+      // 		// };
+      // 		// selection.push(newSelectionItem);
+      // 		// selectionForBuild.push(newSelectionItem);
+      // 		tableFrom = is(builtTableFrom.sql, PgTable)
+      // 			? builtTableFrom.sql
+      // 			: new Subquery(builtTableFrom.sql, {}, tableAlias);
+      // 	}
+      // 	if (selectedColumns.length === 0 && selectedRelations.length === 0 && selectedExtras.length === 0) {
+      // 		throw new DrizzleError(`No fields selected for table "${tableConfig.tsName}" ("${tableAlias}")`);
+      // 	}
+      // 	let selection: BuildRelationalQueryResult<PgTable, PgColumn>['selection'];
+      // 	function prepareSelectedColumns() {
+      // 		return selectedColumns.map((key) => ({
+      // 			dbKey: tableConfig.columns[key]!.name,
+      // 			tsKey: key,
+      // 			field: tableConfig.columns[key] as PgColumn,
+      // 			relationTableTsKey: undefined,
+      // 			isJson: false,
+      // 			selection: [],
+      // 		}));
+      // 	}
+      // 	function prepareSelectedExtras() {
+      // 		return selectedExtras.map((item) => ({
+      // 			dbKey: item.value.fieldAlias,
+      // 			tsKey: item.tsKey,
+      // 			field: item.value,
+      // 			relationTableTsKey: undefined,
+      // 			isJson: false,
+      // 			selection: [],
+      // 		}));
+      // 	}
+      // 	if (isRoot) {
+      // 		selection = [
+      // 			...prepareSelectedColumns(),
+      // 			...prepareSelectedExtras(),
+      // 		];
+      // 	}
+      // 	if (hasUserDefinedWhere || orderBy.length > 0) {
+      // 		tableFrom = new Subquery(
+      // 			this.buildSelectQuery({
+      // 				table: is(tableFrom, PgTable) ? aliasedTable(tableFrom, tableAlias) : tableFrom,
+      // 				fields: {},
+      // 				fieldsFlat: selectionForBuild.map(({ field }) => ({
+      // 					path: [],
+      // 					field: is(field, Column) ? aliasedTableColumn(field, tableAlias) : field,
+      // 				})),
+      // 				joins,
+      // 				distinct,
+      // 			}),
+      // 			{},
+      // 			tableAlias,
+      // 		);
+      // 		selectionForBuild = selection.map((item) =>
+      // 			is(item.field, SQL.Aliased)
+      // 				? { ...item, field: sql`${sql.identifier(tableAlias)}.${sql.identifier(item.field.fieldAlias)}` }
+      // 				: item
+      // 		);
+      // 		joins = [];
+      // 		distinct = undefined;
+      // 	}
+      // 	const result = this.buildSelectQuery({
+      // 		table: is(tableFrom, PgTable) ? aliasedTable(tableFrom, tableAlias) : tableFrom,
+      // 		fields: {},
+      // 		fieldsFlat: selectionForBuild.map(({ field }) => ({
+      // 			path: [],
+      // 			field: is(field, Column) ? aliasedTableColumn(field, tableAlias) : field,
+      // 		})),
+      // 		where,
+      // 		limit,
+      // 		offset,
+      // 		joins,
+      // 		orderBy,
+      // 		distinct,
+      // 	});
+      // 	return {
+      // 		tableTsKey: tableConfig.tsName,
+      // 		sql: result,
+      // 		selection,
+      // 	};
+      // }
+      buildRelationalQueryWithoutPK({
+        fullSchema,
+        schema,
+        tableNamesMap,
+        table,
+        tableConfig,
+        queryConfig: config2,
+        tableAlias,
+        nestedQueryRelation,
+        joinOn
+      }) {
+        let selection = [];
+        let limit, offset, orderBy = [], where;
+        const joins = [];
+        if (config2 === true) {
+          const selectionEntries = Object.entries(tableConfig.columns);
+          selection = selectionEntries.map(([key, value]) => ({
+            dbKey: value.name,
+            tsKey: key,
+            field: aliasedTableColumn(value, tableAlias),
+            relationTableTsKey: void 0,
+            isJson: false,
+            selection: []
+          }));
+        } else {
+          const aliasedColumns = Object.fromEntries(
+            Object.entries(tableConfig.columns).map(([key, value]) => [key, aliasedTableColumn(value, tableAlias)])
+          );
+          if (config2.where) {
+            const whereSql = typeof config2.where === "function" ? config2.where(aliasedColumns, getOperators()) : config2.where;
+            where = whereSql && mapColumnsInSQLToAlias(whereSql, tableAlias);
+          }
+          const fieldsSelection = [];
+          let selectedColumns = [];
+          if (config2.columns) {
+            let isIncludeMode = false;
+            for (const [field, value] of Object.entries(config2.columns)) {
+              if (value === void 0) {
+                continue;
+              }
+              if (field in tableConfig.columns) {
+                if (!isIncludeMode && value === true) {
+                  isIncludeMode = true;
+                }
+                selectedColumns.push(field);
+              }
+            }
+            if (selectedColumns.length > 0) {
+              selectedColumns = isIncludeMode ? selectedColumns.filter((c) => config2.columns?.[c] === true) : Object.keys(tableConfig.columns).filter((key) => !selectedColumns.includes(key));
+            }
+          } else {
+            selectedColumns = Object.keys(tableConfig.columns);
+          }
+          for (const field of selectedColumns) {
+            const column = tableConfig.columns[field];
+            fieldsSelection.push({ tsKey: field, value: column });
+          }
+          let selectedRelations = [];
+          if (config2.with) {
+            selectedRelations = Object.entries(config2.with).filter((entry) => !!entry[1]).map(([tsKey, queryConfig]) => ({ tsKey, queryConfig, relation: tableConfig.relations[tsKey] }));
+          }
+          let extras;
+          if (config2.extras) {
+            extras = typeof config2.extras === "function" ? config2.extras(aliasedColumns, { sql }) : config2.extras;
+            for (const [tsKey, value] of Object.entries(extras)) {
+              fieldsSelection.push({
+                tsKey,
+                value: mapColumnsInAliasedSQLToAlias(value, tableAlias)
+              });
+            }
+          }
+          for (const { tsKey, value } of fieldsSelection) {
+            selection.push({
+              dbKey: is(value, SQL.Aliased) ? value.fieldAlias : tableConfig.columns[tsKey].name,
+              tsKey,
+              field: is(value, Column) ? aliasedTableColumn(value, tableAlias) : value,
+              relationTableTsKey: void 0,
+              isJson: false,
+              selection: []
+            });
+          }
+          let orderByOrig = typeof config2.orderBy === "function" ? config2.orderBy(aliasedColumns, getOrderByOperators()) : config2.orderBy ?? [];
+          if (!Array.isArray(orderByOrig)) {
+            orderByOrig = [orderByOrig];
+          }
+          orderBy = orderByOrig.map((orderByValue) => {
+            if (is(orderByValue, Column)) {
+              return aliasedTableColumn(orderByValue, tableAlias);
+            }
+            return mapColumnsInSQLToAlias(orderByValue, tableAlias);
+          });
+          limit = config2.limit;
+          offset = config2.offset;
+          for (const {
+            tsKey: selectedRelationTsKey,
+            queryConfig: selectedRelationConfigValue,
+            relation
+          } of selectedRelations) {
+            const normalizedRelation = normalizeRelation(schema, tableNamesMap, relation);
+            const relationTableName = getTableUniqueName(relation.referencedTable);
+            const relationTableTsName = tableNamesMap[relationTableName];
+            const relationTableAlias = `${tableAlias}_${selectedRelationTsKey}`;
+            const joinOn2 = and(
+              ...normalizedRelation.fields.map(
+                (field2, i) => eq(
+                  aliasedTableColumn(normalizedRelation.references[i], relationTableAlias),
+                  aliasedTableColumn(field2, tableAlias)
+                )
+              )
+            );
+            const builtRelation = this.buildRelationalQueryWithoutPK({
+              fullSchema,
+              schema,
+              tableNamesMap,
+              table: fullSchema[relationTableTsName],
+              tableConfig: schema[relationTableTsName],
+              queryConfig: is(relation, One) ? selectedRelationConfigValue === true ? { limit: 1 } : { ...selectedRelationConfigValue, limit: 1 } : selectedRelationConfigValue,
+              tableAlias: relationTableAlias,
+              joinOn: joinOn2,
+              nestedQueryRelation: relation
+            });
+            const field = sql`${sql.identifier(relationTableAlias)}.${sql.identifier("data")}`.as(selectedRelationTsKey);
+            joins.push({
+              on: sql`true`,
+              table: new Subquery(builtRelation.sql, {}, relationTableAlias),
+              alias: relationTableAlias,
+              joinType: "left",
+              lateral: true
+            });
+            selection.push({
+              dbKey: selectedRelationTsKey,
+              tsKey: selectedRelationTsKey,
+              field,
+              relationTableTsKey: relationTableTsName,
+              isJson: true,
+              selection: builtRelation.selection
+            });
+          }
+        }
+        if (selection.length === 0) {
+          throw new DrizzleError({ message: `No fields selected for table "${tableConfig.tsName}" ("${tableAlias}")` });
+        }
+        let result;
+        where = and(joinOn, where);
+        if (nestedQueryRelation) {
+          let field = sql`json_build_array(${sql.join(
+            selection.map(
+              ({ field: field2, tsKey, isJson }) => isJson ? sql`${sql.identifier(`${tableAlias}_${tsKey}`)}.${sql.identifier("data")}` : is(field2, SQL.Aliased) ? field2.sql : field2
+            ),
+            sql`, `
+          )})`;
+          if (is(nestedQueryRelation, Many)) {
+            field = sql`coalesce(json_agg(${field}${orderBy.length > 0 ? sql` order by ${sql.join(orderBy, sql`, `)}` : void 0}), '[]'::json)`;
+          }
+          const nestedSelection = [{
+            dbKey: "data",
+            tsKey: "data",
+            field: field.as("data"),
+            isJson: true,
+            relationTableTsKey: tableConfig.tsName,
+            selection
+          }];
+          const needsSubquery = limit !== void 0 || offset !== void 0 || orderBy.length > 0;
+          if (needsSubquery) {
+            result = this.buildSelectQuery({
+              table: aliasedTable(table, tableAlias),
+              fields: {},
+              fieldsFlat: [{
+                path: [],
+                field: sql.raw("*")
+              }],
+              where,
+              limit,
+              offset,
+              orderBy,
+              setOperators: []
+            });
+            where = void 0;
+            limit = void 0;
+            offset = void 0;
+            orderBy = [];
+          } else {
+            result = aliasedTable(table, tableAlias);
+          }
+          result = this.buildSelectQuery({
+            table: is(result, PgTable) ? result : new Subquery(result, {}, tableAlias),
+            fields: {},
+            fieldsFlat: nestedSelection.map(({ field: field2 }) => ({
+              path: [],
+              field: is(field2, Column) ? aliasedTableColumn(field2, tableAlias) : field2
+            })),
+            joins,
+            where,
+            limit,
+            offset,
+            orderBy,
+            setOperators: []
+          });
+        } else {
+          result = this.buildSelectQuery({
+            table: aliasedTable(table, tableAlias),
+            fields: {},
+            fieldsFlat: selection.map(({ field }) => ({
+              path: [],
+              field: is(field, Column) ? aliasedTableColumn(field, tableAlias) : field
+            })),
+            joins,
+            where,
+            limit,
+            offset,
+            orderBy,
+            setOperators: []
+          });
+        }
+        return {
+          tableTsKey: tableConfig.tsName,
+          sql: result,
+          selection
+        };
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/query-builders/query-builder.js
+var TypedQueryBuilder;
+var init_query_builder = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/query-builders/query-builder.js"() {
+    init_entity();
+    TypedQueryBuilder = class {
+      static [entityKind] = "TypedQueryBuilder";
+      /** @internal */
+      getSelectedFields() {
+        return this._.selectedFields;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/select.js
+function createSetOperator(type, isAll) {
+  return (leftSelect, rightSelect, ...restSelects) => {
+    const setOperators = [rightSelect, ...restSelects].map((select) => ({
+      type,
+      isAll,
+      rightSelect: select
+    }));
+    for (const setOperator of setOperators) {
+      if (!haveSameKeys(leftSelect.getSelectedFields(), setOperator.rightSelect.getSelectedFields())) {
+        throw new Error(
+          "Set operator error (union / intersect / except): selected fields are not the same or are in a different order"
+        );
+      }
+    }
+    return leftSelect.addSetOperators(setOperators);
+  };
+}
+var PgSelectBuilder, PgSelectQueryBuilderBase, PgSelectBase, getPgSetOperators, union, unionAll, intersect, intersectAll, except, exceptAll;
+var init_select2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/select.js"() {
+    init_entity();
+    init_view_base();
+    init_query_builder();
+    init_query_promise();
+    init_selection_proxy();
+    init_sql();
+    init_subquery();
+    init_table();
+    init_tracing();
+    init_utils();
+    init_utils();
+    init_view_common();
+    init_utils3();
+    PgSelectBuilder = class {
+      static [entityKind] = "PgSelectBuilder";
+      fields;
+      session;
+      dialect;
+      withList = [];
+      distinct;
+      constructor(config2) {
+        this.fields = config2.fields;
+        this.session = config2.session;
+        this.dialect = config2.dialect;
+        if (config2.withList) {
+          this.withList = config2.withList;
+        }
+        this.distinct = config2.distinct;
+      }
+      authToken;
+      /** @internal */
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      /**
+       * Specify the table, subquery, or other target that you're
+       * building a select query against.
+       *
+       * {@link https://www.postgresql.org/docs/current/sql-select.html#SQL-FROM | Postgres from documentation}
+       */
+      from(source) {
+        const isPartialSelect = !!this.fields;
+        const src = source;
+        let fields;
+        if (this.fields) {
+          fields = this.fields;
+        } else if (is(src, Subquery)) {
+          fields = Object.fromEntries(
+            Object.keys(src._.selectedFields).map((key) => [key, src[key]])
+          );
+        } else if (is(src, PgViewBase)) {
+          fields = src[ViewBaseConfig].selectedFields;
+        } else if (is(src, SQL)) {
+          fields = {};
+        } else {
+          fields = getTableColumns(src);
+        }
+        return new PgSelectBase({
+          table: src,
+          fields,
+          isPartialSelect,
+          session: this.session,
+          dialect: this.dialect,
+          withList: this.withList,
+          distinct: this.distinct
+        }).setToken(this.authToken);
+      }
+    };
+    PgSelectQueryBuilderBase = class extends TypedQueryBuilder {
+      static [entityKind] = "PgSelectQueryBuilder";
+      _;
+      config;
+      joinsNotNullableMap;
+      tableName;
+      isPartialSelect;
+      session;
+      dialect;
+      cacheConfig = void 0;
+      usedTables = /* @__PURE__ */ new Set();
+      constructor({ table, fields, isPartialSelect, session, dialect, withList, distinct }) {
+        super();
+        this.config = {
+          withList,
+          table,
+          fields: { ...fields },
+          distinct,
+          setOperators: []
+        };
+        this.isPartialSelect = isPartialSelect;
+        this.session = session;
+        this.dialect = dialect;
+        this._ = {
+          selectedFields: fields,
+          config: this.config
+        };
+        this.tableName = getTableLikeName(table);
+        this.joinsNotNullableMap = typeof this.tableName === "string" ? { [this.tableName]: true } : {};
+        for (const item of extractUsedTable(table)) this.usedTables.add(item);
+      }
+      /** @internal */
+      getUsedTables() {
+        return [...this.usedTables];
+      }
+      createJoin(joinType, lateral) {
+        return (table, on) => {
+          const baseTableName = this.tableName;
+          const tableName = getTableLikeName(table);
+          for (const item of extractUsedTable(table)) this.usedTables.add(item);
+          if (typeof tableName === "string" && this.config.joins?.some((join) => join.alias === tableName)) {
+            throw new Error(`Alias "${tableName}" is already used in this query`);
+          }
+          if (!this.isPartialSelect) {
+            if (Object.keys(this.joinsNotNullableMap).length === 1 && typeof baseTableName === "string") {
+              this.config.fields = {
+                [baseTableName]: this.config.fields
+              };
+            }
+            if (typeof tableName === "string" && !is(table, SQL)) {
+              const selection = is(table, Subquery) ? table._.selectedFields : is(table, View) ? table[ViewBaseConfig].selectedFields : table[Table.Symbol.Columns];
+              this.config.fields[tableName] = selection;
+            }
+          }
+          if (typeof on === "function") {
+            on = on(
+              new Proxy(
+                this.config.fields,
+                new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
+              )
+            );
+          }
+          if (!this.config.joins) {
+            this.config.joins = [];
+          }
+          this.config.joins.push({ on, table, joinType, alias: tableName, lateral });
+          if (typeof tableName === "string") {
+            switch (joinType) {
+              case "left": {
+                this.joinsNotNullableMap[tableName] = false;
+                break;
+              }
+              case "right": {
+                this.joinsNotNullableMap = Object.fromEntries(
+                  Object.entries(this.joinsNotNullableMap).map(([key]) => [key, false])
+                );
+                this.joinsNotNullableMap[tableName] = true;
+                break;
+              }
+              case "cross":
+              case "inner": {
+                this.joinsNotNullableMap[tableName] = true;
+                break;
+              }
+              case "full": {
+                this.joinsNotNullableMap = Object.fromEntries(
+                  Object.entries(this.joinsNotNullableMap).map(([key]) => [key, false])
+                );
+                this.joinsNotNullableMap[tableName] = false;
+                break;
+              }
+            }
+          }
+          return this;
+        };
+      }
+      /**
+       * Executes a `left join` operation by adding another table to the current query.
+       *
+       * Calling this method associates each row of the table with the corresponding row from the joined table, if a match is found. If no matching row exists, it sets all columns of the joined table to null.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/joins#left-join}
+       *
+       * @param table the table to join.
+       * @param on the `on` clause.
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all users and their pets
+       * const usersWithPets: { user: User; pets: Pet | null; }[] = await db.select()
+       *   .from(users)
+       *   .leftJoin(pets, eq(users.id, pets.ownerId))
+       *
+       * // Select userId and petId
+       * const usersIdsAndPetIds: { userId: number; petId: number | null; }[] = await db.select({
+       *   userId: users.id,
+       *   petId: pets.id,
+       * })
+       *   .from(users)
+       *   .leftJoin(pets, eq(users.id, pets.ownerId))
+       * ```
+       */
+      leftJoin = this.createJoin("left", false);
+      /**
+       * Executes a `left join lateral` operation by adding subquery to the current query.
+       *
+       * A `lateral` join allows the right-hand expression to refer to columns from the left-hand side.
+       *
+       * Calling this method associates each row of the table with the corresponding row from the joined table, if a match is found. If no matching row exists, it sets all columns of the joined table to null.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/joins#left-join-lateral}
+       *
+       * @param table the subquery to join.
+       * @param on the `on` clause.
+       */
+      leftJoinLateral = this.createJoin("left", true);
+      /**
+       * Executes a `right join` operation by adding another table to the current query.
+       *
+       * Calling this method associates each row of the joined table with the corresponding row from the main table, if a match is found. If no matching row exists, it sets all columns of the main table to null.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/joins#right-join}
+       *
+       * @param table the table to join.
+       * @param on the `on` clause.
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all users and their pets
+       * const usersWithPets: { user: User | null; pets: Pet; }[] = await db.select()
+       *   .from(users)
+       *   .rightJoin(pets, eq(users.id, pets.ownerId))
+       *
+       * // Select userId and petId
+       * const usersIdsAndPetIds: { userId: number | null; petId: number; }[] = await db.select({
+       *   userId: users.id,
+       *   petId: pets.id,
+       * })
+       *   .from(users)
+       *   .rightJoin(pets, eq(users.id, pets.ownerId))
+       * ```
+       */
+      rightJoin = this.createJoin("right", false);
+      /**
+       * Executes an `inner join` operation, creating a new table by combining rows from two tables that have matching values.
+       *
+       * Calling this method retrieves rows that have corresponding entries in both joined tables. Rows without matching entries in either table are excluded, resulting in a table that includes only matching pairs.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/joins#inner-join}
+       *
+       * @param table the table to join.
+       * @param on the `on` clause.
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all users and their pets
+       * const usersWithPets: { user: User; pets: Pet; }[] = await db.select()
+       *   .from(users)
+       *   .innerJoin(pets, eq(users.id, pets.ownerId))
+       *
+       * // Select userId and petId
+       * const usersIdsAndPetIds: { userId: number; petId: number; }[] = await db.select({
+       *   userId: users.id,
+       *   petId: pets.id,
+       * })
+       *   .from(users)
+       *   .innerJoin(pets, eq(users.id, pets.ownerId))
+       * ```
+       */
+      innerJoin = this.createJoin("inner", false);
+      /**
+       * Executes an `inner join lateral` operation, creating a new table by combining rows from two queries that have matching values.
+       *
+       * A `lateral` join allows the right-hand expression to refer to columns from the left-hand side.
+       *
+       * Calling this method retrieves rows that have corresponding entries in both joined tables. Rows without matching entries in either table are excluded, resulting in a table that includes only matching pairs.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/joins#inner-join-lateral}
+       *
+       * @param table the subquery to join.
+       * @param on the `on` clause.
+       */
+      innerJoinLateral = this.createJoin("inner", true);
+      /**
+       * Executes a `full join` operation by combining rows from two tables into a new table.
+       *
+       * Calling this method retrieves all rows from both main and joined tables, merging rows with matching values and filling in `null` for non-matching columns.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/joins#full-join}
+       *
+       * @param table the table to join.
+       * @param on the `on` clause.
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all users and their pets
+       * const usersWithPets: { user: User | null; pets: Pet | null; }[] = await db.select()
+       *   .from(users)
+       *   .fullJoin(pets, eq(users.id, pets.ownerId))
+       *
+       * // Select userId and petId
+       * const usersIdsAndPetIds: { userId: number | null; petId: number | null; }[] = await db.select({
+       *   userId: users.id,
+       *   petId: pets.id,
+       * })
+       *   .from(users)
+       *   .fullJoin(pets, eq(users.id, pets.ownerId))
+       * ```
+       */
+      fullJoin = this.createJoin("full", false);
+      /**
+       * Executes a `cross join` operation by combining rows from two tables into a new table.
+       *
+       * Calling this method retrieves all rows from both main and joined tables, merging all rows from each table.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/joins#cross-join}
+       *
+       * @param table the table to join.
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all users, each user with every pet
+       * const usersWithPets: { user: User; pets: Pet; }[] = await db.select()
+       *   .from(users)
+       *   .crossJoin(pets)
+       *
+       * // Select userId and petId
+       * const usersIdsAndPetIds: { userId: number; petId: number; }[] = await db.select({
+       *   userId: users.id,
+       *   petId: pets.id,
+       * })
+       *   .from(users)
+       *   .crossJoin(pets)
+       * ```
+       */
+      crossJoin = this.createJoin("cross", false);
+      /**
+       * Executes a `cross join lateral` operation by combining rows from two queries into a new table.
+       *
+       * A `lateral` join allows the right-hand expression to refer to columns from the left-hand side.
+       *
+       * Calling this method retrieves all rows from both main and joined queries, merging all rows from each query.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/joins#cross-join-lateral}
+       *
+       * @param table the query to join.
+       */
+      crossJoinLateral = this.createJoin("cross", true);
+      createSetOperator(type, isAll) {
+        return (rightSelection) => {
+          const rightSelect = typeof rightSelection === "function" ? rightSelection(getPgSetOperators()) : rightSelection;
+          if (!haveSameKeys(this.getSelectedFields(), rightSelect.getSelectedFields())) {
+            throw new Error(
+              "Set operator error (union / intersect / except): selected fields are not the same or are in a different order"
+            );
+          }
+          this.config.setOperators.push({ type, isAll, rightSelect });
+          return this;
+        };
+      }
+      /**
+       * Adds `union` set operator to the query.
+       *
+       * Calling this method will combine the result sets of the `select` statements and remove any duplicate rows that appear across them.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/set-operations#union}
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all unique names from customers and users tables
+       * await db.select({ name: users.name })
+       *   .from(users)
+       *   .union(
+       *     db.select({ name: customers.name }).from(customers)
+       *   );
+       * // or
+       * import { union } from 'drizzle-orm/pg-core'
+       *
+       * await union(
+       *   db.select({ name: users.name }).from(users),
+       *   db.select({ name: customers.name }).from(customers)
+       * );
+       * ```
+       */
+      union = this.createSetOperator("union", false);
+      /**
+       * Adds `union all` set operator to the query.
+       *
+       * Calling this method will combine the result-set of the `select` statements and keep all duplicate rows that appear across them.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/set-operations#union-all}
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all transaction ids from both online and in-store sales
+       * await db.select({ transaction: onlineSales.transactionId })
+       *   .from(onlineSales)
+       *   .unionAll(
+       *     db.select({ transaction: inStoreSales.transactionId }).from(inStoreSales)
+       *   );
+       * // or
+       * import { unionAll } from 'drizzle-orm/pg-core'
+       *
+       * await unionAll(
+       *   db.select({ transaction: onlineSales.transactionId }).from(onlineSales),
+       *   db.select({ transaction: inStoreSales.transactionId }).from(inStoreSales)
+       * );
+       * ```
+       */
+      unionAll = this.createSetOperator("union", true);
+      /**
+       * Adds `intersect` set operator to the query.
+       *
+       * Calling this method will retain only the rows that are present in both result sets and eliminate duplicates.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/set-operations#intersect}
+       *
+       * @example
+       *
+       * ```ts
+       * // Select course names that are offered in both departments A and B
+       * await db.select({ courseName: depA.courseName })
+       *   .from(depA)
+       *   .intersect(
+       *     db.select({ courseName: depB.courseName }).from(depB)
+       *   );
+       * // or
+       * import { intersect } from 'drizzle-orm/pg-core'
+       *
+       * await intersect(
+       *   db.select({ courseName: depA.courseName }).from(depA),
+       *   db.select({ courseName: depB.courseName }).from(depB)
+       * );
+       * ```
+       */
+      intersect = this.createSetOperator("intersect", false);
+      /**
+       * Adds `intersect all` set operator to the query.
+       *
+       * Calling this method will retain only the rows that are present in both result sets including all duplicates.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/set-operations#intersect-all}
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all products and quantities that are ordered by both regular and VIP customers
+       * await db.select({
+       *   productId: regularCustomerOrders.productId,
+       *   quantityOrdered: regularCustomerOrders.quantityOrdered
+       * })
+       * .from(regularCustomerOrders)
+       * .intersectAll(
+       *   db.select({
+       *     productId: vipCustomerOrders.productId,
+       *     quantityOrdered: vipCustomerOrders.quantityOrdered
+       *   })
+       *   .from(vipCustomerOrders)
+       * );
+       * // or
+       * import { intersectAll } from 'drizzle-orm/pg-core'
+       *
+       * await intersectAll(
+       *   db.select({
+       *     productId: regularCustomerOrders.productId,
+       *     quantityOrdered: regularCustomerOrders.quantityOrdered
+       *   })
+       *   .from(regularCustomerOrders),
+       *   db.select({
+       *     productId: vipCustomerOrders.productId,
+       *     quantityOrdered: vipCustomerOrders.quantityOrdered
+       *   })
+       *   .from(vipCustomerOrders)
+       * );
+       * ```
+       */
+      intersectAll = this.createSetOperator("intersect", true);
+      /**
+       * Adds `except` set operator to the query.
+       *
+       * Calling this method will retrieve all unique rows from the left query, except for the rows that are present in the result set of the right query.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/set-operations#except}
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all courses offered in department A but not in department B
+       * await db.select({ courseName: depA.courseName })
+       *   .from(depA)
+       *   .except(
+       *     db.select({ courseName: depB.courseName }).from(depB)
+       *   );
+       * // or
+       * import { except } from 'drizzle-orm/pg-core'
+       *
+       * await except(
+       *   db.select({ courseName: depA.courseName }).from(depA),
+       *   db.select({ courseName: depB.courseName }).from(depB)
+       * );
+       * ```
+       */
+      except = this.createSetOperator("except", false);
+      /**
+       * Adds `except all` set operator to the query.
+       *
+       * Calling this method will retrieve all rows from the left query, except for the rows that are present in the result set of the right query.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/set-operations#except-all}
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all products that are ordered by regular customers but not by VIP customers
+       * await db.select({
+       *   productId: regularCustomerOrders.productId,
+       *   quantityOrdered: regularCustomerOrders.quantityOrdered,
+       * })
+       * .from(regularCustomerOrders)
+       * .exceptAll(
+       *   db.select({
+       *     productId: vipCustomerOrders.productId,
+       *     quantityOrdered: vipCustomerOrders.quantityOrdered,
+       *   })
+       *   .from(vipCustomerOrders)
+       * );
+       * // or
+       * import { exceptAll } from 'drizzle-orm/pg-core'
+       *
+       * await exceptAll(
+       *   db.select({
+       *     productId: regularCustomerOrders.productId,
+       *     quantityOrdered: regularCustomerOrders.quantityOrdered
+       *   })
+       *   .from(regularCustomerOrders),
+       *   db.select({
+       *     productId: vipCustomerOrders.productId,
+       *     quantityOrdered: vipCustomerOrders.quantityOrdered
+       *   })
+       *   .from(vipCustomerOrders)
+       * );
+       * ```
+       */
+      exceptAll = this.createSetOperator("except", true);
+      /** @internal */
+      addSetOperators(setOperators) {
+        this.config.setOperators.push(...setOperators);
+        return this;
+      }
+      /**
+       * Adds a `where` clause to the query.
+       *
+       * Calling this method will select only those rows that fulfill a specified condition.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/select#filtering}
+       *
+       * @param where the `where` clause.
+       *
+       * @example
+       * You can use conditional operators and `sql function` to filter the rows to be selected.
+       *
+       * ```ts
+       * // Select all cars with green color
+       * await db.select().from(cars).where(eq(cars.color, 'green'));
+       * // or
+       * await db.select().from(cars).where(sql`${cars.color} = 'green'`)
+       * ```
+       *
+       * You can logically combine conditional operators with `and()` and `or()` operators:
+       *
+       * ```ts
+       * // Select all BMW cars with a green color
+       * await db.select().from(cars).where(and(eq(cars.color, 'green'), eq(cars.brand, 'BMW')));
+       *
+       * // Select all cars with the green or blue color
+       * await db.select().from(cars).where(or(eq(cars.color, 'green'), eq(cars.color, 'blue')));
+       * ```
+       */
+      where(where) {
+        if (typeof where === "function") {
+          where = where(
+            new Proxy(
+              this.config.fields,
+              new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
+            )
+          );
+        }
+        this.config.where = where;
+        return this;
+      }
+      /**
+       * Adds a `having` clause to the query.
+       *
+       * Calling this method will select only those rows that fulfill a specified condition. It is typically used with aggregate functions to filter the aggregated data based on a specified condition.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/select#aggregations}
+       *
+       * @param having the `having` clause.
+       *
+       * @example
+       *
+       * ```ts
+       * // Select all brands with more than one car
+       * await db.select({
+       * 	brand: cars.brand,
+       * 	count: sql<number>`cast(count(${cars.id}) as int)`,
+       * })
+       *   .from(cars)
+       *   .groupBy(cars.brand)
+       *   .having(({ count }) => gt(count, 1));
+       * ```
+       */
+      having(having) {
+        if (typeof having === "function") {
+          having = having(
+            new Proxy(
+              this.config.fields,
+              new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
+            )
+          );
+        }
+        this.config.having = having;
+        return this;
+      }
+      groupBy(...columns) {
+        if (typeof columns[0] === "function") {
+          const groupBy = columns[0](
+            new Proxy(
+              this.config.fields,
+              new SelectionProxyHandler({ sqlAliasedBehavior: "alias", sqlBehavior: "sql" })
+            )
+          );
+          this.config.groupBy = Array.isArray(groupBy) ? groupBy : [groupBy];
+        } else {
+          this.config.groupBy = columns;
+        }
+        return this;
+      }
+      orderBy(...columns) {
+        if (typeof columns[0] === "function") {
+          const orderBy = columns[0](
+            new Proxy(
+              this.config.fields,
+              new SelectionProxyHandler({ sqlAliasedBehavior: "alias", sqlBehavior: "sql" })
+            )
+          );
+          const orderByArray = Array.isArray(orderBy) ? orderBy : [orderBy];
+          if (this.config.setOperators.length > 0) {
+            this.config.setOperators.at(-1).orderBy = orderByArray;
+          } else {
+            this.config.orderBy = orderByArray;
+          }
+        } else {
+          const orderByArray = columns;
+          if (this.config.setOperators.length > 0) {
+            this.config.setOperators.at(-1).orderBy = orderByArray;
+          } else {
+            this.config.orderBy = orderByArray;
+          }
+        }
+        return this;
+      }
+      /**
+       * Adds a `limit` clause to the query.
+       *
+       * Calling this method will set the maximum number of rows that will be returned by this query.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/select#limit--offset}
+       *
+       * @param limit the `limit` clause.
+       *
+       * @example
+       *
+       * ```ts
+       * // Get the first 10 people from this query.
+       * await db.select().from(people).limit(10);
+       * ```
+       */
+      limit(limit) {
+        if (this.config.setOperators.length > 0) {
+          this.config.setOperators.at(-1).limit = limit;
+        } else {
+          this.config.limit = limit;
+        }
+        return this;
+      }
+      /**
+       * Adds an `offset` clause to the query.
+       *
+       * Calling this method will skip a number of rows when returning results from this query.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/select#limit--offset}
+       *
+       * @param offset the `offset` clause.
+       *
+       * @example
+       *
+       * ```ts
+       * // Get the 10th-20th people from this query.
+       * await db.select().from(people).offset(10).limit(10);
+       * ```
+       */
+      offset(offset) {
+        if (this.config.setOperators.length > 0) {
+          this.config.setOperators.at(-1).offset = offset;
+        } else {
+          this.config.offset = offset;
+        }
+        return this;
+      }
+      /**
+       * Adds a `for` clause to the query.
+       *
+       * Calling this method will specify a lock strength for this query that controls how strictly it acquires exclusive access to the rows being queried.
+       *
+       * See docs: {@link https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE}
+       *
+       * @param strength the lock strength.
+       * @param config the lock configuration.
+       */
+      for(strength, config2 = {}) {
+        this.config.lockingClause = { strength, config: config2 };
+        return this;
+      }
+      /** @internal */
+      getSQL() {
+        return this.dialect.buildSelectQuery(this.config);
+      }
+      toSQL() {
+        const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
+        return rest;
+      }
+      as(alias) {
+        const usedTables = [];
+        usedTables.push(...extractUsedTable(this.config.table));
+        if (this.config.joins) {
+          for (const it of this.config.joins) usedTables.push(...extractUsedTable(it.table));
+        }
+        return new Proxy(
+          new Subquery(this.getSQL(), this.config.fields, alias, false, [...new Set(usedTables)]),
+          new SelectionProxyHandler({ alias, sqlAliasedBehavior: "alias", sqlBehavior: "error" })
+        );
+      }
+      /** @internal */
+      getSelectedFields() {
+        return new Proxy(
+          this.config.fields,
+          new SelectionProxyHandler({ alias: this.tableName, sqlAliasedBehavior: "alias", sqlBehavior: "error" })
+        );
+      }
+      $dynamic() {
+        return this;
+      }
+      $withCache(config2) {
+        this.cacheConfig = config2 === void 0 ? { config: {}, enable: true, autoInvalidate: true } : config2 === false ? { enable: false } : { enable: true, autoInvalidate: true, ...config2 };
+        return this;
+      }
+    };
+    PgSelectBase = class extends PgSelectQueryBuilderBase {
+      static [entityKind] = "PgSelect";
+      /** @internal */
+      _prepare(name) {
+        const { session, config: config2, dialect, joinsNotNullableMap, authToken, cacheConfig, usedTables } = this;
+        if (!session) {
+          throw new Error("Cannot execute a query on a query builder. Please use a database instance instead.");
+        }
+        const { fields } = config2;
+        return tracer.startActiveSpan("drizzle.prepareQuery", () => {
+          const fieldsList = orderSelectedFields(fields);
+          const query = session.prepareQuery(dialect.sqlToQuery(this.getSQL()), fieldsList, name, true, void 0, {
+            type: "select",
+            tables: [...usedTables]
+          }, cacheConfig);
+          query.joinsNotNullableMap = joinsNotNullableMap;
+          return query.setToken(authToken);
+        });
+      }
+      /**
+       * Create a prepared statement for this query. This allows
+       * the database to remember this query for the given session
+       * and call it by name, rather than specifying the full query.
+       *
+       * {@link https://www.postgresql.org/docs/current/sql-prepare.html | Postgres prepare documentation}
+       */
+      prepare(name) {
+        return this._prepare(name);
+      }
+      authToken;
+      /** @internal */
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      execute = (placeholderValues) => {
+        return tracer.startActiveSpan("drizzle.operation", () => {
+          return this._prepare().execute(placeholderValues, this.authToken);
+        });
+      };
+    };
+    applyMixins(PgSelectBase, [QueryPromise]);
+    getPgSetOperators = () => ({
+      union,
+      unionAll,
+      intersect,
+      intersectAll,
+      except,
+      exceptAll
+    });
+    union = createSetOperator("union", false);
+    unionAll = createSetOperator("union", true);
+    intersect = createSetOperator("intersect", false);
+    intersectAll = createSetOperator("intersect", true);
+    except = createSetOperator("except", false);
+    exceptAll = createSetOperator("except", true);
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/query-builder.js
+var QueryBuilder;
+var init_query_builder2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/query-builder.js"() {
+    init_entity();
+    init_dialect();
+    init_selection_proxy();
+    init_subquery();
+    init_select2();
+    QueryBuilder = class {
+      static [entityKind] = "PgQueryBuilder";
+      dialect;
+      dialectConfig;
+      constructor(dialect) {
+        this.dialect = is(dialect, PgDialect) ? dialect : void 0;
+        this.dialectConfig = is(dialect, PgDialect) ? void 0 : dialect;
+      }
+      $with = (alias, selection) => {
+        const queryBuilder = this;
+        const as = (qb) => {
+          if (typeof qb === "function") {
+            qb = qb(queryBuilder);
+          }
+          return new Proxy(
+            new WithSubquery(
+              qb.getSQL(),
+              selection ?? ("getSelectedFields" in qb ? qb.getSelectedFields() ?? {} : {}),
+              alias,
+              true
+            ),
+            new SelectionProxyHandler({ alias, sqlAliasedBehavior: "alias", sqlBehavior: "error" })
+          );
+        };
+        return { as };
+      };
+      with(...queries) {
+        const self = this;
+        function select(fields) {
+          return new PgSelectBuilder({
+            fields: fields ?? void 0,
+            session: void 0,
+            dialect: self.getDialect(),
+            withList: queries
+          });
+        }
+        function selectDistinct(fields) {
+          return new PgSelectBuilder({
+            fields: fields ?? void 0,
+            session: void 0,
+            dialect: self.getDialect(),
+            distinct: true
+          });
+        }
+        function selectDistinctOn(on, fields) {
+          return new PgSelectBuilder({
+            fields: fields ?? void 0,
+            session: void 0,
+            dialect: self.getDialect(),
+            distinct: { on }
+          });
+        }
+        return { select, selectDistinct, selectDistinctOn };
+      }
+      select(fields) {
+        return new PgSelectBuilder({
+          fields: fields ?? void 0,
+          session: void 0,
+          dialect: this.getDialect()
+        });
+      }
+      selectDistinct(fields) {
+        return new PgSelectBuilder({
+          fields: fields ?? void 0,
+          session: void 0,
+          dialect: this.getDialect(),
+          distinct: true
+        });
+      }
+      selectDistinctOn(on, fields) {
+        return new PgSelectBuilder({
+          fields: fields ?? void 0,
+          session: void 0,
+          dialect: this.getDialect(),
+          distinct: { on }
+        });
+      }
+      // Lazy load dialect to avoid circular dependency
+      getDialect() {
+        if (!this.dialect) {
+          this.dialect = new PgDialect(this.dialectConfig);
+        }
+        return this.dialect;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/view.js
+function pgViewWithSchema(name, selection, schema) {
+  if (selection) {
+    return new ManualViewBuilder(name, selection, schema);
+  }
+  return new ViewBuilder(name, schema);
+}
+function pgMaterializedViewWithSchema(name, selection, schema) {
+  if (selection) {
+    return new ManualMaterializedViewBuilder(name, selection, schema);
+  }
+  return new MaterializedViewBuilder(name, schema);
+}
+var DefaultViewBuilderCore, ViewBuilder, ManualViewBuilder, MaterializedViewBuilderCore, MaterializedViewBuilder, ManualMaterializedViewBuilder, PgView, PgMaterializedViewConfig, PgMaterializedView;
+var init_view = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/view.js"() {
+    init_entity();
+    init_selection_proxy();
+    init_utils();
+    init_query_builder2();
+    init_table2();
+    init_view_base();
+    init_view_common2();
+    DefaultViewBuilderCore = class {
+      constructor(name, schema) {
+        this.name = name;
+        this.schema = schema;
+      }
+      static [entityKind] = "PgDefaultViewBuilderCore";
+      config = {};
+      with(config2) {
+        this.config.with = config2;
+        return this;
+      }
+    };
+    ViewBuilder = class extends DefaultViewBuilderCore {
+      static [entityKind] = "PgViewBuilder";
+      as(qb) {
+        if (typeof qb === "function") {
+          qb = qb(new QueryBuilder());
+        }
+        const selectionProxy = new SelectionProxyHandler({
+          alias: this.name,
+          sqlBehavior: "error",
+          sqlAliasedBehavior: "alias",
+          replaceOriginalName: true
+        });
+        const aliasedSelection = new Proxy(qb.getSelectedFields(), selectionProxy);
+        return new Proxy(
+          new PgView({
+            pgConfig: this.config,
+            config: {
+              name: this.name,
+              schema: this.schema,
+              selectedFields: aliasedSelection,
+              query: qb.getSQL().inlineParams()
+            }
+          }),
+          selectionProxy
+        );
+      }
+    };
+    ManualViewBuilder = class extends DefaultViewBuilderCore {
+      static [entityKind] = "PgManualViewBuilder";
+      columns;
+      constructor(name, columns, schema) {
+        super(name, schema);
+        this.columns = getTableColumns(pgTable(name, columns));
+      }
+      existing() {
+        return new Proxy(
+          new PgView({
+            pgConfig: void 0,
+            config: {
+              name: this.name,
+              schema: this.schema,
+              selectedFields: this.columns,
+              query: void 0
+            }
+          }),
+          new SelectionProxyHandler({
+            alias: this.name,
+            sqlBehavior: "error",
+            sqlAliasedBehavior: "alias",
+            replaceOriginalName: true
+          })
+        );
+      }
+      as(query) {
+        return new Proxy(
+          new PgView({
+            pgConfig: this.config,
+            config: {
+              name: this.name,
+              schema: this.schema,
+              selectedFields: this.columns,
+              query: query.inlineParams()
+            }
+          }),
+          new SelectionProxyHandler({
+            alias: this.name,
+            sqlBehavior: "error",
+            sqlAliasedBehavior: "alias",
+            replaceOriginalName: true
+          })
+        );
+      }
+    };
+    MaterializedViewBuilderCore = class {
+      constructor(name, schema) {
+        this.name = name;
+        this.schema = schema;
+      }
+      static [entityKind] = "PgMaterializedViewBuilderCore";
+      config = {};
+      using(using) {
+        this.config.using = using;
+        return this;
+      }
+      with(config2) {
+        this.config.with = config2;
+        return this;
+      }
+      tablespace(tablespace) {
+        this.config.tablespace = tablespace;
+        return this;
+      }
+      withNoData() {
+        this.config.withNoData = true;
+        return this;
+      }
+    };
+    MaterializedViewBuilder = class extends MaterializedViewBuilderCore {
+      static [entityKind] = "PgMaterializedViewBuilder";
+      as(qb) {
+        if (typeof qb === "function") {
+          qb = qb(new QueryBuilder());
+        }
+        const selectionProxy = new SelectionProxyHandler({
+          alias: this.name,
+          sqlBehavior: "error",
+          sqlAliasedBehavior: "alias",
+          replaceOriginalName: true
+        });
+        const aliasedSelection = new Proxy(qb.getSelectedFields(), selectionProxy);
+        return new Proxy(
+          new PgMaterializedView({
+            pgConfig: {
+              with: this.config.with,
+              using: this.config.using,
+              tablespace: this.config.tablespace,
+              withNoData: this.config.withNoData
+            },
+            config: {
+              name: this.name,
+              schema: this.schema,
+              selectedFields: aliasedSelection,
+              query: qb.getSQL().inlineParams()
+            }
+          }),
+          selectionProxy
+        );
+      }
+    };
+    ManualMaterializedViewBuilder = class extends MaterializedViewBuilderCore {
+      static [entityKind] = "PgManualMaterializedViewBuilder";
+      columns;
+      constructor(name, columns, schema) {
+        super(name, schema);
+        this.columns = getTableColumns(pgTable(name, columns));
+      }
+      existing() {
+        return new Proxy(
+          new PgMaterializedView({
+            pgConfig: {
+              tablespace: this.config.tablespace,
+              using: this.config.using,
+              with: this.config.with,
+              withNoData: this.config.withNoData
+            },
+            config: {
+              name: this.name,
+              schema: this.schema,
+              selectedFields: this.columns,
+              query: void 0
+            }
+          }),
+          new SelectionProxyHandler({
+            alias: this.name,
+            sqlBehavior: "error",
+            sqlAliasedBehavior: "alias",
+            replaceOriginalName: true
+          })
+        );
+      }
+      as(query) {
+        return new Proxy(
+          new PgMaterializedView({
+            pgConfig: {
+              tablespace: this.config.tablespace,
+              using: this.config.using,
+              with: this.config.with,
+              withNoData: this.config.withNoData
+            },
+            config: {
+              name: this.name,
+              schema: this.schema,
+              selectedFields: this.columns,
+              query: query.inlineParams()
+            }
+          }),
+          new SelectionProxyHandler({
+            alias: this.name,
+            sqlBehavior: "error",
+            sqlAliasedBehavior: "alias",
+            replaceOriginalName: true
+          })
+        );
+      }
+    };
+    PgView = class extends PgViewBase {
+      static [entityKind] = "PgView";
+      [PgViewConfig];
+      constructor({ pgConfig, config: config2 }) {
+        super(config2);
+        if (pgConfig) {
+          this[PgViewConfig] = {
+            with: pgConfig.with
+          };
+        }
+      }
+    };
+    PgMaterializedViewConfig = /* @__PURE__ */ Symbol.for("drizzle:PgMaterializedViewConfig");
+    PgMaterializedView = class extends PgViewBase {
+      static [entityKind] = "PgMaterializedView";
+      [PgMaterializedViewConfig];
+      constructor({ pgConfig, config: config2 }) {
+        super(config2);
+        this[PgMaterializedViewConfig] = {
+          with: pgConfig?.with,
+          using: pgConfig?.using,
+          tablespace: pgConfig?.tablespace,
+          withNoData: pgConfig?.withNoData
+        };
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/utils.js
+function extractUsedTable(table) {
+  if (is(table, PgTable)) {
+    return [table[Schema] ? `${table[Schema]}.${table[Table.Symbol.BaseName]}` : table[Table.Symbol.BaseName]];
+  }
+  if (is(table, Subquery)) {
+    return table._.usedTables ?? [];
+  }
+  if (is(table, SQL)) {
+    return table.usedTables ?? [];
+  }
+  return [];
+}
+var init_utils3 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/utils.js"() {
+    init_entity();
+    init_table2();
+    init_sql();
+    init_subquery();
+    init_table();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/delete.js
+var PgDeleteBase;
+var init_delete = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/delete.js"() {
+    init_entity();
+    init_query_promise();
+    init_selection_proxy();
+    init_table();
+    init_tracing();
+    init_utils();
+    init_utils3();
+    PgDeleteBase = class extends QueryPromise {
+      constructor(table, session, dialect, withList) {
+        super();
+        this.session = session;
+        this.dialect = dialect;
+        this.config = { table, withList };
+      }
+      static [entityKind] = "PgDelete";
+      config;
+      cacheConfig;
+      /**
+       * Adds a `where` clause to the query.
+       *
+       * Calling this method will delete only those rows that fulfill a specified condition.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/delete}
+       *
+       * @param where the `where` clause.
+       *
+       * @example
+       * You can use conditional operators and `sql function` to filter the rows to be deleted.
+       *
+       * ```ts
+       * // Delete all cars with green color
+       * await db.delete(cars).where(eq(cars.color, 'green'));
+       * // or
+       * await db.delete(cars).where(sql`${cars.color} = 'green'`)
+       * ```
+       *
+       * You can logically combine conditional operators with `and()` and `or()` operators:
+       *
+       * ```ts
+       * // Delete all BMW cars with a green color
+       * await db.delete(cars).where(and(eq(cars.color, 'green'), eq(cars.brand, 'BMW')));
+       *
+       * // Delete all cars with the green or blue color
+       * await db.delete(cars).where(or(eq(cars.color, 'green'), eq(cars.color, 'blue')));
+       * ```
+       */
+      where(where) {
+        this.config.where = where;
+        return this;
+      }
+      returning(fields = this.config.table[Table.Symbol.Columns]) {
+        this.config.returningFields = fields;
+        this.config.returning = orderSelectedFields(fields);
+        return this;
+      }
+      /** @internal */
+      getSQL() {
+        return this.dialect.buildDeleteQuery(this.config);
+      }
+      toSQL() {
+        const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
+        return rest;
+      }
+      /** @internal */
+      _prepare(name) {
+        return tracer.startActiveSpan("drizzle.prepareQuery", () => {
+          return this.session.prepareQuery(this.dialect.sqlToQuery(this.getSQL()), this.config.returning, name, true, void 0, {
+            type: "delete",
+            tables: extractUsedTable(this.config.table)
+          }, this.cacheConfig);
+        });
+      }
+      prepare(name) {
+        return this._prepare(name);
+      }
+      authToken;
+      /** @internal */
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      execute = (placeholderValues) => {
+        return tracer.startActiveSpan("drizzle.operation", () => {
+          return this._prepare().execute(placeholderValues, this.authToken);
+        });
+      };
+      /** @internal */
+      getSelectedFields() {
+        return this.config.returningFields ? new Proxy(
+          this.config.returningFields,
+          new SelectionProxyHandler({
+            alias: getTableName(this.config.table),
+            sqlAliasedBehavior: "alias",
+            sqlBehavior: "error"
+          })
+        ) : void 0;
+      }
+      $dynamic() {
+        return this;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/insert.js
+var PgInsertBuilder, PgInsertBase;
+var init_insert = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/insert.js"() {
+    init_entity();
+    init_query_promise();
+    init_selection_proxy();
+    init_sql();
+    init_table();
+    init_tracing();
+    init_utils();
+    init_utils3();
+    init_query_builder2();
+    PgInsertBuilder = class {
+      constructor(table, session, dialect, withList, overridingSystemValue_) {
+        this.table = table;
+        this.session = session;
+        this.dialect = dialect;
+        this.withList = withList;
+        this.overridingSystemValue_ = overridingSystemValue_;
+      }
+      static [entityKind] = "PgInsertBuilder";
+      authToken;
+      /** @internal */
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      overridingSystemValue() {
+        this.overridingSystemValue_ = true;
+        return this;
+      }
+      values(values) {
+        values = Array.isArray(values) ? values : [values];
+        if (values.length === 0) {
+          throw new Error("values() must be called with at least one value");
+        }
+        const mappedValues = values.map((entry) => {
+          const result = {};
+          const cols = this.table[Table.Symbol.Columns];
+          for (const colKey of Object.keys(entry)) {
+            const colValue = entry[colKey];
+            result[colKey] = is(colValue, SQL) ? colValue : new Param(colValue, cols[colKey]);
+          }
+          return result;
+        });
+        return new PgInsertBase(
+          this.table,
+          mappedValues,
+          this.session,
+          this.dialect,
+          this.withList,
+          false,
+          this.overridingSystemValue_
+        ).setToken(this.authToken);
+      }
+      select(selectQuery) {
+        const select = typeof selectQuery === "function" ? selectQuery(new QueryBuilder()) : selectQuery;
+        if (!is(select, SQL) && !haveSameKeys(this.table[Columns], select._.selectedFields)) {
+          throw new Error(
+            "Insert select error: selected fields are not the same or are in a different order compared to the table definition"
+          );
+        }
+        return new PgInsertBase(this.table, select, this.session, this.dialect, this.withList, true);
+      }
+    };
+    PgInsertBase = class extends QueryPromise {
+      constructor(table, values, session, dialect, withList, select, overridingSystemValue_) {
+        super();
+        this.session = session;
+        this.dialect = dialect;
+        this.config = { table, values, withList, select, overridingSystemValue_ };
+      }
+      static [entityKind] = "PgInsert";
+      config;
+      cacheConfig;
+      returning(fields = this.config.table[Table.Symbol.Columns]) {
+        this.config.returningFields = fields;
+        this.config.returning = orderSelectedFields(fields);
+        return this;
+      }
+      /**
+       * Adds an `on conflict do nothing` clause to the query.
+       *
+       * Calling this method simply avoids inserting a row as its alternative action.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/insert#on-conflict-do-nothing}
+       *
+       * @param config The `target` and `where` clauses.
+       *
+       * @example
+       * ```ts
+       * // Insert one row and cancel the insert if there's a conflict
+       * await db.insert(cars)
+       *   .values({ id: 1, brand: 'BMW' })
+       *   .onConflictDoNothing();
+       *
+       * // Explicitly specify conflict target
+       * await db.insert(cars)
+       *   .values({ id: 1, brand: 'BMW' })
+       *   .onConflictDoNothing({ target: cars.id });
+       * ```
+       */
+      onConflictDoNothing(config2 = {}) {
+        if (config2.target === void 0) {
+          this.config.onConflict = sql`do nothing`;
+        } else {
+          let targetColumn = "";
+          targetColumn = Array.isArray(config2.target) ? config2.target.map((it) => this.dialect.escapeName(this.dialect.casing.getColumnCasing(it))).join(",") : this.dialect.escapeName(this.dialect.casing.getColumnCasing(config2.target));
+          const whereSql = config2.where ? sql` where ${config2.where}` : void 0;
+          this.config.onConflict = sql`(${sql.raw(targetColumn)})${whereSql} do nothing`;
+        }
+        return this;
+      }
+      /**
+       * Adds an `on conflict do update` clause to the query.
+       *
+       * Calling this method will update the existing row that conflicts with the row proposed for insertion as its alternative action.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/insert#upserts-and-conflicts}
+       *
+       * @param config The `target`, `set` and `where` clauses.
+       *
+       * @example
+       * ```ts
+       * // Update the row if there's a conflict
+       * await db.insert(cars)
+       *   .values({ id: 1, brand: 'BMW' })
+       *   .onConflictDoUpdate({
+       *     target: cars.id,
+       *     set: { brand: 'Porsche' }
+       *   });
+       *
+       * // Upsert with 'where' clause
+       * await db.insert(cars)
+       *   .values({ id: 1, brand: 'BMW' })
+       *   .onConflictDoUpdate({
+       *     target: cars.id,
+       *     set: { brand: 'newBMW' },
+       *     targetWhere: sql`${cars.createdAt} > '2023-01-01'::date`,
+       *   });
+       * ```
+       */
+      onConflictDoUpdate(config2) {
+        if (config2.where && (config2.targetWhere || config2.setWhere)) {
+          throw new Error(
+            'You cannot use both "where" and "targetWhere"/"setWhere" at the same time - "where" is deprecated, use "targetWhere" or "setWhere" instead.'
+          );
+        }
+        const whereSql = config2.where ? sql` where ${config2.where}` : void 0;
+        const targetWhereSql = config2.targetWhere ? sql` where ${config2.targetWhere}` : void 0;
+        const setWhereSql = config2.setWhere ? sql` where ${config2.setWhere}` : void 0;
+        const setSql = this.dialect.buildUpdateSet(this.config.table, mapUpdateSet(this.config.table, config2.set));
+        let targetColumn = "";
+        targetColumn = Array.isArray(config2.target) ? config2.target.map((it) => this.dialect.escapeName(this.dialect.casing.getColumnCasing(it))).join(",") : this.dialect.escapeName(this.dialect.casing.getColumnCasing(config2.target));
+        this.config.onConflict = sql`(${sql.raw(targetColumn)})${targetWhereSql} do update set ${setSql}${whereSql}${setWhereSql}`;
+        return this;
+      }
+      /** @internal */
+      getSQL() {
+        return this.dialect.buildInsertQuery(this.config);
+      }
+      toSQL() {
+        const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
+        return rest;
+      }
+      /** @internal */
+      _prepare(name) {
+        return tracer.startActiveSpan("drizzle.prepareQuery", () => {
+          return this.session.prepareQuery(this.dialect.sqlToQuery(this.getSQL()), this.config.returning, name, true, void 0, {
+            type: "insert",
+            tables: extractUsedTable(this.config.table)
+          }, this.cacheConfig);
+        });
+      }
+      prepare(name) {
+        return this._prepare(name);
+      }
+      authToken;
+      /** @internal */
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      execute = (placeholderValues) => {
+        return tracer.startActiveSpan("drizzle.operation", () => {
+          return this._prepare().execute(placeholderValues, this.authToken);
+        });
+      };
+      /** @internal */
+      getSelectedFields() {
+        return this.config.returningFields ? new Proxy(
+          this.config.returningFields,
+          new SelectionProxyHandler({
+            alias: getTableName(this.config.table),
+            sqlAliasedBehavior: "alias",
+            sqlBehavior: "error"
+          })
+        ) : void 0;
+      }
+      $dynamic() {
+        return this;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/refresh-materialized-view.js
+var PgRefreshMaterializedView;
+var init_refresh_materialized_view = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/refresh-materialized-view.js"() {
+    init_entity();
+    init_query_promise();
+    init_tracing();
+    PgRefreshMaterializedView = class extends QueryPromise {
+      constructor(view, session, dialect) {
+        super();
+        this.session = session;
+        this.dialect = dialect;
+        this.config = { view };
+      }
+      static [entityKind] = "PgRefreshMaterializedView";
+      config;
+      concurrently() {
+        if (this.config.withNoData !== void 0) {
+          throw new Error("Cannot use concurrently and withNoData together");
+        }
+        this.config.concurrently = true;
+        return this;
+      }
+      withNoData() {
+        if (this.config.concurrently !== void 0) {
+          throw new Error("Cannot use concurrently and withNoData together");
+        }
+        this.config.withNoData = true;
+        return this;
+      }
+      /** @internal */
+      getSQL() {
+        return this.dialect.buildRefreshMaterializedViewQuery(this.config);
+      }
+      toSQL() {
+        const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
+        return rest;
+      }
+      /** @internal */
+      _prepare(name) {
+        return tracer.startActiveSpan("drizzle.prepareQuery", () => {
+          return this.session.prepareQuery(this.dialect.sqlToQuery(this.getSQL()), void 0, name, true);
+        });
+      }
+      prepare(name) {
+        return this._prepare(name);
+      }
+      authToken;
+      /** @internal */
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      execute = (placeholderValues) => {
+        return tracer.startActiveSpan("drizzle.operation", () => {
+          return this._prepare().execute(placeholderValues, this.authToken);
+        });
+      };
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/select.types.js
+var init_select_types = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/select.types.js"() {
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/update.js
+var PgUpdateBuilder, PgUpdateBase;
+var init_update = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/update.js"() {
+    init_entity();
+    init_table2();
+    init_query_promise();
+    init_selection_proxy();
+    init_sql();
+    init_subquery();
+    init_table();
+    init_utils();
+    init_view_common();
+    init_utils3();
+    PgUpdateBuilder = class {
+      constructor(table, session, dialect, withList) {
+        this.table = table;
+        this.session = session;
+        this.dialect = dialect;
+        this.withList = withList;
+      }
+      static [entityKind] = "PgUpdateBuilder";
+      authToken;
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      set(values) {
+        return new PgUpdateBase(
+          this.table,
+          mapUpdateSet(this.table, values),
+          this.session,
+          this.dialect,
+          this.withList
+        ).setToken(this.authToken);
+      }
+    };
+    PgUpdateBase = class extends QueryPromise {
+      constructor(table, set, session, dialect, withList) {
+        super();
+        this.session = session;
+        this.dialect = dialect;
+        this.config = { set, table, withList, joins: [] };
+        this.tableName = getTableLikeName(table);
+        this.joinsNotNullableMap = typeof this.tableName === "string" ? { [this.tableName]: true } : {};
+      }
+      static [entityKind] = "PgUpdate";
+      config;
+      tableName;
+      joinsNotNullableMap;
+      cacheConfig;
+      from(source) {
+        const src = source;
+        const tableName = getTableLikeName(src);
+        if (typeof tableName === "string") {
+          this.joinsNotNullableMap[tableName] = true;
+        }
+        this.config.from = src;
+        return this;
+      }
+      getTableLikeFields(table) {
+        if (is(table, PgTable)) {
+          return table[Table.Symbol.Columns];
+        } else if (is(table, Subquery)) {
+          return table._.selectedFields;
+        }
+        return table[ViewBaseConfig].selectedFields;
+      }
+      createJoin(joinType) {
+        return (table, on) => {
+          const tableName = getTableLikeName(table);
+          if (typeof tableName === "string" && this.config.joins.some((join) => join.alias === tableName)) {
+            throw new Error(`Alias "${tableName}" is already used in this query`);
+          }
+          if (typeof on === "function") {
+            const from = this.config.from && !is(this.config.from, SQL) ? this.getTableLikeFields(this.config.from) : void 0;
+            on = on(
+              new Proxy(
+                this.config.table[Table.Symbol.Columns],
+                new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
+              ),
+              from && new Proxy(
+                from,
+                new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
+              )
+            );
+          }
+          this.config.joins.push({ on, table, joinType, alias: tableName });
+          if (typeof tableName === "string") {
+            switch (joinType) {
+              case "left": {
+                this.joinsNotNullableMap[tableName] = false;
+                break;
+              }
+              case "right": {
+                this.joinsNotNullableMap = Object.fromEntries(
+                  Object.entries(this.joinsNotNullableMap).map(([key]) => [key, false])
+                );
+                this.joinsNotNullableMap[tableName] = true;
+                break;
+              }
+              case "inner": {
+                this.joinsNotNullableMap[tableName] = true;
+                break;
+              }
+              case "full": {
+                this.joinsNotNullableMap = Object.fromEntries(
+                  Object.entries(this.joinsNotNullableMap).map(([key]) => [key, false])
+                );
+                this.joinsNotNullableMap[tableName] = false;
+                break;
+              }
+            }
+          }
+          return this;
+        };
+      }
+      leftJoin = this.createJoin("left");
+      rightJoin = this.createJoin("right");
+      innerJoin = this.createJoin("inner");
+      fullJoin = this.createJoin("full");
+      /**
+       * Adds a 'where' clause to the query.
+       *
+       * Calling this method will update only those rows that fulfill a specified condition.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/update}
+       *
+       * @param where the 'where' clause.
+       *
+       * @example
+       * You can use conditional operators and `sql function` to filter the rows to be updated.
+       *
+       * ```ts
+       * // Update all cars with green color
+       * await db.update(cars).set({ color: 'red' })
+       *   .where(eq(cars.color, 'green'));
+       * // or
+       * await db.update(cars).set({ color: 'red' })
+       *   .where(sql`${cars.color} = 'green'`)
+       * ```
+       *
+       * You can logically combine conditional operators with `and()` and `or()` operators:
+       *
+       * ```ts
+       * // Update all BMW cars with a green color
+       * await db.update(cars).set({ color: 'red' })
+       *   .where(and(eq(cars.color, 'green'), eq(cars.brand, 'BMW')));
+       *
+       * // Update all cars with the green or blue color
+       * await db.update(cars).set({ color: 'red' })
+       *   .where(or(eq(cars.color, 'green'), eq(cars.color, 'blue')));
+       * ```
+       */
+      where(where) {
+        this.config.where = where;
+        return this;
+      }
+      returning(fields) {
+        if (!fields) {
+          fields = Object.assign({}, this.config.table[Table.Symbol.Columns]);
+          if (this.config.from) {
+            const tableName = getTableLikeName(this.config.from);
+            if (typeof tableName === "string" && this.config.from && !is(this.config.from, SQL)) {
+              const fromFields = this.getTableLikeFields(this.config.from);
+              fields[tableName] = fromFields;
+            }
+            for (const join of this.config.joins) {
+              const tableName2 = getTableLikeName(join.table);
+              if (typeof tableName2 === "string" && !is(join.table, SQL)) {
+                const fromFields = this.getTableLikeFields(join.table);
+                fields[tableName2] = fromFields;
+              }
+            }
+          }
+        }
+        this.config.returningFields = fields;
+        this.config.returning = orderSelectedFields(fields);
+        return this;
+      }
+      /** @internal */
+      getSQL() {
+        return this.dialect.buildUpdateQuery(this.config);
+      }
+      toSQL() {
+        const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
+        return rest;
+      }
+      /** @internal */
+      _prepare(name) {
+        const query = this.session.prepareQuery(this.dialect.sqlToQuery(this.getSQL()), this.config.returning, name, true, void 0, {
+          type: "insert",
+          tables: extractUsedTable(this.config.table)
+        }, this.cacheConfig);
+        query.joinsNotNullableMap = this.joinsNotNullableMap;
+        return query;
+      }
+      prepare(name) {
+        return this._prepare(name);
+      }
+      authToken;
+      /** @internal */
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      execute = (placeholderValues) => {
+        return this._prepare().execute(placeholderValues, this.authToken);
+      };
+      /** @internal */
+      getSelectedFields() {
+        return this.config.returningFields ? new Proxy(
+          this.config.returningFields,
+          new SelectionProxyHandler({
+            alias: getTableName(this.config.table),
+            sqlAliasedBehavior: "alias",
+            sqlBehavior: "error"
+          })
+        ) : void 0;
+      }
+      $dynamic() {
+        return this;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/index.js
+var init_query_builders = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/index.js"() {
+    init_delete();
+    init_insert();
+    init_query_builder2();
+    init_refresh_materialized_view();
+    init_select2();
+    init_select_types();
+    init_update();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/count.js
+var PgCountBuilder;
+var init_count = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/count.js"() {
+    init_entity();
+    init_sql();
+    PgCountBuilder = class _PgCountBuilder extends SQL {
+      constructor(params) {
+        super(_PgCountBuilder.buildEmbeddedCount(params.source, params.filters).queryChunks);
+        this.params = params;
+        this.mapWith(Number);
+        this.session = params.session;
+        this.sql = _PgCountBuilder.buildCount(
+          params.source,
+          params.filters
+        );
+      }
+      sql;
+      token;
+      static [entityKind] = "PgCountBuilder";
+      [Symbol.toStringTag] = "PgCountBuilder";
+      session;
+      static buildEmbeddedCount(source, filters) {
+        return sql`(select count(*) from ${source}${sql.raw(" where ").if(filters)}${filters})`;
+      }
+      static buildCount(source, filters) {
+        return sql`select count(*) as count from ${source}${sql.raw(" where ").if(filters)}${filters};`;
+      }
+      /** @intrnal */
+      setToken(token) {
+        this.token = token;
+        return this;
+      }
+      then(onfulfilled, onrejected) {
+        return Promise.resolve(this.session.count(this.sql, this.token)).then(
+          onfulfilled,
+          onrejected
+        );
+      }
+      catch(onRejected) {
+        return this.then(void 0, onRejected);
+      }
+      finally(onFinally) {
+        return this.then(
+          (value) => {
+            onFinally?.();
+            return value;
+          },
+          (reason) => {
+            onFinally?.();
+            throw reason;
+          }
+        );
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/query.js
+var RelationalQueryBuilder, PgRelationalQuery;
+var init_query = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/query.js"() {
+    init_entity();
+    init_query_promise();
+    init_relations();
+    init_tracing();
+    RelationalQueryBuilder = class {
+      constructor(fullSchema, schema, tableNamesMap, table, tableConfig, dialect, session) {
+        this.fullSchema = fullSchema;
+        this.schema = schema;
+        this.tableNamesMap = tableNamesMap;
+        this.table = table;
+        this.tableConfig = tableConfig;
+        this.dialect = dialect;
+        this.session = session;
+      }
+      static [entityKind] = "PgRelationalQueryBuilder";
+      findMany(config2) {
+        return new PgRelationalQuery(
+          this.fullSchema,
+          this.schema,
+          this.tableNamesMap,
+          this.table,
+          this.tableConfig,
+          this.dialect,
+          this.session,
+          config2 ? config2 : {},
+          "many"
+        );
+      }
+      findFirst(config2) {
+        return new PgRelationalQuery(
+          this.fullSchema,
+          this.schema,
+          this.tableNamesMap,
+          this.table,
+          this.tableConfig,
+          this.dialect,
+          this.session,
+          config2 ? { ...config2, limit: 1 } : { limit: 1 },
+          "first"
+        );
+      }
+    };
+    PgRelationalQuery = class extends QueryPromise {
+      constructor(fullSchema, schema, tableNamesMap, table, tableConfig, dialect, session, config2, mode) {
+        super();
+        this.fullSchema = fullSchema;
+        this.schema = schema;
+        this.tableNamesMap = tableNamesMap;
+        this.table = table;
+        this.tableConfig = tableConfig;
+        this.dialect = dialect;
+        this.session = session;
+        this.config = config2;
+        this.mode = mode;
+      }
+      static [entityKind] = "PgRelationalQuery";
+      /** @internal */
+      _prepare(name) {
+        return tracer.startActiveSpan("drizzle.prepareQuery", () => {
+          const { query, builtQuery } = this._toSQL();
+          return this.session.prepareQuery(
+            builtQuery,
+            void 0,
+            name,
+            true,
+            (rawRows, mapColumnValue) => {
+              const rows = rawRows.map(
+                (row) => mapRelationalRow(this.schema, this.tableConfig, row, query.selection, mapColumnValue)
+              );
+              if (this.mode === "first") {
+                return rows[0];
+              }
+              return rows;
+            }
+          );
+        });
+      }
+      prepare(name) {
+        return this._prepare(name);
+      }
+      _getQuery() {
+        return this.dialect.buildRelationalQueryWithoutPK({
+          fullSchema: this.fullSchema,
+          schema: this.schema,
+          tableNamesMap: this.tableNamesMap,
+          table: this.table,
+          tableConfig: this.tableConfig,
+          queryConfig: this.config,
+          tableAlias: this.tableConfig.tsName
+        });
+      }
+      /** @internal */
+      getSQL() {
+        return this._getQuery().sql;
+      }
+      _toSQL() {
+        const query = this._getQuery();
+        const builtQuery = this.dialect.sqlToQuery(query.sql);
+        return { query, builtQuery };
+      }
+      toSQL() {
+        return this._toSQL().builtQuery;
+      }
+      authToken;
+      /** @internal */
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      execute() {
+        return tracer.startActiveSpan("drizzle.operation", () => {
+          return this._prepare().execute(void 0, this.authToken);
+        });
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/raw.js
+var PgRaw;
+var init_raw = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/raw.js"() {
+    init_entity();
+    init_query_promise();
+    PgRaw = class extends QueryPromise {
+      constructor(execute, sql2, query, mapBatchResult) {
+        super();
+        this.execute = execute;
+        this.sql = sql2;
+        this.query = query;
+        this.mapBatchResult = mapBatchResult;
+      }
+      static [entityKind] = "PgRaw";
+      /** @internal */
+      getSQL() {
+        return this.sql;
+      }
+      getQuery() {
+        return this.query;
+      }
+      mapResult(result, isFromBatch) {
+        return isFromBatch ? this.mapBatchResult(result) : result;
+      }
+      _prepare() {
+        return this;
+      }
+      /** @internal */
+      isResponseInArrayMode() {
+        return false;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/db.js
+var PgDatabase;
+var init_db = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/db.js"() {
+    init_entity();
+    init_query_builders();
+    init_selection_proxy();
+    init_sql();
+    init_subquery();
+    init_count();
+    init_query();
+    init_raw();
+    init_refresh_materialized_view();
+    PgDatabase = class {
+      constructor(dialect, session, schema) {
+        this.dialect = dialect;
+        this.session = session;
+        this._ = schema ? {
+          schema: schema.schema,
+          fullSchema: schema.fullSchema,
+          tableNamesMap: schema.tableNamesMap,
+          session
+        } : {
+          schema: void 0,
+          fullSchema: {},
+          tableNamesMap: {},
+          session
+        };
+        this.query = {};
+        if (this._.schema) {
+          for (const [tableName, columns] of Object.entries(this._.schema)) {
+            this.query[tableName] = new RelationalQueryBuilder(
+              schema.fullSchema,
+              this._.schema,
+              this._.tableNamesMap,
+              schema.fullSchema[tableName],
+              columns,
+              dialect,
+              session
+            );
+          }
+        }
+        this.$cache = { invalidate: async (_params) => {
+        } };
+      }
+      static [entityKind] = "PgDatabase";
+      query;
+      /**
+       * Creates a subquery that defines a temporary named result set as a CTE.
+       *
+       * It is useful for breaking down complex queries into simpler parts and for reusing the result set in subsequent parts of the query.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/select#with-clause}
+       *
+       * @param alias The alias for the subquery.
+       *
+       * Failure to provide an alias will result in a DrizzleTypeError, preventing the subquery from being referenced in other queries.
+       *
+       * @example
+       *
+       * ```ts
+       * // Create a subquery with alias 'sq' and use it in the select query
+       * const sq = db.$with('sq').as(db.select().from(users).where(eq(users.id, 42)));
+       *
+       * const result = await db.with(sq).select().from(sq);
+       * ```
+       *
+       * To select arbitrary SQL values as fields in a CTE and reference them in other CTEs or in the main query, you need to add aliases to them:
+       *
+       * ```ts
+       * // Select an arbitrary SQL value as a field in a CTE and reference it in the main query
+       * const sq = db.$with('sq').as(db.select({
+       *   name: sql<string>`upper(${users.name})`.as('name'),
+       * })
+       * .from(users));
+       *
+       * const result = await db.with(sq).select({ name: sq.name }).from(sq);
+       * ```
+       */
+      $with = (alias, selection) => {
+        const self = this;
+        const as = (qb) => {
+          if (typeof qb === "function") {
+            qb = qb(new QueryBuilder(self.dialect));
+          }
+          return new Proxy(
+            new WithSubquery(
+              qb.getSQL(),
+              selection ?? ("getSelectedFields" in qb ? qb.getSelectedFields() ?? {} : {}),
+              alias,
+              true
+            ),
+            new SelectionProxyHandler({ alias, sqlAliasedBehavior: "alias", sqlBehavior: "error" })
+          );
+        };
+        return { as };
+      };
+      $count(source, filters) {
+        return new PgCountBuilder({ source, filters, session: this.session });
+      }
+      $cache;
+      /**
+       * Incorporates a previously defined CTE (using `$with`) into the main query.
+       *
+       * This method allows the main query to reference a temporary named result set.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/select#with-clause}
+       *
+       * @param queries The CTEs to incorporate into the main query.
+       *
+       * @example
+       *
+       * ```ts
+       * // Define a subquery 'sq' as a CTE using $with
+       * const sq = db.$with('sq').as(db.select().from(users).where(eq(users.id, 42)));
+       *
+       * // Incorporate the CTE 'sq' into the main query and select from it
+       * const result = await db.with(sq).select().from(sq);
+       * ```
+       */
+      with(...queries) {
+        const self = this;
+        function select(fields) {
+          return new PgSelectBuilder({
+            fields: fields ?? void 0,
+            session: self.session,
+            dialect: self.dialect,
+            withList: queries
+          });
+        }
+        function selectDistinct(fields) {
+          return new PgSelectBuilder({
+            fields: fields ?? void 0,
+            session: self.session,
+            dialect: self.dialect,
+            withList: queries,
+            distinct: true
+          });
+        }
+        function selectDistinctOn(on, fields) {
+          return new PgSelectBuilder({
+            fields: fields ?? void 0,
+            session: self.session,
+            dialect: self.dialect,
+            withList: queries,
+            distinct: { on }
+          });
+        }
+        function update(table) {
+          return new PgUpdateBuilder(table, self.session, self.dialect, queries);
+        }
+        function insert(table) {
+          return new PgInsertBuilder(table, self.session, self.dialect, queries);
+        }
+        function delete_(table) {
+          return new PgDeleteBase(table, self.session, self.dialect, queries);
+        }
+        return { select, selectDistinct, selectDistinctOn, update, insert, delete: delete_ };
+      }
+      select(fields) {
+        return new PgSelectBuilder({
+          fields: fields ?? void 0,
+          session: this.session,
+          dialect: this.dialect
+        });
+      }
+      selectDistinct(fields) {
+        return new PgSelectBuilder({
+          fields: fields ?? void 0,
+          session: this.session,
+          dialect: this.dialect,
+          distinct: true
+        });
+      }
+      selectDistinctOn(on, fields) {
+        return new PgSelectBuilder({
+          fields: fields ?? void 0,
+          session: this.session,
+          dialect: this.dialect,
+          distinct: { on }
+        });
+      }
+      /**
+       * Creates an update query.
+       *
+       * Calling this method without `.where()` clause will update all rows in a table. The `.where()` clause specifies which rows should be updated.
+       *
+       * Use `.set()` method to specify which values to update.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/update}
+       *
+       * @param table The table to update.
+       *
+       * @example
+       *
+       * ```ts
+       * // Update all rows in the 'cars' table
+       * await db.update(cars).set({ color: 'red' });
+       *
+       * // Update rows with filters and conditions
+       * await db.update(cars).set({ color: 'red' }).where(eq(cars.brand, 'BMW'));
+       *
+       * // Update with returning clause
+       * const updatedCar: Car[] = await db.update(cars)
+       *   .set({ color: 'red' })
+       *   .where(eq(cars.id, 1))
+       *   .returning();
+       * ```
+       */
+      update(table) {
+        return new PgUpdateBuilder(table, this.session, this.dialect);
+      }
+      /**
+       * Creates an insert query.
+       *
+       * Calling this method will create new rows in a table. Use `.values()` method to specify which values to insert.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/insert}
+       *
+       * @param table The table to insert into.
+       *
+       * @example
+       *
+       * ```ts
+       * // Insert one row
+       * await db.insert(cars).values({ brand: 'BMW' });
+       *
+       * // Insert multiple rows
+       * await db.insert(cars).values([{ brand: 'BMW' }, { brand: 'Porsche' }]);
+       *
+       * // Insert with returning clause
+       * const insertedCar: Car[] = await db.insert(cars)
+       *   .values({ brand: 'BMW' })
+       *   .returning();
+       * ```
+       */
+      insert(table) {
+        return new PgInsertBuilder(table, this.session, this.dialect);
+      }
+      /**
+       * Creates a delete query.
+       *
+       * Calling this method without `.where()` clause will delete all rows in a table. The `.where()` clause specifies which rows should be deleted.
+       *
+       * See docs: {@link https://orm.drizzle.team/docs/delete}
+       *
+       * @param table The table to delete from.
+       *
+       * @example
+       *
+       * ```ts
+       * // Delete all rows in the 'cars' table
+       * await db.delete(cars);
+       *
+       * // Delete rows with filters and conditions
+       * await db.delete(cars).where(eq(cars.color, 'green'));
+       *
+       * // Delete with returning clause
+       * const deletedCar: Car[] = await db.delete(cars)
+       *   .where(eq(cars.id, 1))
+       *   .returning();
+       * ```
+       */
+      delete(table) {
+        return new PgDeleteBase(table, this.session, this.dialect);
+      }
+      refreshMaterializedView(view) {
+        return new PgRefreshMaterializedView(view, this.session, this.dialect);
+      }
+      authToken;
+      execute(query) {
+        const sequel = typeof query === "string" ? sql.raw(query) : query.getSQL();
+        const builtQuery = this.dialect.sqlToQuery(sequel);
+        const prepared = this.session.prepareQuery(
+          builtQuery,
+          void 0,
+          void 0,
+          false
+        );
+        return new PgRaw(
+          () => prepared.execute(void 0, this.authToken),
+          sequel,
+          builtQuery,
+          (result) => prepared.mapResult(result, true)
+        );
+      }
+      transaction(transaction, config2) {
+        return this.session.transaction(transaction, config2);
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/cache/core/cache.js
+async function hashQuery(sql2, params) {
+  const dataToHash = `${sql2}-${JSON.stringify(params)}`;
+  const encoder = new TextEncoder();
+  const data = encoder.encode(dataToHash);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = [...new Uint8Array(hashBuffer)];
+  const hashHex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  return hashHex;
+}
+var Cache, NoopCache;
+var init_cache = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/cache/core/cache.js"() {
+    init_entity();
+    Cache = class {
+      static [entityKind] = "Cache";
+    };
+    NoopCache = class extends Cache {
+      strategy() {
+        return "all";
+      }
+      static [entityKind] = "NoopCache";
+      async get(_key) {
+        return void 0;
+      }
+      async put(_hashedQuery, _response, _tables, _config) {
+      }
+      async onMutate(_params) {
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/cache/core/index.js
+var init_core = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/cache/core/index.js"() {
+    init_cache();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/alias.js
+var init_alias2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/alias.js"() {
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/roles.js
+var PgRole;
+var init_roles = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/roles.js"() {
+    init_entity();
+    PgRole = class {
+      constructor(name, config2) {
+        this.name = name;
+        if (config2) {
+          this.createDb = config2.createDb;
+          this.createRole = config2.createRole;
+          this.inherit = config2.inherit;
+        }
+      }
+      static [entityKind] = "PgRole";
+      /** @internal */
+      _existing;
+      /** @internal */
+      createDb;
+      /** @internal */
+      createRole;
+      /** @internal */
+      inherit;
+      existing() {
+        this._existing = true;
+        return this;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/sequence.js
+function pgSequenceWithSchema(name, options, schema) {
+  return new PgSequence(name, options, schema);
+}
+var PgSequence;
+var init_sequence = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/sequence.js"() {
+    init_entity();
+    PgSequence = class {
+      constructor(seqName, seqOptions, schema) {
+        this.seqName = seqName;
+        this.seqOptions = seqOptions;
+        this.schema = schema;
+      }
+      static [entityKind] = "PgSequence";
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/schema.js
+var PgSchema;
+var init_schema = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/schema.js"() {
+    init_entity();
+    init_sql();
+    init_enum();
+    init_sequence();
+    init_table2();
+    init_view();
+    PgSchema = class {
+      constructor(schemaName) {
+        this.schemaName = schemaName;
+      }
+      static [entityKind] = "PgSchema";
+      table = (name, columns, extraConfig) => {
+        return pgTableWithSchema(name, columns, extraConfig, this.schemaName);
+      };
+      view = (name, columns) => {
+        return pgViewWithSchema(name, columns, this.schemaName);
+      };
+      materializedView = (name, columns) => {
+        return pgMaterializedViewWithSchema(name, columns, this.schemaName);
+      };
+      enum(enumName, input) {
+        return Array.isArray(input) ? pgEnumWithSchema(
+          enumName,
+          [...input],
+          this.schemaName
+        ) : pgEnumObjectWithSchema(enumName, input, this.schemaName);
+      }
+      sequence = (name, options) => {
+        return pgSequenceWithSchema(name, options, this.schemaName);
+      };
+      getSQL() {
+        return new SQL([sql.identifier(this.schemaName)]);
+      }
+      shouldOmitSQLParens() {
+        return true;
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/session.js
+var PgPreparedQuery, PgSession, PgTransaction;
+var init_session = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/session.js"() {
+    init_cache();
+    init_entity();
+    init_errors();
+    init_sql2();
+    init_tracing();
+    init_db();
+    PgPreparedQuery = class {
+      constructor(query, cache, queryMetadata, cacheConfig) {
+        this.query = query;
+        this.cache = cache;
+        this.queryMetadata = queryMetadata;
+        this.cacheConfig = cacheConfig;
+        if (cache && cache.strategy() === "all" && cacheConfig === void 0) {
+          this.cacheConfig = { enable: true, autoInvalidate: true };
+        }
+        if (!this.cacheConfig?.enable) {
+          this.cacheConfig = void 0;
+        }
+      }
+      authToken;
+      getQuery() {
+        return this.query;
+      }
+      mapResult(response, _isFromBatch) {
+        return response;
+      }
+      /** @internal */
+      setToken(token) {
+        this.authToken = token;
+        return this;
+      }
+      static [entityKind] = "PgPreparedQuery";
+      /** @internal */
+      joinsNotNullableMap;
+      /** @internal */
+      async queryWithCache(queryString, params, query) {
+        if (this.cache === void 0 || is(this.cache, NoopCache) || this.queryMetadata === void 0) {
+          try {
+            return await query();
+          } catch (e) {
+            throw new DrizzleQueryError(queryString, params, e);
+          }
+        }
+        if (this.cacheConfig && !this.cacheConfig.enable) {
+          try {
+            return await query();
+          } catch (e) {
+            throw new DrizzleQueryError(queryString, params, e);
+          }
+        }
+        if ((this.queryMetadata.type === "insert" || this.queryMetadata.type === "update" || this.queryMetadata.type === "delete") && this.queryMetadata.tables.length > 0) {
+          try {
+            const [res] = await Promise.all([
+              query(),
+              this.cache.onMutate({ tables: this.queryMetadata.tables })
+            ]);
+            return res;
+          } catch (e) {
+            throw new DrizzleQueryError(queryString, params, e);
+          }
+        }
+        if (!this.cacheConfig) {
+          try {
+            return await query();
+          } catch (e) {
+            throw new DrizzleQueryError(queryString, params, e);
+          }
+        }
+        if (this.queryMetadata.type === "select") {
+          const fromCache = await this.cache.get(
+            this.cacheConfig.tag ?? await hashQuery(queryString, params),
+            this.queryMetadata.tables,
+            this.cacheConfig.tag !== void 0,
+            this.cacheConfig.autoInvalidate
+          );
+          if (fromCache === void 0) {
+            let result;
+            try {
+              result = await query();
+            } catch (e) {
+              throw new DrizzleQueryError(queryString, params, e);
+            }
+            await this.cache.put(
+              this.cacheConfig.tag ?? await hashQuery(queryString, params),
+              result,
+              // make sure we send tables that were used in a query only if user wants to invalidate it on each write
+              this.cacheConfig.autoInvalidate ? this.queryMetadata.tables : [],
+              this.cacheConfig.tag !== void 0,
+              this.cacheConfig.config
+            );
+            return result;
+          }
+          return fromCache;
+        }
+        try {
+          return await query();
+        } catch (e) {
+          throw new DrizzleQueryError(queryString, params, e);
+        }
+      }
+    };
+    PgSession = class {
+      constructor(dialect) {
+        this.dialect = dialect;
+      }
+      static [entityKind] = "PgSession";
+      /** @internal */
+      execute(query, token) {
+        return tracer.startActiveSpan("drizzle.operation", () => {
+          const prepared = tracer.startActiveSpan("drizzle.prepareQuery", () => {
+            return this.prepareQuery(
+              this.dialect.sqlToQuery(query),
+              void 0,
+              void 0,
+              false
+            );
+          });
+          return prepared.setToken(token).execute(void 0, token);
+        });
+      }
+      all(query) {
+        return this.prepareQuery(
+          this.dialect.sqlToQuery(query),
+          void 0,
+          void 0,
+          false
+        ).all();
+      }
+      /** @internal */
+      async count(sql2, token) {
+        const res = await this.execute(sql2, token);
+        return Number(
+          res[0]["count"]
+        );
+      }
+    };
+    PgTransaction = class extends PgDatabase {
+      constructor(dialect, session, schema, nestedIndex = 0) {
+        super(dialect, session, schema);
+        this.schema = schema;
+        this.nestedIndex = nestedIndex;
+      }
+      static [entityKind] = "PgTransaction";
+      rollback() {
+        throw new TransactionRollbackError();
+      }
+      /** @internal */
+      getTransactionConfigSQL(config2) {
+        const chunks = [];
+        if (config2.isolationLevel) {
+          chunks.push(`isolation level ${config2.isolationLevel}`);
+        }
+        if (config2.accessMode) {
+          chunks.push(config2.accessMode);
+        }
+        if (typeof config2.deferrable === "boolean") {
+          chunks.push(config2.deferrable ? "deferrable" : "not deferrable");
+        }
+        return sql.raw(chunks.join(" "));
+      }
+      setTransaction(config2) {
+        return this.session.execute(sql`set transaction ${this.getTransactionConfigSQL(config2)}`);
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/subquery.js
+var init_subquery2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/subquery.js"() {
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/utils/index.js
+var init_utils4 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/utils/index.js"() {
+    init_array();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/index.js
+var init_pg_core = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/index.js"() {
+    init_alias2();
+    init_checks();
+    init_columns();
+    init_db();
+    init_dialect();
+    init_foreign_keys();
+    init_indexes();
+    init_policies();
+    init_primary_keys();
+    init_query_builders();
+    init_roles();
+    init_schema();
+    init_sequence();
+    init_session();
+    init_subquery2();
+    init_table2();
+    init_unique_constraint();
+    init_utils3();
+    init_utils4();
+    init_view_common2();
+    init_view();
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/node-postgres/session.js
+var Pool2, types2, NodePgPreparedQuery, NodePgSession, NodePgTransaction;
+var init_session2 = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/node-postgres/session.js"() {
+    init_esm();
+    init_core();
+    init_entity();
+    init_logger2();
+    init_pg_core();
+    init_session();
+    init_sql();
+    init_tracing();
+    init_utils();
+    ({ Pool: Pool2, types: types2 } = esm_default);
+    NodePgPreparedQuery = class extends PgPreparedQuery {
+      constructor(client3, queryString, params, logger2, cache, queryMetadata, cacheConfig, fields, name, _isResponseInArrayMode, customResultMapper) {
+        super({ sql: queryString, params }, cache, queryMetadata, cacheConfig);
+        this.client = client3;
+        this.queryString = queryString;
+        this.params = params;
+        this.logger = logger2;
+        this.fields = fields;
+        this._isResponseInArrayMode = _isResponseInArrayMode;
+        this.customResultMapper = customResultMapper;
+        this.rawQueryConfig = {
+          name,
+          text: queryString,
+          types: {
+            // @ts-ignore
+            getTypeParser: (typeId, format) => {
+              if (typeId === types2.builtins.TIMESTAMPTZ) {
+                return (val) => val;
+              }
+              if (typeId === types2.builtins.TIMESTAMP) {
+                return (val) => val;
+              }
+              if (typeId === types2.builtins.DATE) {
+                return (val) => val;
+              }
+              if (typeId === types2.builtins.INTERVAL) {
+                return (val) => val;
+              }
+              if (typeId === 1231) {
+                return (val) => val;
+              }
+              if (typeId === 1115) {
+                return (val) => val;
+              }
+              if (typeId === 1185) {
+                return (val) => val;
+              }
+              if (typeId === 1187) {
+                return (val) => val;
+              }
+              if (typeId === 1182) {
+                return (val) => val;
+              }
+              return types2.getTypeParser(typeId, format);
+            }
+          }
+        };
+        this.queryConfig = {
+          name,
+          text: queryString,
+          rowMode: "array",
+          types: {
+            // @ts-ignore
+            getTypeParser: (typeId, format) => {
+              if (typeId === types2.builtins.TIMESTAMPTZ) {
+                return (val) => val;
+              }
+              if (typeId === types2.builtins.TIMESTAMP) {
+                return (val) => val;
+              }
+              if (typeId === types2.builtins.DATE) {
+                return (val) => val;
+              }
+              if (typeId === types2.builtins.INTERVAL) {
+                return (val) => val;
+              }
+              if (typeId === 1231) {
+                return (val) => val;
+              }
+              if (typeId === 1115) {
+                return (val) => val;
+              }
+              if (typeId === 1185) {
+                return (val) => val;
+              }
+              if (typeId === 1187) {
+                return (val) => val;
+              }
+              if (typeId === 1182) {
+                return (val) => val;
+              }
+              return types2.getTypeParser(typeId, format);
+            }
+          }
+        };
+      }
+      static [entityKind] = "NodePgPreparedQuery";
+      rawQueryConfig;
+      queryConfig;
+      async execute(placeholderValues = {}) {
+        return tracer.startActiveSpan("drizzle.execute", async () => {
+          const params = fillPlaceholders(this.params, placeholderValues);
+          this.logger.logQuery(this.rawQueryConfig.text, params);
+          const { fields, rawQueryConfig: rawQuery, client: client3, queryConfig: query, joinsNotNullableMap, customResultMapper } = this;
+          if (!fields && !customResultMapper) {
+            return tracer.startActiveSpan("drizzle.driver.execute", async (span) => {
+              span?.setAttributes({
+                "drizzle.query.name": rawQuery.name,
+                "drizzle.query.text": rawQuery.text,
+                "drizzle.query.params": JSON.stringify(params)
+              });
+              return this.queryWithCache(rawQuery.text, params, async () => {
+                return await client3.query(rawQuery, params);
+              });
+            });
+          }
+          const result = await tracer.startActiveSpan("drizzle.driver.execute", (span) => {
+            span?.setAttributes({
+              "drizzle.query.name": query.name,
+              "drizzle.query.text": query.text,
+              "drizzle.query.params": JSON.stringify(params)
+            });
+            return this.queryWithCache(query.text, params, async () => {
+              return await client3.query(query, params);
+            });
+          });
+          return tracer.startActiveSpan("drizzle.mapResponse", () => {
+            return customResultMapper ? customResultMapper(result.rows) : result.rows.map((row) => mapResultRow(fields, row, joinsNotNullableMap));
+          });
+        });
+      }
+      all(placeholderValues = {}) {
+        return tracer.startActiveSpan("drizzle.execute", () => {
+          const params = fillPlaceholders(this.params, placeholderValues);
+          this.logger.logQuery(this.rawQueryConfig.text, params);
+          return tracer.startActiveSpan("drizzle.driver.execute", (span) => {
+            span?.setAttributes({
+              "drizzle.query.name": this.rawQueryConfig.name,
+              "drizzle.query.text": this.rawQueryConfig.text,
+              "drizzle.query.params": JSON.stringify(params)
+            });
+            return this.queryWithCache(this.rawQueryConfig.text, params, async () => {
+              return this.client.query(this.rawQueryConfig, params);
+            }).then((result) => result.rows);
+          });
+        });
+      }
+      /** @internal */
+      isResponseInArrayMode() {
+        return this._isResponseInArrayMode;
+      }
+    };
+    NodePgSession = class _NodePgSession extends PgSession {
+      constructor(client3, dialect, schema, options = {}) {
+        super(dialect);
+        this.client = client3;
+        this.schema = schema;
+        this.options = options;
+        this.logger = options.logger ?? new NoopLogger();
+        this.cache = options.cache ?? new NoopCache();
+      }
+      static [entityKind] = "NodePgSession";
+      logger;
+      cache;
+      prepareQuery(query, fields, name, isResponseInArrayMode, customResultMapper, queryMetadata, cacheConfig) {
+        return new NodePgPreparedQuery(
+          this.client,
+          query.sql,
+          query.params,
+          this.logger,
+          this.cache,
+          queryMetadata,
+          cacheConfig,
+          fields,
+          name,
+          isResponseInArrayMode,
+          customResultMapper
+        );
+      }
+      async transaction(transaction, config2) {
+        const isPool = this.client instanceof Pool2 || Object.getPrototypeOf(this.client).constructor.name.includes("Pool");
+        const session = isPool ? new _NodePgSession(await this.client.connect(), this.dialect, this.schema, this.options) : this;
+        const tx = new NodePgTransaction(this.dialect, session, this.schema);
+        await tx.execute(sql`begin${config2 ? sql` ${tx.getTransactionConfigSQL(config2)}` : void 0}`);
+        try {
+          const result = await transaction(tx);
+          await tx.execute(sql`commit`);
+          return result;
+        } catch (error) {
+          await tx.execute(sql`rollback`);
+          throw error;
+        } finally {
+          if (isPool) session.client.release();
+        }
+      }
+      async count(sql2) {
+        const res = await this.execute(sql2);
+        return Number(
+          res["rows"][0]["count"]
+        );
+      }
+    };
+    NodePgTransaction = class _NodePgTransaction extends PgTransaction {
+      static [entityKind] = "NodePgTransaction";
+      async transaction(transaction) {
+        const savepointName = `sp${this.nestedIndex + 1}`;
+        const tx = new _NodePgTransaction(
+          this.dialect,
+          this.session,
+          this.schema,
+          this.nestedIndex + 1
+        );
+        await tx.execute(sql.raw(`savepoint ${savepointName}`));
+        try {
+          const result = await transaction(tx);
+          await tx.execute(sql.raw(`release savepoint ${savepointName}`));
+          return result;
+        } catch (err) {
+          await tx.execute(sql.raw(`rollback to savepoint ${savepointName}`));
+          throw err;
+        }
+      }
+    };
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/node-postgres/driver.js
+function construct(client3, config2 = {}) {
+  const dialect = new PgDialect({ casing: config2.casing });
+  let logger2;
+  if (config2.logger === true) {
+    logger2 = new DefaultLogger();
+  } else if (config2.logger !== false) {
+    logger2 = config2.logger;
+  }
+  let schema;
+  if (config2.schema) {
+    const tablesConfig = extractTablesRelationalConfig(
+      config2.schema,
+      createTableRelationsHelpers
+    );
+    schema = {
+      fullSchema: config2.schema,
+      schema: tablesConfig.tables,
+      tableNamesMap: tablesConfig.tableNamesMap
+    };
+  }
+  const driver = new NodePgDriver(client3, dialect, { logger: logger2, cache: config2.cache });
+  const session = driver.createSession(schema);
+  const db2 = new NodePgDatabase(dialect, session, schema);
+  db2.$client = client3;
+  db2.$cache = config2.cache;
+  if (db2.$cache) {
+    db2.$cache["invalidate"] = config2.cache?.onMutate;
+  }
+  return db2;
+}
+function drizzle(...params) {
+  if (typeof params[0] === "string") {
+    const instance = new esm_default.Pool({
+      connectionString: params[0]
+    });
+    return construct(instance, params[1]);
+  }
+  if (isConfig(params[0])) {
+    const { connection, client: client3, ...drizzleConfig } = params[0];
+    if (client3) return construct(client3, drizzleConfig);
+    const instance = typeof connection === "string" ? new esm_default.Pool({
+      connectionString: connection
+    }) : new esm_default.Pool(connection);
+    return construct(instance, drizzleConfig);
+  }
+  return construct(params[0], params[1]);
+}
+var NodePgDriver, NodePgDatabase;
+var init_driver = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/node-postgres/driver.js"() {
+    init_esm();
+    init_entity();
+    init_logger2();
+    init_db();
+    init_dialect();
+    init_relations();
+    init_utils();
+    init_session2();
+    NodePgDriver = class {
+      constructor(client3, dialect, options = {}) {
+        this.client = client3;
+        this.dialect = dialect;
+        this.options = options;
+      }
+      static [entityKind] = "NodePgDriver";
+      createSession(schema) {
+        return new NodePgSession(this.client, this.dialect, schema, {
+          logger: this.options.logger,
+          cache: this.options.cache
+        });
+      }
+    };
+    NodePgDatabase = class extends PgDatabase {
+      static [entityKind] = "NodePgDatabase";
+    };
+    ((drizzle2) => {
+      function mock(config2) {
+        return construct({}, config2);
+      }
+      drizzle2.mock = mock;
+    })(drizzle || (drizzle = {}));
+  }
+});
+
+// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/node-postgres/index.js
+var init_node_postgres = __esm({
+  "../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/node-postgres/index.js"() {
+    init_driver();
+    init_session2();
+  }
+});
+
+// ../../lib/db/src/schema/trading-bots.ts
+var botStatusEnum, botPhaseEnum, walletUsersTable, tradingBotsTable, activationPaymentsTable, kasWithdrawalsTable, managedLotsTable;
+var init_trading_bots = __esm({
+  "../../lib/db/src/schema/trading-bots.ts"() {
+    "use strict";
+    init_pg_core();
+    botStatusEnum = pgEnum("bot_status", [
+      "setup",
+      "ready",
+      "running",
+      "paused",
+      "stopped"
+    ]);
+    botPhaseEnum = pgEnum("bot_phase", ["buying", "selling"]);
+    walletUsersTable = pgTable(
+      "wallet_users",
+      {
+        id: uuid("id").primaryKey().defaultRandom(),
+        walletAddress: text("wallet_address").notNull(),
+        publicKey: text("public_key").notNull(),
+        createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => /* @__PURE__ */ new Date())
+      },
+      (table) => [uniqueIndex("wallet_users_address_unique").on(table.walletAddress)]
+    );
+    tradingBotsTable = pgTable(
+      "trading_bots",
+      {
+        id: uuid("id").primaryKey().defaultRandom(),
+        userId: uuid("user_id").notNull().references(() => walletUsersTable.id, { onDelete: "cascade" }),
+        botAddress: text("bot_address").notNull(),
+        encryptedPrivateKey: text("encrypted_private_key").notNull(),
+        tokenId: text("token_id"),
+        tokenSymbol: text("token_symbol"),
+        activationTxId: text("activation_tx_id"),
+        activationVerifiedAt: timestamp("activation_verified_at", { withTimezone: true }),
+        configurationVersion: integer("configuration_version").notNull().default(1),
+        status: botStatusEnum("status").notNull().default("setup"),
+        phase: botPhaseEnum("phase").notNull().default("buying"),
+        completedBuys: integer("completed_buys").notNull().default(0),
+        completedSells: integer("completed_sells").notNull().default(0),
+        totalTrades: integer("total_trades").notNull().default(0),
+        lastTradeAt: timestamp("last_trade_at", { withTimezone: true }),
+        nextRunAt: timestamp("next_run_at", { withTimezone: true }),
+        inFlight: jsonb("in_flight"),
+        stopReason: text("stop_reason"),
+        createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => /* @__PURE__ */ new Date())
+      },
+      (table) => [
+        uniqueIndex("trading_bots_user_unique").on(table.userId),
+        uniqueIndex("trading_bots_address_unique").on(table.botAddress),
+        uniqueIndex("trading_bots_activation_tx_unique").on(table.activationTxId)
+      ]
+    );
+    activationPaymentsTable = pgTable(
+      "activation_payments",
+      {
+        id: uuid("id").primaryKey().defaultRandom(),
+        botId: uuid("bot_id").notNull().references(() => tradingBotsTable.id, { onDelete: "cascade" }),
+        userId: uuid("user_id").notNull().references(() => walletUsersTable.id, { onDelete: "cascade" }),
+        configurationVersion: integer("configuration_version").notNull(),
+        tokenId: text("token_id").notNull(),
+        transactionId: text("transaction_id").notNull(),
+        verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull().defaultNow()
+      },
+      (table) => [
+        uniqueIndex("activation_payments_transaction_unique").on(table.transactionId),
+        uniqueIndex("activation_payments_configuration_unique").on(table.botId, table.configurationVersion)
+      ]
+    );
+    kasWithdrawalsTable = pgTable(
+      "kas_withdrawals",
+      {
+        id: uuid("id").primaryKey().defaultRandom(),
+        botId: uuid("bot_id").notNull().references(() => tradingBotsTable.id, { onDelete: "cascade" }),
+        userId: uuid("user_id").notNull().references(() => walletUsersTable.id, { onDelete: "cascade" }),
+        transactionId: text("transaction_id").notNull(),
+        destinationAddress: text("destination_address").notNull(),
+        amountSompi: bigint("amount_sompi", { mode: "bigint" }).notNull(),
+        feeSompi: bigint("fee_sompi", { mode: "bigint" }).notNull(),
+        createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+      },
+      (table) => [uniqueIndex("kas_withdrawals_transaction_unique").on(table.transactionId)]
+    );
+    managedLotsTable = pgTable(
+      "managed_lots",
+      {
+        id: uuid("id").primaryKey().defaultRandom(),
+        botId: uuid("bot_id").notNull().references(() => tradingBotsTable.id, { onDelete: "cascade" }),
+        buyTransactionId: text("buy_transaction_id").notNull(),
+        outputIndex: integer("output_index").notNull(),
+        tokenAmount: bigint("token_amount", { mode: "bigint" }).notNull(),
+        costSompi: bigint("cost_sompi", { mode: "bigint" }).notNull(),
+        tokenId: text("token_id"),
+        tokenSymbol: text("token_symbol"),
+        sellTransactionId: text("sell_transaction_id"),
+        soldAt: timestamp("sold_at", { withTimezone: true }),
+        createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+      },
+      (table) => [
+        uniqueIndex("managed_lots_outpoint_unique").on(
+          table.buyTransactionId,
+          table.outputIndex
+        )
+      ]
+    );
+  }
+});
+
+// ../../lib/db/src/schema/index.ts
+var schema_exports = {};
+__export(schema_exports, {
+  activationPaymentsTable: () => activationPaymentsTable,
+  botPhaseEnum: () => botPhaseEnum,
+  botStatusEnum: () => botStatusEnum,
+  kasWithdrawalsTable: () => kasWithdrawalsTable,
+  managedLotsTable: () => managedLotsTable,
+  tradingBotsTable: () => tradingBotsTable,
+  walletUsersTable: () => walletUsersTable
+});
+var init_schema2 = __esm({
+  "../../lib/db/src/schema/index.ts"() {
+    "use strict";
+    init_trading_bots();
+  }
+});
+
+// ../../lib/db/src/index.ts
+var Pool3, pool, db;
+var init_src = __esm({
+  "../../lib/db/src/index.ts"() {
+    "use strict";
+    init_node_postgres();
+    init_esm();
+    init_schema2();
+    init_schema2();
+    ({ Pool: Pool3 } = esm_default);
+    if (!process.env.DATABASE_URL) {
+      throw new Error(
+        "DATABASE_URL must be set. Did you forget to provision a database?"
+      );
+    }
+    pool = new Pool3({ connectionString: process.env.DATABASE_URL });
+    db = drizzle(pool, { schema: schema_exports });
+  }
+});
+
+// src/lib/interrupted-trade-service.ts
+async function reconcileStaleInFlight(bot) {
+  const marker = bot.inFlight;
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return false;
+  const startedAtValue = "startedAt" in marker ? marker.startedAt : void 0;
+  if (typeof startedAtValue !== "string") return false;
+  const startedAt = new Date(startedAtValue);
+  if (!Number.isFinite(startedAt.getTime()) || Date.now() - startedAt.getTime() < STALE_IN_FLIGHT_MS) {
+    return false;
+  }
+  const after = startedAt.getTime() - 6e4;
+  let before;
+  let outgoing;
+  for (let page = 0; page < 100; page += 1) {
+    const url = new URL(
+      `/addresses/${encodeURIComponent(bot.botAddress)}/full-transactions-page`,
+      KASPA_REST_API
+    );
+    url.searchParams.set("limit", "500");
+    if (before === void 0) url.searchParams.set("after", String(after));
+    else url.searchParams.set("before", String(before));
+    url.searchParams.set("resolve_previous_outpoints", "light");
+    const response = await fetch(url, { signal: AbortSignal.timeout(15e3) });
+    if (!response.ok) {
+      throw new Error(`Kaspa history lookup failed with HTTP ${response.status}.`);
+    }
+    const transactions = await response.json();
+    if (!Array.isArray(transactions) || transactions.some(
+      (tx) => !Number.isFinite(tx.block_time) || !Array.isArray(tx.inputs) || typeof tx.is_accepted !== "boolean"
+    )) {
+      throw new Error("Kaspa history response is incomplete; reconciliation cannot proceed.");
+    }
+    outgoing = transactions.find(
+      (transaction) => transaction.is_accepted === true && typeof transaction.block_time === "number" && transaction.block_time >= startedAt.getTime() && transaction.inputs?.some((input) => input.previous_outpoint_address === bot.botAddress)
+    );
+    if (outgoing) break;
+    if (transactions.length === 0 || Math.min(...transactions.map((tx) => tx.block_time)) <= after) break;
+    const nextBefore = response.headers.get("x-next-page-before");
+    if (!nextBefore) {
+      throw new Error("Kaspa history pagination ended before the reconciliation window was covered.");
+    }
+    const parsedNextBefore = Number(nextBefore);
+    if (!Number.isFinite(parsedNextBefore) || parsedNextBefore <= after || before !== void 0 && parsedNextBefore >= before) {
+      throw new Error("Kaspa history pagination returned an invalid cursor.");
+    }
+    before = parsedNextBefore;
+    if (page === 99) {
+      throw new Error("Kaspa history is too large to reconcile safely.");
+    }
+  }
+  if (outgoing) {
+    await db.update(tradingBotsTable).set({
+      status: "paused",
+      nextRunAt: null,
+      stopReason: `Safety pause: transaction ${outgoing.transaction_id ?? "unknown"} reached the chain during an interrupted trade and requires reconciliation.`,
+      updatedAt: /* @__PURE__ */ new Date()
+    }).where(and(
+      eq(tradingBotsTable.id, bot.id),
+      eq(tradingBotsTable.inFlight, marker)
+    ));
+    logger.error(
+      { botId: bot.id, transactionId: outgoing.transaction_id },
+      "Interrupted user trade reached the chain; manual reconciliation required"
+    );
+    return false;
+  }
+  const cleared = await db.update(tradingBotsTable).set({
+    inFlight: null,
+    nextRunAt: bot.status === "running" ? /* @__PURE__ */ new Date() : null,
+    stopReason: null,
+    updatedAt: /* @__PURE__ */ new Date()
+  }).where(and(
+    eq(tradingBotsTable.id, bot.id),
+    eq(tradingBotsTable.inFlight, marker)
+  )).returning({ id: tradingBotsTable.id });
+  if (!cleared.length) return false;
+  logger.warn({ botId: bot.id }, "Cleared stale user trade after confirming no outgoing chain transaction");
+  return true;
+}
+var STALE_IN_FLIGHT_MS, KASPA_REST_API;
+var init_interrupted_trade_service = __esm({
+  "src/lib/interrupted-trade-service.ts"() {
+    "use strict";
+    init_drizzle_orm();
+    init_src();
+    init_logger();
+    STALE_IN_FLIGHT_MS = 10 * 6e4;
+    KASPA_REST_API = "https://api.kaspa.org";
+  }
+});
+
+// src/lib/bot-sell-all-service.ts
+var bot_sell_all_service_exports = {};
+__export(bot_sell_all_service_exports, {
+  expireStaleSellAllInFlight: () => expireStaleSellAllInFlight,
+  sellAllUserBotManagedPositions: () => sellAllUserBotManagedPositions
+});
+async function listOpenLots(botId) {
+  return db.select().from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt))).orderBy(asc(managedLotsTable.createdAt));
+}
+function isSignatureScriptRejection(message) {
+  return /verification failed|script ran, but verification failed|failed to verify the signature script/i.test(message);
+}
+function isHardSubmissionRejection(message) {
+  return isSignatureScriptRejection(message) || /double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i.test(message);
+}
+function isTransientFailure(error, message) {
+  if (error instanceof RetryableTradeStateError) return true;
+  if (isHardSubmissionRejection(message)) return false;
+  return /orphan|is an orphan|curve is busy|in-flight sequenced|amm pool has an in-flight|rejected transaction/i.test(message);
+}
+function sellAllMarkerAgeMs(marker) {
+  const beat = typeof marker.heartbeatAt === "string" ? Date.parse(marker.heartbeatAt) : typeof marker.startedAt === "string" ? Date.parse(marker.startedAt) : Number.NaN;
+  return Number.isFinite(beat) ? Date.now() - beat : Number.POSITIVE_INFINITY;
+}
+function retainSellAllForReconciliation(stopReason) {
+  return /uncertain|reconcil/i.test(stopReason ?? "");
+}
+function describeActiveSellAll(marker) {
+  const ageSec = Math.max(0, Math.round(sellAllMarkerAgeMs(marker) / 1e3));
+  const sold = typeof marker.soldCount === "number" ? marker.soldCount : 0;
+  const lots = typeof marker.lotCount === "number" ? marker.lotCount : void 0;
+  const stage = marker.stage === "consolidate" ? "merging lots" : "selling";
+  return lots != null ? `${stage}, ${sold} of ${lots} sold, last update ${ageSec}s ago` : `${stage}, last update ${ageSec}s ago`;
+}
+async function clearSellAllByAction(botId) {
+  await db.update(tradingBotsTable).set({
+    inFlight: null,
+    stopReason: null,
+    updatedAt: /* @__PURE__ */ new Date()
+  }).where(and(
+    eq(tradingBotsTable.id, botId),
+    sql`${tradingBotsTable.inFlight}->>'action' = 'sell-all'`
+  ));
+}
+async function expireStaleSellAllInFlight(bot) {
+  const marker = bot.inFlight;
+  if (!marker || marker.action !== "sell-all") return { cleared: false, active: false };
+  if (retainSellAllForReconciliation(bot.stopReason)) {
+    return { cleared: false, active: true };
+  }
+  const ageMs = sellAllMarkerAgeMs(marker);
+  const rejected = isHardSubmissionRejection(bot.stopReason ?? "");
+  if (!rejected && ageMs < ACTIVE_SELL_ALL_MS) {
+    return { cleared: false, active: true };
+  }
+  await clearSellAllByAction(bot.id);
+  logger.warn({ botId: bot.id, ageMs }, "Cleared stalled sell-all marker on dashboard refresh");
+  return { cleared: true, active: false };
+}
+async function heartbeat(botId, base, patch = {}) {
+  const next = {
+    ...base,
+    ...patch,
+    heartbeatAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  await db.update(tradingBotsTable).set({
+    inFlight: next,
+    updatedAt: /* @__PURE__ */ new Date()
+  }).where(eq(tradingBotsTable.id, botId));
+  return next;
+}
+async function markLotsSold(botId, lots, transactionId, previousTotalTrades) {
+  const soldAt = /* @__PURE__ */ new Date();
+  await db.transaction(async (tx) => {
+    for (const lot of lots) {
+      await tx.update(managedLotsTable).set({
+        sellTransactionId: transactionId,
+        soldAt
+      }).where(eq(managedLotsTable.id, lot.id));
+    }
+    const remaining = await tx.select({ id: managedLotsTable.id }).from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt))).limit(1);
+    const cleared = remaining.length === 0;
+    await tx.update(tradingBotsTable).set({
+      phase: cleared ? "buying" : "selling",
+      ...cleared ? { completedBuys: 0, completedSells: 0 } : {},
+      totalTrades: previousTotalTrades + 1,
+      lastTradeAt: soldAt,
+      nextRunAt: null,
+      stopReason: null,
+      updatedAt: soldAt
+    }).where(eq(tradingBotsTable.id, botId));
+  });
+  return soldAt;
+}
+async function sellMappedLots(args) {
+  const { botId, credentials, lots, mapped, deadline, stage } = args;
+  let { inFlight, soldCount, previousTotalTrades } = args;
+  let lastMessage = "Unknown sell failure";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_BATCH && Date.now() < deadline; attempt += 1) {
+    inFlight = await heartbeat(botId, inFlight, {
+      lotCount: lots.length,
+      soldCount,
+      stage
+    });
+    let submissionAttempted = false;
+    try {
+      const result = await executeUserAutomatedSellLots(mapped, credentials);
+      submissionAttempted = true;
+      if (!result.transactionId) {
+        throw new Error("Sell-all submission returned no transaction ID.");
+      }
+      await markLotsSold(botId, lots, result.transactionId, previousTotalTrades);
+      previousTotalTrades += 1;
+      soldCount += lots.length;
+      logger.info({
+        botId,
+        transactionId: result.transactionId,
+        soldCount: lots.length,
+        tokenIn: result.tokenIn,
+        stage
+      }, "Sell-all batch completed");
+      return {
+        inFlight,
+        transactionId: result.transactionId,
+        soldCount,
+        totalTrades: previousTotalTrades
+      };
+    } catch (error) {
+      submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
+      lastMessage = error instanceof Error ? error.message : "Unknown sell failure";
+      const hardReject = isHardSubmissionRejection(lastMessage);
+      const transient = isTransientFailure(error, lastMessage);
+      if (submissionAttempted && !hardReject && !transient) {
+        await db.update(tradingBotsTable).set({
+          status: "paused",
+          nextRunAt: null,
+          stopReason: `Sell-all paused after uncertain submission: ${lastMessage}`,
+          inFlight,
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq(tradingBotsTable.id, botId));
+        throw new Error(
+          `Sell-all may have been submitted and needs reconciliation. ${lastMessage}`
+        );
+      }
+      if (hardReject) {
+        throw new Error(lastMessage);
+      }
+      if (transient && attempt < MAX_ATTEMPTS_PER_BATCH && Date.now() + RETRY_WAIT_MS < deadline) {
+        logger.warn({
+          botId,
+          attempt,
+          lotCount: lots.length,
+          err: lastMessage,
+          stage
+        }, "Sell-all retrying batch after transient failure");
+        inFlight = await heartbeat(botId, inFlight, { lotCount: lots.length, soldCount, stage });
+        await sleep(RETRY_WAIT_MS);
+        continue;
+      }
+      throw new Error(lastMessage);
+    }
+  }
+  throw new Error(`Sell-all timed out: ${lastMessage}`);
+}
+async function consolidateThenSell(args) {
+  const { botId, credentials, lots, deadline } = args;
+  let { inFlight, soldCount, previousTotalTrades } = args;
+  let lastMessage = "Unknown consolidate failure";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_BATCH && Date.now() < deadline; attempt += 1) {
+    inFlight = await heartbeat(botId, inFlight, {
+      lotCount: lots.length,
+      soldCount,
+      stage: "consolidate"
+    });
+    let submissionAttempted = false;
+    try {
+      const mapped = lots.map((lot) => ({
+        transactionId: lot.buyTransactionId,
+        index: lot.outputIndex,
+        amount: lot.tokenAmount.toString()
+      }));
+      const consolidated = await executeUserAutomatedConsolidateLots(mapped, credentials);
+      submissionAttempted = true;
+      logger.info({
+        botId,
+        transactionId: consolidated.transactionId,
+        lotCount: lots.length,
+        amount: consolidated.amount
+      }, "Sell-all consolidated lots into one token UTXO");
+      const sold = await sellMappedLots({
+        botId,
+        credentials,
+        lots,
+        mapped: [{
+          transactionId: consolidated.transactionId,
+          index: consolidated.index,
+          amount: consolidated.amount
+        }],
+        inFlight,
+        deadline,
+        previousTotalTrades,
+        soldCount,
+        stage: "sell"
+      });
+      return {
+        ...sold,
+        consolidateTransactionId: consolidated.transactionId
+      };
+    } catch (error) {
+      submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
+      lastMessage = error instanceof Error ? error.message : "Unknown consolidate failure";
+      const hardReject = isHardSubmissionRejection(lastMessage);
+      const transient = isTransientFailure(error, lastMessage);
+      if (submissionAttempted && !hardReject && !transient) {
+        await db.update(tradingBotsTable).set({
+          status: "paused",
+          nextRunAt: null,
+          stopReason: `Sell-all paused after uncertain consolidation: ${lastMessage}`,
+          inFlight,
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq(tradingBotsTable.id, botId));
+        throw new Error(
+          `Sell-all may have consolidated on-chain and needs reconciliation. ${lastMessage}`
+        );
+      }
+      if (hardReject) throw new Error(lastMessage);
+      if (transient && attempt < MAX_ATTEMPTS_PER_BATCH && Date.now() + RETRY_WAIT_MS < deadline) {
+        logger.warn({
+          botId,
+          attempt,
+          err: lastMessage
+        }, "Sell-all retrying consolidate after transient failure");
+        await sleep(RETRY_WAIT_MS);
+        continue;
+      }
+      throw new Error(lastMessage);
+    }
+  }
+  throw new Error(`Sell-all consolidate timed out: ${lastMessage}`);
+}
+async function sellLotsOneByOne(args) {
+  const { botId, credentials, lots, deadline } = args;
+  let { inFlight, soldCount, previousTotalTrades } = args;
+  const sellTransactionIds = [];
+  for (let i = 0; i < lots.length && Date.now() < deadline; i += 1) {
+    const lot = lots[i];
+    const result = await sellMappedLots({
+      botId,
+      credentials,
+      lots: [lot],
+      mapped: [{
+        transactionId: lot.buyTransactionId,
+        index: lot.outputIndex,
+        amount: lot.tokenAmount.toString()
+      }],
+      inFlight,
+      deadline,
+      previousTotalTrades,
+      soldCount,
+      stage: "sell"
+    });
+    inFlight = result.inFlight;
+    sellTransactionIds.push(result.transactionId);
+    soldCount = result.soldCount;
+    previousTotalTrades = result.totalTrades;
+    if (i < lots.length - 1 && Date.now() + BETWEEN_LOTS_MS < deadline) {
+      inFlight = await heartbeat(botId, inFlight, { soldCount, stage: "sell" });
+      await sleep(BETWEEN_LOTS_MS);
+    }
+  }
+  return { inFlight, sellTransactionIds, soldCount, totalTrades: previousTotalTrades };
+}
+async function sellAllUserBotManagedPositions(userId2) {
+  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
+  if (!bot) throw new Error("Bot wallet was not found.");
+  const tokenId = bot.tokenId;
+  if (!tokenId) throw new Error("Bot has no configured token to sell.");
+  if (bot.status === "running") {
+    throw new Error("Stop trading before selling remaining managed positions.");
+  }
+  if (bot.inFlight) {
+    const marker = bot.inFlight;
+    if (marker.action === "sell-all") {
+      if (retainSellAllForReconciliation(bot.stopReason)) {
+        throw new Error(
+          bot.stopReason ?? "The last sell needs reconciliation before retrying Sell All."
+        );
+      }
+      const ageMs = sellAllMarkerAgeMs(marker);
+      const rejected = isHardSubmissionRejection(bot.stopReason ?? "");
+      const activelyRunning = !rejected && ageMs < ACTIVE_SELL_ALL_MS;
+      if (activelyRunning) {
+        throw new Error(
+          `Sell All is still running (${describeActiveSellAll(marker)}). Wait for that submit to finish. If it stays stuck, wait about 90 seconds and click Sell All again.`
+        );
+      }
+      await clearSellAllByAction(bot.id);
+      logger.warn({ botId: bot.id, ageMs, stopReason: bot.stopReason }, "Cleared stalled sell-all marker for retry");
+      [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
+      if (!bot) throw new Error("Bot wallet was not found.");
+      if (bot.inFlight) {
+        throw new Error("The bot operation changed. Refresh and try sell all again.");
+      }
+    } else {
+      await reconcileStaleInFlight(bot);
+      [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
+      if (!bot || bot.inFlight) {
+        throw new Error("The interrupted trade requires reconciliation before selling positions.");
+      }
+    }
+  }
+  const openLots = await listOpenLots(bot.id);
+  if (openLots.length === 0) {
+    return {
+      soldCount: 0,
+      remainingOpenLots: 0,
+      sellTransactionIds: [],
+      complete: true,
+      message: "No open managed token positions to sell."
+    };
+  }
+  const startedAt = /* @__PURE__ */ new Date();
+  let inFlight = {
+    action: "sell-all",
+    startedAt: startedAt.toISOString(),
+    heartbeatAt: startedAt.toISOString(),
+    lotCount: openLots.length,
+    soldCount: 0,
+    stage: "sell"
+  };
+  const [claim] = await db.update(tradingBotsTable).set({
+    inFlight,
+    stopReason: null,
+    updatedAt: startedAt
+  }).where(and(
+    eq(tradingBotsTable.id, bot.id),
+    ne(tradingBotsTable.status, "running"),
+    isNull(tradingBotsTable.inFlight)
+  )).returning({ id: tradingBotsTable.id });
+  if (!claim) throw new Error("The bot state changed. Refresh and try sell all again.");
+  const credentials = {
+    privateKey: decryptPrivateKey(bot.encryptedPrivateKey),
+    tokenId
+  };
+  const deadline = Date.now() + SELL_ALL_DEADLINE_MS;
+  const sellTransactionIds = [];
+  let soldCount = 0;
+  let totalTrades = bot.totalTrades;
+  try {
+    const mapped = openLots.map((lot) => ({
+      transactionId: lot.buyTransactionId,
+      index: lot.outputIndex,
+      amount: lot.tokenAmount.toString()
+    }));
+    try {
+      if (openLots.length === 1) {
+        const result = await sellMappedLots({
+          botId: bot.id,
+          credentials,
+          lots: openLots,
+          mapped,
+          inFlight,
+          deadline,
+          previousTotalTrades: totalTrades,
+          soldCount,
+          stage: "sell"
+        });
+        inFlight = result.inFlight;
+        sellTransactionIds.push(result.transactionId);
+        soldCount = result.soldCount;
+        totalTrades = result.totalTrades;
+      } else {
+        logger.info({
+          botId: bot.id,
+          lotCount: openLots.length
+        }, "Sell-all using one-lot submits to avoid multi-input AMM verify rejects");
+        const sequential = await sellLotsOneByOne({
+          botId: bot.id,
+          credentials,
+          lots: openLots,
+          inFlight,
+          deadline,
+          previousTotalTrades: totalTrades,
+          soldCount
+        });
+        inFlight = sequential.inFlight;
+        sellTransactionIds.push(...sequential.sellTransactionIds);
+        soldCount = sequential.soldCount;
+        totalTrades = sequential.totalTrades;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown sell failure";
+      if (/needs reconciliation|uncertain submission|uncertain consolidation/i.test(message)) {
+        throw error;
+      }
+      if (!isHardSubmissionRejection(message)) {
+        await db.update(tradingBotsTable).set({
+          inFlight: null,
+          stopReason: `Sell-all failed: ${message}`,
+          phase: "selling",
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq(tradingBotsTable.id, bot.id));
+        throw new Error(`Sell-all failed: ${message}`);
+      }
+      let remaining = await listOpenLots(bot.id);
+      if (remaining.length === 0) {
+        soldCount = openLots.length;
+      } else if (remaining.length >= 2 && isHardSubmissionRejection(message)) {
+        logger.warn({
+          botId: bot.id,
+          lotCount: remaining.length,
+          err: message
+        }, "Sell-all falling back to consolidate-then-sell after lot rejects");
+        const result = await consolidateThenSell({
+          botId: bot.id,
+          credentials,
+          lots: remaining,
+          inFlight,
+          deadline,
+          previousTotalTrades: totalTrades,
+          soldCount
+        });
+        inFlight = result.inFlight;
+        sellTransactionIds.push(result.transactionId);
+        soldCount = result.soldCount;
+        totalTrades = result.totalTrades;
+      } else {
+        await db.update(tradingBotsTable).set({
+          inFlight: null,
+          stopReason: `Sell-all failed: ${message}`,
+          phase: "selling",
+          updatedAt: /* @__PURE__ */ new Date()
+        }).where(eq(tradingBotsTable.id, bot.id));
+        throw error;
+      }
+    }
+    const leftover = await listOpenLots(bot.id);
+    await db.update(tradingBotsTable).set({
+      inFlight: null,
+      stopReason: leftover.length === 0 ? null : `Sell-all incomplete: ${leftover.length} managed lot(s) still open.`,
+      phase: leftover.length === 0 ? "buying" : "selling",
+      completedBuys: leftover.length === 0 ? 0 : bot.completedBuys,
+      completedSells: leftover.length === 0 ? 0 : bot.completedSells,
+      updatedAt: /* @__PURE__ */ new Date()
+    }).where(eq(tradingBotsTable.id, bot.id));
+    if (leftover.length > 0) {
+      throw new Error(
+        `Sell-all incomplete after ${soldCount} sale(s); ${leftover.length} managed lot(s) remain.`
+      );
+    }
+    return {
+      soldCount,
+      remainingOpenLots: 0,
+      sellTransactionIds,
+      complete: true,
+      message: sellTransactionIds.length === 1 ? `Sold all ${soldCount} managed position(s) in one transaction. You can withdraw KAS now.` : `Sold all ${soldCount} managed position(s) across ${sellTransactionIds.length} sell transaction(s). You can withdraw KAS now.`
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (!/needs reconciliation|uncertain submission|uncertain consolidation/i.test(message)) {
+      await db.update(tradingBotsTable).set({
+        inFlight: null,
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(and(
+        eq(tradingBotsTable.id, bot.id),
+        sql`${tradingBotsTable.inFlight}->>'action' = 'sell-all'`
+      ));
+    }
+    throw error;
+  }
+}
+var ACTIVE_SELL_ALL_MS, BETWEEN_LOTS_MS, RETRY_WAIT_MS, SELL_ALL_DEADLINE_MS, MAX_ATTEMPTS_PER_BATCH, sleep;
+var init_bot_sell_all_service = __esm({
+  "src/lib/bot-sell-all-service.ts"() {
+    "use strict";
+    init_drizzle_orm();
+    init_src();
+    init_kron_live_service();
+    init_user_app_service();
+    init_interrupted_trade_service();
+    init_logger();
+    ACTIVE_SELL_ALL_MS = 9e4;
+    BETWEEN_LOTS_MS = 8e3;
+    RETRY_WAIT_MS = 2e4;
+    SELL_ALL_DEADLINE_MS = 10 * 6e4;
+    MAX_ATTEMPTS_PER_BATCH = 4;
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  }
+});
+
+// src/lib/user-app-service.ts
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual
+} from "node:crypto";
+import * as kron2 from "@kronsdk/kron-sdk";
+import { loadKaspa as loadKaspa2 } from "@kronsdk/kron-sdk/wasm";
+function secret() {
+  const value = process.env.SESSION_SECRET;
+  if (!value) throw new Error("SESSION_SECRET is not configured.");
+  return value;
+}
+function encryptionKey() {
+  return createHash("sha256").update(secret()).digest();
+}
+function encryptPrivateKey(value) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", encryptionKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return [iv, cipher.getAuthTag(), encrypted].map((part) => part.toString("base64url")).join(".");
+}
+function decryptPrivateKey(value) {
+  const [ivText, tagText, encryptedText] = value.split(".");
+  if (!ivText || !tagText || !encryptedText) throw new Error("Stored signer is invalid.");
+  const decipher = createDecipheriv("aes-256-gcm", encryptionKey(), Buffer.from(ivText, "base64url"));
+  decipher.setAuthTag(Buffer.from(tagText, "base64url"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(encryptedText, "base64url")),
+    decipher.final()
+  ]).toString("utf8");
+}
+function createSessionToken(userId2) {
+  const payload = Buffer.from(JSON.stringify({
+    userId: userId2,
+    expiresAt: Date.now() + 7 * 24 * 60 * 6e4
+  })).toString("base64url");
+  const signature = createHmac("sha256", secret()).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+function readSessionToken(token) {
+  if (!token) return null;
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature) return null;
+  const expected = createHmac("sha256", secret()).update(payload).digest();
+  const actual = Buffer.from(signature, "base64url");
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
+  const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+  return data.expiresAt > Date.now() ? data.userId : null;
+}
+function sessionCookieName() {
+  return SESSION_COOKIE;
+}
+function fixedStrategy() {
+  return {
+    orderSizeKas: 21,
+    buyCount: 5,
+    sellCount: 5,
+    tradesPerHour: 10,
+    activationFeeKas: 100,
+    activationAddress: ACTIVATION_ADDRESS
+  };
+}
+function getGuestDashboard() {
+  return {
+    authenticated: false,
+    walletAddress: "",
+    strategy: fixedStrategy(),
+    bot: null
+  };
+}
+async function createWalletChallenge(address, publicKey) {
+  const k = await loadKaspa2();
+  const derived = new k.PublicKey(publicKey).toAddress(k.NetworkType.Mainnet).toString();
+  if (derived !== address || !address.startsWith("kaspa:")) {
+    throw new Error("Public key does not match the supplied Kaspa mainnet address.");
+  }
+  const challengeId = randomUUID();
+  const expiresAt = Date.now() + 5 * 6e4;
+  const message = [
+    "Kron Bot wallet verification",
+    `Address: ${address}`,
+    `Challenge: ${randomBytes(24).toString("hex")}`,
+    `Expires: ${new Date(expiresAt).toISOString()}`,
+    "This signature does not authorize a transaction."
+  ].join("\n");
+  challenges.set(challengeId, { address, publicKey, message, expiresAt });
+  return { challengeId, message, expiresAt: new Date(expiresAt).toISOString() };
+}
+async function verifyWalletChallenge(input) {
+  const challenge = challenges.get(input.challengeId);
+  challenges.delete(input.challengeId);
+  if (!challenge || challenge.expiresAt < Date.now() || challenge.address !== input.walletAddress || challenge.publicKey !== input.publicKey) throw new Error("Wallet challenge is invalid or expired.");
+  const k = await loadKaspa2();
+  const signature = /^[a-fA-F0-9]+$/.test(input.signature) ? input.signature : Buffer.from(input.signature, "base64").toString("hex");
+  if (!k.verifyMessage({
+    message: challenge.message,
+    signature,
+    publicKey: input.publicKey
+  })) throw new Error("Wallet signature could not be verified.");
+  const [user] = await db.insert(walletUsersTable).values({ walletAddress: input.walletAddress, publicKey: input.publicKey }).onConflictDoUpdate({
+    target: walletUsersTable.walletAddress,
+    set: { publicKey: input.publicKey, updatedAt: /* @__PURE__ */ new Date() }
+  }).returning();
+  if (!user) throw new Error("Could not create wallet account.");
+  return { userId: user.id, token: createSessionToken(user.id) };
+}
+async function getUserDashboard(userId2) {
+  const [user] = await db.select().from(walletUsersTable).where(eq(walletUsersTable.id, userId2)).limit(1);
+  if (!user) throw new Error("Wallet session is no longer valid.");
+  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
+  if (bot?.inFlight && typeof bot.inFlight === "object" && !Array.isArray(bot.inFlight) && bot.inFlight.action === "sell-all") {
+    const { expireStaleSellAllInFlight: expireStaleSellAllInFlight2 } = await Promise.resolve().then(() => (init_bot_sell_all_service(), bot_sell_all_service_exports));
+    const expired = await expireStaleSellAllInFlight2(bot);
+    if (expired.cleared) {
+      [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
+    }
+  }
+  const lots = bot ? await db.select().from(managedLotsTable).where(eq(managedLotsTable.botId, bot.id)).orderBy(desc(managedLotsTable.createdAt)).limit(50) : [];
+  const tradeHistory = Object.values(lots.flatMap((lot) => [
+    ...lot.sellTransactionId && lot.soldAt ? [{
+      action: "sell",
+      transactionId: lot.sellTransactionId,
+      executedAt: lot.soldAt.toISOString(),
+      tokenAmount: lot.tokenAmount.toString(),
+      tokenId: lot.tokenId,
+      tokenSymbol: lot.tokenSymbol
+    }] : [],
+    {
+      action: "buy",
+      transactionId: lot.buyTransactionId,
+      executedAt: lot.createdAt.toISOString(),
+      tokenAmount: lot.tokenAmount.toString(),
+      tokenId: lot.tokenId,
+      tokenSymbol: lot.tokenSymbol
+    }
+  ]).reduce((acc, trade) => {
+    const key = `${trade.action}:${trade.transactionId}`;
+    const existing = acc[key];
+    if (!existing) {
+      acc[key] = { ...trade };
+      return acc;
+    }
+    const nextAmount = (BigInt(existing.tokenAmount) + BigInt(trade.tokenAmount)).toString();
+    const nextExecutedAt = Date.parse(trade.executedAt) > Date.parse(existing.executedAt) ? trade.executedAt : existing.executedAt;
+    acc[key] = {
+      ...existing,
+      tokenAmount: nextAmount,
+      executedAt: nextExecutedAt,
+      tokenId: existing.tokenId ?? trade.tokenId,
+      tokenSymbol: existing.tokenSymbol ?? trade.tokenSymbol
+    };
+    return acc;
+  }, {})).sort((a, b) => Date.parse(b.executedAt) - Date.parse(a.executedAt));
+  let botKasBalance = 0;
+  let managedTokenAmount = "0";
+  if (bot) {
+    const k = await loadKaspa2();
+    const rpc = new k.RpcClient({ url: NODE_URL2, networkId: "mainnet", encoding: k.Encoding.Borsh });
+    const indexer = new kron2.client.IndexerClient(INDEXER_URL2);
+    await rpc.connect();
+    try {
+      const [{ entries }, tokenBalanceResponse] = await Promise.all([
+        rpc.getUtxosByAddresses({ addresses: [bot.botAddress] }),
+        bot.tokenSymbol ? indexer.balance(bot.tokenSymbol.toLowerCase(), bot.botAddress) : Promise.resolve([])
+      ]);
+      botKasBalance = entries.reduce((sum, entry) => sum + Number(entry.amount) / 1e8, 0);
+      const tokenBalanceData = tokenBalanceResponse;
+      const rawTokenBalance = Array.isArray(tokenBalanceData) ? tokenBalanceData[0]?.balance : tokenBalanceData?.balance;
+      managedTokenAmount = rawTokenBalance == null ? "0" : String(rawTokenBalance);
+    } finally {
+      await rpc.disconnect();
+    }
+  }
+  return {
+    authenticated: true,
+    walletAddress: user.walletAddress,
+    strategy: fixedStrategy(),
+    bot: bot ? {
+      id: bot.id,
+      botAddress: bot.botAddress,
+      tokenId: bot.tokenId,
+      tokenSymbol: bot.tokenSymbol,
+      configurationVersion: bot.configurationVersion,
+      activationPaid: Boolean(bot.activationVerifiedAt),
+      activationTxId: bot.activationTxId,
+      status: bot.status,
+      phase: bot.phase,
+      completedBuys: bot.completedBuys,
+      completedSells: bot.completedSells,
+      totalTrades: bot.totalTrades,
+      nextRunAt: bot.nextRunAt?.toISOString() ?? null,
+      lastTradeAt: bot.lastTradeAt?.toISOString() ?? null,
+      stopReason: bot.stopReason,
+      managedTokenAmount,
+      botKasBalance,
+      tradeHistory
+    } : null
+  };
+}
+async function setupUserBot(userId2, tokenId) {
+  const normalized = tokenId.toLowerCase();
+  const registry = new kron2.client.RegistryClient(API_URL2);
+  const entry = (await registry.tokenlist({ all: true })).tokens.find(
+    (token) => token.covenantId.toLowerCase() === normalized
+  );
+  if (!entry?.extensions.chainVerified || entry.network !== "mainnet") {
+    throw new Error("Token must be a chain-verified Kron mainnet KCC20 token.");
+  }
+  const [existing] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
+  if (existing) {
+    if (existing.tokenId !== normalized) {
+      throw new Error("Use Change Covenant to update an existing bot configuration.");
+    }
+  } else {
+    const k = await loadKaspa2();
+    let key;
+    do {
+      try {
+        key = new k.PrivateKey(randomBytes(32).toString("hex"));
+      } catch {
+        key = null;
+      }
+    } while (!key);
+    await db.insert(tradingBotsTable).values({
+      userId: userId2,
+      botAddress: key.toAddress(k.NetworkType.Mainnet).toString(),
+      encryptedPrivateKey: encryptPrivateKey(key.toString()),
+      tokenId: normalized,
+      tokenSymbol: entry.symbol
+    });
+  }
+  return getUserDashboard(userId2);
+}
+async function verifyActivation(userId2, transactionId) {
+  const normalizedTransactionId = transactionId.toLowerCase();
+  const [usedPayment] = await db.select({ id: activationPaymentsTable.id }).from(activationPaymentsTable).where(eq(activationPaymentsTable.transactionId, normalizedTransactionId)).limit(1);
+  if (usedPayment) throw new Error("This activation transaction has already been used.");
+  const k = await loadKaspa2();
+  const rpc = new k.RpcClient({ url: NODE_URL2, networkId: "mainnet", encoding: k.Encoding.Borsh });
+  await rpc.connect();
+  try {
+    const { entries } = await rpc.getUtxosByAddresses({ addresses: [ACTIVATION_ADDRESS] });
+    const payment = entries.find(
+      (entry) => entry.outpoint.transactionId === normalizedTransactionId && BigInt(entry.amount) >= ACTIVATION_SOMPI
+    );
+    if (!payment) throw new Error("Confirmed 100 KAS activation payment was not found.");
+  } finally {
+    await rpc.disconnect();
+  }
+  const [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
+  if (!bot?.tokenId) throw new Error("Set up the bot before verifying activation.");
+  const verifiedAt = /* @__PURE__ */ new Date();
+  await db.transaction(async (tx) => {
+    await tx.insert(activationPaymentsTable).values({
+      botId: bot.id,
+      userId: userId2,
+      configurationVersion: bot.configurationVersion,
+      tokenId: bot.tokenId,
+      transactionId: normalizedTransactionId,
+      verifiedAt
+    });
+    await tx.update(tradingBotsTable).set({
+      activationTxId: normalizedTransactionId,
+      activationVerifiedAt: verifiedAt,
+      status: "ready",
+      updatedAt: verifiedAt
+    }).where(eq(tradingBotsTable.id, bot.id));
+  });
+  return getUserDashboard(userId2);
+}
+async function changeUserBotCovenant(userId2, tokenId) {
+  const normalized = tokenId.toLowerCase();
+  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
+  if (!bot?.tokenId) throw new Error("Set up the bot before changing its covenant.");
+  if (bot.tokenId === normalized) throw new Error("Enter a different covenant ID.");
+  if (bot.status === "running") throw new Error("Stop the bot before changing its covenant.");
+  const originalTokenId = bot.tokenId;
+  const originalConfigurationVersion = bot.configurationVersion;
+  const pendingAction = bot.inFlight && typeof bot.inFlight === "object" && !Array.isArray(bot.inFlight) && "action" in bot.inFlight ? bot.inFlight.action : void 0;
+  if (bot.inFlight) {
+    if (pendingAction === "withdraw" && bot.stopReason !== "Withdrawal submission is awaiting reconciliation. Do not retry.") {
+      const [cleared] = await db.update(tradingBotsTable).set({
+        inFlight: null,
+        stopReason: null,
+        updatedAt: /* @__PURE__ */ new Date()
+      }).where(and(
+        eq(tradingBotsTable.id, bot.id),
+        eq(tradingBotsTable.inFlight, bot.inFlight)
+      )).returning({ id: tradingBotsTable.id });
+      if (!cleared) throw new Error("The bot operation changed. Refresh and try again.");
+    } else {
+      await reconcileStaleInFlight(bot);
+    }
+    [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
+    if (!bot || bot.inFlight) {
+      throw new Error("The interrupted operation requires reconciliation before changing the covenant.");
+    }
+  }
+  const [openLot] = await db.select({ id: managedLotsTable.id }).from(managedLotsTable).where(and(eq(managedLotsTable.botId, bot.id), isNull(managedLotsTable.soldAt))).limit(1);
+  if (openLot) throw new Error("All managed positions must be sold before changing the covenant.");
+  const registry = new kron2.client.RegistryClient(API_URL2);
+  const entry = (await registry.tokenlist({ all: true })).tokens.find(
+    (token) => token.covenantId.toLowerCase() === normalized
+  );
+  if (!entry?.extensions.chainVerified || entry.network !== "mainnet") {
+    throw new Error("Token must be a chain-verified Kron mainnet KCC20 token.");
+  }
+  await db.transaction(async (tx) => {
+    if (bot.activationTxId && bot.activationVerifiedAt) {
+      await tx.insert(activationPaymentsTable).values({
+        botId: bot.id,
+        userId: userId2,
+        configurationVersion: bot.configurationVersion,
+        tokenId: bot.tokenId,
+        transactionId: bot.activationTxId,
+        verifiedAt: bot.activationVerifiedAt
+      }).onConflictDoNothing();
+    }
+    await tx.update(managedLotsTable).set({
+      tokenId: bot.tokenId,
+      tokenSymbol: bot.tokenSymbol
+    }).where(and(eq(managedLotsTable.botId, bot.id), isNull(managedLotsTable.tokenId)));
+    const [updated] = await tx.update(tradingBotsTable).set({
+      tokenId: normalized,
+      tokenSymbol: entry.symbol,
+      configurationVersion: bot.configurationVersion + 1,
+      activationTxId: null,
+      activationVerifiedAt: null,
+      status: "setup",
+      phase: "buying",
+      completedBuys: 0,
+      completedSells: 0,
+      nextRunAt: null,
+      inFlight: null,
+      stopReason: null,
+      updatedAt: /* @__PURE__ */ new Date()
+    }).where(and(
+      eq(tradingBotsTable.id, bot.id),
+      ne(tradingBotsTable.status, "running"),
+      isNull(tradingBotsTable.inFlight),
+      eq(tradingBotsTable.configurationVersion, originalConfigurationVersion),
+      eq(tradingBotsTable.tokenId, originalTokenId)
+    )).returning({ id: tradingBotsTable.id });
+    if (!updated) throw new Error("The bot state changed. Refresh and try the covenant change again.");
+  });
+  return getUserDashboard(userId2);
+}
+async function setUserBotRunning(userId2, running) {
+  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
+  if (!bot?.activationVerifiedAt || !bot.tokenId) throw new Error("Complete setup and activation first.");
+  let resetSellCycle = false;
+  if (running) {
+    if (bot.inFlight) {
+      await reconcileStaleInFlight(bot);
+      [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
+      if (!bot || bot.inFlight) {
+        throw new Error("The interrupted trade requires reconciliation before the bot can restart.");
+      }
+    }
+    if (bot.phase === "selling") {
+      const [openLot] = await db.select({ id: managedLotsTable.id }).from(managedLotsTable).where(and(
+        eq(managedLotsTable.botId, bot.id),
+        isNull(managedLotsTable.soldAt)
+      )).limit(1);
+      resetSellCycle = !openLot;
+    }
+    const k = await loadKaspa2();
+    const rpc = new k.RpcClient({ url: NODE_URL2, networkId: "mainnet", encoding: k.Encoding.Borsh });
+    await rpc.connect();
+    try {
+      const { entries } = await rpc.getUtxosByAddresses({ addresses: [bot.botAddress] });
+      const balance = entries.reduce((sum, entry) => sum + BigInt(entry.amount), 0n);
+      if (balance < MINIMUM_BOT_FUNDING_SOMPI) {
+        throw new Error("Fund the bot wallet with at least 22.75 KAS before starting.");
+      }
+    } finally {
+      await rpc.disconnect();
+    }
+  }
+  const update = db.update(tradingBotsTable).set({
+    status: running ? "running" : "stopped",
+    nextRunAt: running ? new Date(Date.now() + 6e4) : null,
+    stopReason: running ? null : "Stopped by user.",
+    ...running && resetSellCycle ? {
+      phase: "buying",
+      completedBuys: 0,
+      completedSells: 0
+    } : {},
+    updatedAt: /* @__PURE__ */ new Date()
+  });
+  const updated = running ? await update.where(and(eq(tradingBotsTable.id, bot.id), isNull(tradingBotsTable.inFlight))).returning({ id: tradingBotsTable.id }) : await update.where(eq(tradingBotsTable.id, bot.id)).returning({ id: tradingBotsTable.id });
+  if (!updated.length) throw new Error("Another bot operation is in progress. Wait before starting.");
+  return getUserDashboard(userId2);
+}
+var ACTIVATION_ADDRESS, ACTIVATION_SOMPI, MINIMUM_BOT_FUNDING_SOMPI, SESSION_COOKIE, API_URL2, INDEXER_URL2, NODE_URL2, challenges;
+var init_user_app_service = __esm({
+  "src/lib/user-app-service.ts"() {
+    "use strict";
+    init_drizzle_orm();
+    init_src();
+    init_interrupted_trade_service();
+    ACTIVATION_ADDRESS = "kaspa:qz6dltvkds80wf8raac504ze4nesgnk72n24jr7krum2m8dq34khvkevr88cc";
+    ACTIVATION_SOMPI = 10000000000n;
+    MINIMUM_BOT_FUNDING_SOMPI = 2275000000n;
+    SESSION_COOKIE = "kron_wallet_session";
+    API_URL2 = "https://api.kron.technology";
+    INDEXER_URL2 = "https://idx.kron.technology/v1/kcc20";
+    NODE_URL2 = "wss://node.kron.technology";
+    challenges = /* @__PURE__ */ new Map();
   }
 });
 
@@ -38579,25 +49325,8 @@ var health_default = router;
 // src/routes/bot.ts
 var import_express2 = __toESM(require_express2(), 1);
 
-// src/lib/logger.ts
-var import_pino = __toESM(require_pino(), 1);
-var isProduction = process.env.NODE_ENV === "production";
-var logger = (0, import_pino.default)({
-  level: process.env.LOG_LEVEL ?? "info",
-  redact: [
-    "req.headers.authorization",
-    "req.headers.cookie",
-    "res.headers['set-cookie']"
-  ],
-  ...isProduction ? {} : {
-    transport: {
-      target: "pino-pretty",
-      options: { colorize: true }
-    }
-  }
-});
-
 // src/lib/bot-service.ts
+init_logger();
 var config = {
   tokenId: process.env.KRON_TOKEN_ID?.trim() || "KCC20_TOKEN_ID_REQUIRED",
   buyCount: 5,
@@ -38892,488 +49621,8 @@ function simulateLongRun(input) {
   };
 }
 
-// src/lib/kron-live-service.ts
-import * as kron from "@kronsdk/kron-sdk";
-import { loadKaspa } from "@kronsdk/kron-sdk/wasm";
-import { access, mkdir, unlink, writeFile } from "node:fs/promises";
-import path from "node:path";
-var API_URL = "https://api.kron.technology";
-var INDEXER_URL = "https://idx.kron.technology/v1/kcc20";
-var NODE_URL = "wss://node.kron.technology";
-var NETWORK_ID = "mainnet";
-var LIVE_TEST_KAS = 21;
-var SOMPI_PER_KAS = 100000000n;
-var MAXIMUM_DEBIT_SOMPI = 2275000000n;
-var MINIMUM_RESERVE_SOMPI = 2500000000n;
-var EXECUTION_LOCK = path.resolve(process.cwd(), ".local/kron-live-buy.executed.json");
-var TradeSubmissionAttemptedError = class extends Error {
-  constructor(message, cause) {
-    super(message);
-    this.name = "TradeSubmissionAttemptedError";
-    this.cause = cause;
-  }
-};
-var RetryableTradeStateError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "RetryableTradeStateError";
-  }
-};
-var toBytes = (hex) => Uint8Array.from(Buffer.from(hex, "hex"));
-var toKas = (sompi) => Number(sompi) / Number(SOMPI_PER_KAS);
-function resolveLiveTokenId(credentials) {
-  if (credentials) {
-    const tokenId2 = credentials.tokenId?.trim().toLowerCase();
-    if (!tokenId2) {
-      throw new Error("Bot token ID is required. Enter the covenant ID in the console.");
-    }
-    return tokenId2;
-  }
-  const tokenId = process.env.KRON_TOKEN_ID?.trim().toLowerCase();
-  if (!tokenId) {
-    throw new Error(
-      "KRON_TOKEN_ID env is required only for server-owned CLI / file automation (not wallet-connect user bots)."
-    );
-  }
-  return tokenId;
-}
-async function prepareLiveBuy() {
-  return runLiveBuy(false, false);
-}
-async function runLiveBuy(submit, signOnly, automation = false, credentials, enforceMinimumOutput = true) {
-  const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
-  const tokenId = resolveLiveTokenId(credentials);
-  if (!privateKey) throw new Error("Dedicated bot wallet secret is not configured.");
-  const k = await loadKaspa();
-  let key;
-  try {
-    key = new k.PrivateKey(privateKey);
-  } catch {
-    throw new Error("The configured bot wallet private key is invalid.");
-  }
-  const publicKey = key.toPublicKey();
-  const walletAddress = publicKey.toAddress(k.NetworkType.Mainnet).toString();
-  const buyerPubkey = toBytes(publicKey.toXOnlyPublicKey().toString());
-  const registry = new kron.client.RegistryClient(API_URL);
-  const indexer = new kron.client.IndexerClient(INDEXER_URL);
-  const entry = (await registry.tokenlist({ all: true })).tokens.find(
-    (token2) => token2.covenantId.toLowerCase() === tokenId
-  );
-  if (!entry || !entry.extensions.chainVerified || entry.network !== NETWORK_ID) {
-    throw new Error("Configured token is not a chain-verified Kron mainnet token.");
-  }
-  if (!entry.extensions.curveCovenantId || !entry.extensions.curveParams) {
-    throw new Error("Configured token has no active Kron curve.");
-  }
-  const tokenResponse = await indexer.token(entry.symbol.toLowerCase());
-  const token = Array.isArray(tokenResponse) ? tokenResponse[0] : tokenResponse;
-  if (!token || token.graduated || !token.cpState) {
-    throw new Error("This guarded preview currently supports pre-graduation curve buys only.");
-  }
-  const templates = await kron.client.fetchCpTemplates({
-    baseUrl: API_URL,
-    tokenCovid: entry.covenantId,
-    curveParams: entry.extensions.curveParams,
-    templateVersion: entry.extensions.templateVersion ?? null
-  });
-  const tokenCovid = toBytes(entry.covenantId);
-  const curveCovid = toBytes(entry.extensions.curveCovenantId);
-  const sequence = await new kron.client.SequencerClient(
-    "https://seq.kron.technology"
-  ).curveHead(entry.extensions.curveCovenantId);
-  if (submit && sequence.ok && sequence.head) {
-    throw new RetryableTradeStateError(
-      "The curve has an in-flight sequenced trade; waiting for it to settle."
-    );
-  }
-  const tokenReserve = BigInt(token.cpState.tokenReserve);
-  const state2 = { graduated: false, tokenCovid, tokenReserve };
-  const inventoryState = kron.kcc20.covenantIdOwned(curveCovid, tokenReserve, false);
-  const curveAddress = kron.curveCp.cpAddress(k, templates.curve, state2, NETWORK_ID);
-  const inventoryAddress = kron.kcc20.kcc20Address(
-    k,
-    templates.token,
-    inventoryState,
-    NETWORK_ID
-  );
-  const rpc = new k.RpcClient({
-    url: NODE_URL,
-    networkId: NETWORK_ID,
-    encoding: k.Encoding.Borsh
-  });
-  await rpc.connect();
-  try {
-    const [
-      { entries: curveEntries },
-      { entries: inventoryEntries },
-      { entries: walletEntries },
-      tokenBalanceResponse
-    ] = await Promise.all([
-      rpc.getUtxosByAddresses({ addresses: [curveAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [walletAddress] }),
-      indexer.balance(entry.symbol.toLowerCase(), walletAddress)
-    ]);
-    if (curveEntries.length !== 1 || inventoryEntries.length !== 1) {
-      throw new RetryableTradeStateError(
-        "Live curve state is temporarily ambiguous; waiting before retrying."
-      );
-    }
-    if (!walletEntries.length) throw new Error("Bot wallet has no spendable KAS UTXOs.");
-    const curveParams = entry.extensions.curveParams;
-    const quoteState = {
-      realKas: BigInt(token.cpState.realKas),
-      tokenReserve,
-      vKas: BigInt(curveParams.vKas),
-      graduationKas: BigInt(curveParams.graduationKas),
-      creatorFeeBps: BigInt(curveParams.creatorFeeBps),
-      platformFeeBps: BigInt(curveParams.platformFeeBps),
-      devFundBps: BigInt(curveParams.devFundBps ?? 0)
-    };
-    const quote = kron.curve.quoteCpBuy(
-      quoteState,
-      BigInt(LIVE_TEST_KAS) * SOMPI_PER_KAS
-    );
-    if (!quote?.tokenOut) throw new Error("Kron returned no executable 21 KAS buy quote.");
-    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
-    const curveEntry = curveEntries[0];
-    const inventoryEntry = inventoryEntries[0];
-    const spend3 = kron.curveCp.buildCpBuy(
-      k,
-      templates.curve,
-      templates.token,
-      {
-        transactionId: curveEntry.outpoint.transactionId,
-        index: curveEntry.outpoint.index,
-        realKas: BigInt(curveEntry.amount),
-        state: state2
-      },
-      {
-        transactionId: inventoryEntry.outpoint.transactionId,
-        index: inventoryEntry.outpoint.index,
-        value: BigInt(inventoryEntry.amount),
-        amount: tokenReserve
-      },
-      curveCovid,
-      buyerPubkey,
-      quote.kasIn,
-      quote.tokenOut,
-      [],
-      2
-    );
-    let assembly = kron.spend.assembleNativeTx(k, {
-      spend: spend3,
-      fundingEntries,
-      changeAddress: walletAddress,
-      networkFee: 10000n
-    });
-    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
-    assembly = kron.spend.assembleNativeTx(k, {
-      spend: spend3,
-      fundingEntries,
-      changeAddress: walletAddress,
-      networkFee
-    });
-    const fundingTotal = fundingEntries.reduce(
-      (sum, item) => sum + BigInt(item.amount),
-      0n
-    );
-    const walletBalance = walletEntries.reduce(
-      (sum, item) => sum + BigInt(item.amount),
-      0n
-    );
-    const maximumDebit = fundingTotal - assembly.change;
-    const recipientDust = maximumDebit - quote.total - networkFee;
-    if (maximumDebit > MAXIMUM_DEBIT_SOMPI) {
-      throw new Error(
-        `Maximum debit ${toKas(maximumDebit)} KAS exceeds the approved 22.75 KAS cap.`
-      );
-    }
-    if (!automation && walletBalance - maximumDebit < MINIMUM_RESERVE_SOMPI) {
-      throw new Error("Trade would breach the 25 KAS wallet reserve.");
-    }
-    if (enforceMinimumOutput && quote.tokenOut < 8n) {
-      throw new Error("Quote fell below the approved minimum output of 8 KDIST.");
-    }
-    const rawTokenBalance = Array.isArray(tokenBalanceResponse) ? tokenBalanceResponse[0]?.balance : tokenBalanceResponse?.balance;
-    let transactionId;
-    let fundingSignatureScriptBytes;
-    if (submit || signOnly) {
-      const inputsBefore = assembly.transaction.inputs;
-      const covenantScripts = inputsBefore.slice(0, assembly.fundingInputIndexes[0]).map((input) => input.signatureScript);
-      assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
-      const inputsAfter = assembly.transaction.inputs;
-      covenantScripts.forEach((script, index) => {
-        if (inputsAfter[index].signatureScript !== script) {
-          throw new Error("Native signer modified a covenant input; refusing submission.");
-        }
-      });
-      fundingSignatureScriptBytes = assembly.fundingInputIndexes.map((index) => {
-        const script = inputsAfter[index].signatureScript;
-        if (!script || typeof script !== "string" || script.length % 2 !== 0) {
-          throw new Error("Native signer produced an invalid funding signature script.");
-        }
-        return script.length / 2;
-      });
-    }
-    if (submit && !automation) {
-      await mkdir(path.dirname(EXECUTION_LOCK), { recursive: true });
-      await writeFile(
-        EXECUTION_LOCK,
-        JSON.stringify({ status: "pending", createdAt: (/* @__PURE__ */ new Date()).toISOString() }),
-        { flag: "wx" }
-      );
-      try {
-        const result = await rpc.submitTransaction({
-          transaction: assembly.transaction,
-          allowOrphan: false
-        });
-        transactionId = result.transactionId;
-        await writeFile(
-          EXECUTION_LOCK,
-          JSON.stringify({
-            status: "submitted",
-            transactionId,
-            submittedAt: (/* @__PURE__ */ new Date()).toISOString(),
-            tokenId: entry.covenantId,
-            tradeKas: LIVE_TEST_KAS,
-            maximumDebitKas: toKas(maximumDebit)
-          })
-        );
-      } catch (error) {
-        await unlink(EXECUTION_LOCK).catch(() => void 0);
-        throw error;
-      }
-    } else if (submit) {
-      try {
-        const result = await rpc.submitTransaction({
-          transaction: assembly.transaction,
-          allowOrphan: false
-        });
-        transactionId = result.transactionId;
-      } catch (error) {
-        throw new TradeSubmissionAttemptedError(
-          error instanceof Error ? error.message : "Buy submission failed with an unknown result.",
-          error
-        );
-      }
-    }
-    return {
-      tokenId: entry.covenantId,
-      symbol: entry.symbol,
-      tokenName: entry.name,
-      walletAddress,
-      walletKasBalance: toKas(walletBalance),
-      walletTokenBalance: Number(rawTokenBalance ?? 0),
-      tradeKas: LIVE_TEST_KAS,
-      tokenOut: Number(quote.tokenOut),
-      kronFeeKas: toKas(quote.fee),
-      networkFeeKas: toKas(networkFee),
-      recipientDustKas: toKas(recipientDust),
-      maximumDebitKas: toKas(maximumDebit),
-      transactionBuilt: true,
-      signed: submit || signOnly,
-      submitted: submit,
-      transactionId,
-      fundingSignatureScriptBytes,
-      preparedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      warnings: [
-        "This preview is state-dependent and must be rebuilt immediately before execution.",
-        submit ? "The one-time live-test cap is now permanently consumed." : "No transaction was signed or submitted.",
-        "Live execution is available only from the private server command line."
-      ]
-    };
-  } finally {
-    await rpc.disconnect().catch(() => void 0);
-    key = void 0;
-  }
-}
-async function executeUserAutomatedSell(lot, credentials) {
-  return runAutomatedSell(lot, true, credentials);
-}
-async function runAutomatedSell(lot, submit, credentials) {
-  const privateKey = credentials?.privateKey.trim() ?? process.env.KASPA_BOT_PRIVATE_KEY?.trim();
-  const tokenId = resolveLiveTokenId(credentials);
-  if (!privateKey) throw new Error("Live wallet configuration is missing.");
-  const k = await loadKaspa();
-  const key = new k.PrivateKey(privateKey);
-  const publicKey = key.toPublicKey();
-  const walletAddress = publicKey.toAddress(k.NetworkType.Mainnet).toString();
-  const traderPubkey = toBytes(publicKey.toXOnlyPublicKey().toString());
-  const registry = new kron.client.RegistryClient(API_URL);
-  const indexer = new kron.client.IndexerClient(INDEXER_URL);
-  const entry = (await registry.tokenlist({ all: true })).tokens.find(
-    (token2) => token2.covenantId.toLowerCase() === tokenId
-  );
-  if (!entry?.extensions.curveCovenantId || !entry.extensions.curveParams) {
-    throw new Error("Configured token has no active Kron curve.");
-  }
-  const tokenResponse = await indexer.token(entry.symbol.toLowerCase());
-  const token = Array.isArray(tokenResponse) ? tokenResponse[0] : tokenResponse;
-  if (!token?.cpState || token.graduated) throw new Error("KDIST is no longer on its curve.");
-  const sequence = await new kron.client.SequencerClient(
-    "https://seq.kron.technology"
-  ).curveHead(entry.extensions.curveCovenantId);
-  if (sequence.ok && sequence.head) {
-    throw new RetryableTradeStateError(
-      "The curve is busy with an in-flight sequenced trade; waiting before retrying."
-    );
-  }
-  const templates = await kron.client.fetchCpTemplates({
-    baseUrl: API_URL,
-    tokenCovid: entry.covenantId,
-    curveParams: entry.extensions.curveParams,
-    templateVersion: entry.extensions.templateVersion ?? null
-  });
-  const tokenCovid = toBytes(entry.covenantId);
-  const curveCovid = toBytes(entry.extensions.curveCovenantId);
-  const tokenReserve = BigInt(token.cpState.tokenReserve);
-  const state2 = { graduated: false, tokenCovid, tokenReserve };
-  const inventoryState = kron.kcc20.covenantIdOwned(curveCovid, tokenReserve, false);
-  const curveAddress = kron.curveCp.cpAddress(k, templates.curve, state2, NETWORK_ID);
-  const inventoryAddress = kron.kcc20.kcc20Address(
-    k,
-    templates.token,
-    inventoryState,
-    NETWORK_ID
-  );
-  const owned = await indexer.tokenUtxos(entry.symbol.toLowerCase(), walletAddress);
-  const ownedLot = owned.find(
-    (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index && item.amount === lot.amount
-  );
-  if (!ownedLot) throw new Error("Managed KDIST lot is no longer spendable.");
-  const decoded = kron.kcc20.decodeKcc20Redeem(toBytes(ownedLot.redeemScriptHex));
-  const sellerAddress = kron.kcc20.kcc20Address(
-    k,
-    decoded.template,
-    decoded.state,
-    NETWORK_ID
-  );
-  const rpc = new k.RpcClient({
-    url: NODE_URL,
-    networkId: NETWORK_ID,
-    encoding: k.Encoding.Borsh
-  });
-  await rpc.connect();
-  try {
-    const [
-      { entries: curveEntries },
-      { entries: inventoryEntries },
-      { entries: sellerEntries },
-      { entries: walletEntries }
-    ] = await Promise.all([
-      rpc.getUtxosByAddresses({ addresses: [curveAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [inventoryAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [sellerAddress] }),
-      rpc.getUtxosByAddresses({ addresses: [walletAddress] })
-    ]);
-    if (curveEntries.length !== 1 || inventoryEntries.length !== 1) {
-      throw new RetryableTradeStateError(
-        "Live curve state is temporarily ambiguous; waiting before retrying."
-      );
-    }
-    const sellerEntry = sellerEntries.find(
-      (item) => item.outpoint.transactionId === lot.transactionId && item.outpoint.index === lot.index
-    );
-    if (!sellerEntry || !walletEntries.length) throw new Error("Required sell UTXO is missing.");
-    const p = entry.extensions.curveParams;
-    const quote = kron.curve.quoteCpSell(
-      {
-        realKas: BigInt(token.cpState.realKas),
-        tokenReserve,
-        vKas: BigInt(p.vKas),
-        graduationKas: BigInt(p.graduationKas),
-        creatorFeeBps: BigInt(p.creatorFeeBps),
-        platformFeeBps: BigInt(p.platformFeeBps),
-        devFundBps: BigInt(p.devFundBps ?? 0)
-      },
-      BigInt(lot.amount)
-    );
-    if (!quote?.net || quote.net <= 0n) throw new Error("Managed lot has no positive sell quote.");
-    const fundingEntries = [...walletEntries].sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? 1 : -1).slice(0, 1);
-    const curveEntry = curveEntries[0];
-    const inventoryEntry = inventoryEntries[0];
-    const spend3 = kron.curveCp.buildCpSell(
-      k,
-      templates.curve,
-      templates.token,
-      {
-        transactionId: curveEntry.outpoint.transactionId,
-        index: curveEntry.outpoint.index,
-        realKas: BigInt(curveEntry.amount),
-        state: state2
-      },
-      [{
-        transactionId: lot.transactionId,
-        index: lot.index,
-        value: BigInt(sellerEntry.amount),
-        state: decoded.state
-      }],
-      {
-        transactionId: inventoryEntry.outpoint.transactionId,
-        index: inventoryEntry.outpoint.index,
-        value: BigInt(inventoryEntry.amount),
-        amount: tokenReserve
-      },
-      curveCovid,
-      traderPubkey,
-      BigInt(lot.amount),
-      quote.kasOut,
-      3
-    );
-    let assembly = kron.spend.assembleNativeTx(k, {
-      spend: spend3,
-      fundingEntries,
-      changeAddress: walletAddress,
-      networkFee: 10000n
-    });
-    const networkFee = kron.spend.estimateNativeFee(k, NETWORK_ID, assembly, 100);
-    assembly = kron.spend.assembleNativeTx(k, {
-      spend: spend3,
-      fundingEntries,
-      changeAddress: walletAddress,
-      networkFee
-    });
-    const fundingTotal = BigInt(fundingEntries[0].amount);
-    const netCredit = assembly.change - fundingTotal;
-    if (netCredit <= 0n) throw new Error("Assembled sell does not produce a positive KAS credit.");
-    const covenantScripts = assembly.transaction.inputs.slice(0, assembly.fundingInputIndexes[0]).map((input) => input.signatureScript);
-    assembly.transaction = k.signTransaction(assembly.transaction, [key], false);
-    covenantScripts.forEach((script, index) => {
-      if (assembly.transaction.inputs[index].signatureScript !== script) {
-        throw new Error("Signer modified a covenant input.");
-      }
-    });
-    let result = null;
-    if (submit) {
-      try {
-        result = await rpc.submitTransaction({
-          transaction: assembly.transaction,
-          allowOrphan: false
-        });
-      } catch (error) {
-        throw new TradeSubmissionAttemptedError(
-          error instanceof Error ? error.message : "Sell submission failed with an unknown result.",
-          error
-        );
-      }
-    }
-    return {
-      transactionId: result?.transactionId,
-      tokenIn: Number(lot.amount),
-      grossKas: toKas(quote.kasOut),
-      kronFeeKas: toKas(quote.fee),
-      networkFeeKas: toKas(networkFee),
-      netCreditKas: toKas(netCredit),
-      signed: true,
-      submitted: submit
-    };
-  } finally {
-    await rpc.disconnect().catch(() => void 0);
-  }
-}
-
 // src/routes/bot.ts
+init_kron_live_service();
 var router2 = (0, import_express2.Router)();
 router2.get("/bot/state", (_req, res) => {
   res.json(GetBotStateResponse.parse(getBotState()));
@@ -39428,7690 +49677,13 @@ var bot_default = router2;
 
 // src/routes/user-app.ts
 var import_express3 = __toESM(require_express2(), 1);
-
-// src/lib/user-app-service.ts
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  createHmac,
-  randomBytes,
-  randomUUID,
-  timingSafeEqual
-} from "node:crypto";
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/entity.js
-var entityKind = /* @__PURE__ */ Symbol.for("drizzle:entityKind");
-function is(value, type) {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  if (value instanceof type) {
-    return true;
-  }
-  if (!Object.prototype.hasOwnProperty.call(type, entityKind)) {
-    throw new Error(
-      `Class "${type.name ?? "<unknown>"}" doesn't look like a Drizzle entity. If this is incorrect and the class is provided by Drizzle, please report this as a bug.`
-    );
-  }
-  let cls = Object.getPrototypeOf(value).constructor;
-  if (cls) {
-    while (cls) {
-      if (entityKind in cls && cls[entityKind] === type[entityKind]) {
-        return true;
-      }
-      cls = Object.getPrototypeOf(cls);
-    }
-  }
-  return false;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/column.js
-var Column = class {
-  constructor(table, config2) {
-    this.table = table;
-    this.config = config2;
-    this.name = config2.name;
-    this.keyAsName = config2.keyAsName;
-    this.notNull = config2.notNull;
-    this.default = config2.default;
-    this.defaultFn = config2.defaultFn;
-    this.onUpdateFn = config2.onUpdateFn;
-    this.hasDefault = config2.hasDefault;
-    this.primary = config2.primaryKey;
-    this.isUnique = config2.isUnique;
-    this.uniqueName = config2.uniqueName;
-    this.uniqueType = config2.uniqueType;
-    this.dataType = config2.dataType;
-    this.columnType = config2.columnType;
-    this.generated = config2.generated;
-    this.generatedIdentity = config2.generatedIdentity;
-  }
-  static [entityKind] = "Column";
-  name;
-  keyAsName;
-  primary;
-  notNull;
-  default;
-  defaultFn;
-  onUpdateFn;
-  hasDefault;
-  isUnique;
-  uniqueName;
-  uniqueType;
-  dataType;
-  columnType;
-  enumValues = void 0;
-  generated = void 0;
-  generatedIdentity = void 0;
-  config;
-  mapFromDriverValue(value) {
-    return value;
-  }
-  mapToDriverValue(value) {
-    return value;
-  }
-  // ** @internal */
-  shouldDisableInsert() {
-    return this.config.generated !== void 0 && this.config.generated.type !== "byDefault";
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/column-builder.js
-var ColumnBuilder = class {
-  static [entityKind] = "ColumnBuilder";
-  config;
-  constructor(name, dataType, columnType) {
-    this.config = {
-      name,
-      keyAsName: name === "",
-      notNull: false,
-      default: void 0,
-      hasDefault: false,
-      primaryKey: false,
-      isUnique: false,
-      uniqueName: void 0,
-      uniqueType: void 0,
-      dataType,
-      columnType,
-      generated: void 0
-    };
-  }
-  /**
-   * Changes the data type of the column. Commonly used with `json` columns. Also, useful for branded types.
-   *
-   * @example
-   * ```ts
-   * const users = pgTable('users', {
-   * 	id: integer('id').$type<UserId>().primaryKey(),
-   * 	details: json('details').$type<UserDetails>().notNull(),
-   * });
-   * ```
-   */
-  $type() {
-    return this;
-  }
-  /**
-   * Adds a `not null` clause to the column definition.
-   *
-   * Affects the `select` model of the table - columns *without* `not null` will be nullable on select.
-   */
-  notNull() {
-    this.config.notNull = true;
-    return this;
-  }
-  /**
-   * Adds a `default <value>` clause to the column definition.
-   *
-   * Affects the `insert` model of the table - columns *with* `default` are optional on insert.
-   *
-   * If you need to set a dynamic default value, use {@link $defaultFn} instead.
-   */
-  default(value) {
-    this.config.default = value;
-    this.config.hasDefault = true;
-    return this;
-  }
-  /**
-   * Adds a dynamic default value to the column.
-   * The function will be called when the row is inserted, and the returned value will be used as the column value.
-   *
-   * **Note:** This value does not affect the `drizzle-kit` behavior, it is only used at runtime in `drizzle-orm`.
-   */
-  $defaultFn(fn) {
-    this.config.defaultFn = fn;
-    this.config.hasDefault = true;
-    return this;
-  }
-  /**
-   * Alias for {@link $defaultFn}.
-   */
-  $default = this.$defaultFn;
-  /**
-   * Adds a dynamic update value to the column.
-   * The function will be called when the row is updated, and the returned value will be used as the column value if none is provided.
-   * If no `default` (or `$defaultFn`) value is provided, the function will be called when the row is inserted as well, and the returned value will be used as the column value.
-   *
-   * **Note:** This value does not affect the `drizzle-kit` behavior, it is only used at runtime in `drizzle-orm`.
-   */
-  $onUpdateFn(fn) {
-    this.config.onUpdateFn = fn;
-    this.config.hasDefault = true;
-    return this;
-  }
-  /**
-   * Alias for {@link $onUpdateFn}.
-   */
-  $onUpdate = this.$onUpdateFn;
-  /**
-   * Adds a `primary key` clause to the column definition. This implicitly makes the column `not null`.
-   *
-   * In SQLite, `integer primary key` implicitly makes the column auto-incrementing.
-   */
-  primaryKey() {
-    this.config.primaryKey = true;
-    this.config.notNull = true;
-    return this;
-  }
-  /** @internal Sets the name of the column to the key within the table definition if a name was not given. */
-  setName(name) {
-    if (this.config.name !== "") return;
-    this.config.name = name;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/table.utils.js
-var TableName = /* @__PURE__ */ Symbol.for("drizzle:Name");
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/foreign-keys.js
-var ForeignKeyBuilder = class {
-  static [entityKind] = "PgForeignKeyBuilder";
-  /** @internal */
-  reference;
-  /** @internal */
-  _onUpdate = "no action";
-  /** @internal */
-  _onDelete = "no action";
-  constructor(config2, actions) {
-    this.reference = () => {
-      const { name, columns, foreignColumns } = config2();
-      return { name, columns, foreignTable: foreignColumns[0].table, foreignColumns };
-    };
-    if (actions) {
-      this._onUpdate = actions.onUpdate;
-      this._onDelete = actions.onDelete;
-    }
-  }
-  onUpdate(action) {
-    this._onUpdate = action === void 0 ? "no action" : action;
-    return this;
-  }
-  onDelete(action) {
-    this._onDelete = action === void 0 ? "no action" : action;
-    return this;
-  }
-  /** @internal */
-  build(table) {
-    return new ForeignKey(table, this);
-  }
-};
-var ForeignKey = class {
-  constructor(table, builder) {
-    this.table = table;
-    this.reference = builder.reference;
-    this.onUpdate = builder._onUpdate;
-    this.onDelete = builder._onDelete;
-  }
-  static [entityKind] = "PgForeignKey";
-  reference;
-  onUpdate;
-  onDelete;
-  getName() {
-    const { name, columns, foreignColumns } = this.reference();
-    const columnNames = columns.map((column) => column.name);
-    const foreignColumnNames = foreignColumns.map((column) => column.name);
-    const chunks = [
-      this.table[TableName],
-      ...columnNames,
-      foreignColumns[0].table[TableName],
-      ...foreignColumnNames
-    ];
-    return name ?? `${chunks.join("_")}_fk`;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/tracing-utils.js
-function iife(fn, ...args) {
-  return fn(...args);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/unique-constraint.js
-function uniqueKeyName(table, columns) {
-  return `${table[TableName]}_${columns.join("_")}_unique`;
-}
-var UniqueConstraintBuilder = class {
-  constructor(columns, name) {
-    this.name = name;
-    this.columns = columns;
-  }
-  static [entityKind] = "PgUniqueConstraintBuilder";
-  /** @internal */
-  columns;
-  /** @internal */
-  nullsNotDistinctConfig = false;
-  nullsNotDistinct() {
-    this.nullsNotDistinctConfig = true;
-    return this;
-  }
-  /** @internal */
-  build(table) {
-    return new UniqueConstraint(table, this.columns, this.nullsNotDistinctConfig, this.name);
-  }
-};
-var UniqueOnConstraintBuilder = class {
-  static [entityKind] = "PgUniqueOnConstraintBuilder";
-  /** @internal */
-  name;
-  constructor(name) {
-    this.name = name;
-  }
-  on(...columns) {
-    return new UniqueConstraintBuilder(columns, this.name);
-  }
-};
-var UniqueConstraint = class {
-  constructor(table, columns, nullsNotDistinct, name) {
-    this.table = table;
-    this.columns = columns;
-    this.name = name ?? uniqueKeyName(this.table, this.columns.map((column) => column.name));
-    this.nullsNotDistinct = nullsNotDistinct;
-  }
-  static [entityKind] = "PgUniqueConstraint";
-  columns;
-  name;
-  nullsNotDistinct = false;
-  getName() {
-    return this.name;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/utils/array.js
-function parsePgArrayValue(arrayString, startFrom, inQuotes) {
-  for (let i = startFrom; i < arrayString.length; i++) {
-    const char2 = arrayString[i];
-    if (char2 === "\\") {
-      i++;
-      continue;
-    }
-    if (char2 === '"') {
-      return [arrayString.slice(startFrom, i).replace(/\\/g, ""), i + 1];
-    }
-    if (inQuotes) {
-      continue;
-    }
-    if (char2 === "," || char2 === "}") {
-      return [arrayString.slice(startFrom, i).replace(/\\/g, ""), i];
-    }
-  }
-  return [arrayString.slice(startFrom).replace(/\\/g, ""), arrayString.length];
-}
-function parsePgNestedArray(arrayString, startFrom = 0) {
-  const result = [];
-  let i = startFrom;
-  let lastCharIsComma = false;
-  while (i < arrayString.length) {
-    const char2 = arrayString[i];
-    if (char2 === ",") {
-      if (lastCharIsComma || i === startFrom) {
-        result.push("");
-      }
-      lastCharIsComma = true;
-      i++;
-      continue;
-    }
-    lastCharIsComma = false;
-    if (char2 === "\\") {
-      i += 2;
-      continue;
-    }
-    if (char2 === '"') {
-      const [value2, startFrom2] = parsePgArrayValue(arrayString, i + 1, true);
-      result.push(value2);
-      i = startFrom2;
-      continue;
-    }
-    if (char2 === "}") {
-      return [result, i + 1];
-    }
-    if (char2 === "{") {
-      const [value2, startFrom2] = parsePgNestedArray(arrayString, i + 1);
-      result.push(value2);
-      i = startFrom2;
-      continue;
-    }
-    const [value, newStartFrom] = parsePgArrayValue(arrayString, i, false);
-    result.push(value);
-    i = newStartFrom;
-  }
-  return [result, i];
-}
-function parsePgArray(arrayString) {
-  const [result] = parsePgNestedArray(arrayString, 1);
-  return result;
-}
-function makePgArray(array) {
-  return `{${array.map((item) => {
-    if (Array.isArray(item)) {
-      return makePgArray(item);
-    }
-    if (typeof item === "string") {
-      return `"${item.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-    }
-    return `${item}`;
-  }).join(",")}}`;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/common.js
-var PgColumnBuilder = class extends ColumnBuilder {
-  foreignKeyConfigs = [];
-  static [entityKind] = "PgColumnBuilder";
-  array(size) {
-    return new PgArrayBuilder(this.config.name, this, size);
-  }
-  references(ref, actions = {}) {
-    this.foreignKeyConfigs.push({ ref, actions });
-    return this;
-  }
-  unique(name, config2) {
-    this.config.isUnique = true;
-    this.config.uniqueName = name;
-    this.config.uniqueType = config2?.nulls;
-    return this;
-  }
-  generatedAlwaysAs(as) {
-    this.config.generated = {
-      as,
-      type: "always",
-      mode: "stored"
-    };
-    return this;
-  }
-  /** @internal */
-  buildForeignKeys(column, table) {
-    return this.foreignKeyConfigs.map(({ ref, actions }) => {
-      return iife(
-        (ref2, actions2) => {
-          const builder = new ForeignKeyBuilder(() => {
-            const foreignColumn = ref2();
-            return { columns: [column], foreignColumns: [foreignColumn] };
-          });
-          if (actions2.onUpdate) {
-            builder.onUpdate(actions2.onUpdate);
-          }
-          if (actions2.onDelete) {
-            builder.onDelete(actions2.onDelete);
-          }
-          return builder.build(table);
-        },
-        ref,
-        actions
-      );
-    });
-  }
-  /** @internal */
-  buildExtraConfigColumn(table) {
-    return new ExtraConfigColumn(table, this.config);
-  }
-};
-var PgColumn = class extends Column {
-  constructor(table, config2) {
-    if (!config2.uniqueName) {
-      config2.uniqueName = uniqueKeyName(table, [config2.name]);
-    }
-    super(table, config2);
-    this.table = table;
-  }
-  static [entityKind] = "PgColumn";
-};
-var ExtraConfigColumn = class extends PgColumn {
-  static [entityKind] = "ExtraConfigColumn";
-  getSQLType() {
-    return this.getSQLType();
-  }
-  indexConfig = {
-    order: this.config.order ?? "asc",
-    nulls: this.config.nulls ?? "last",
-    opClass: this.config.opClass
-  };
-  defaultConfig = {
-    order: "asc",
-    nulls: "last",
-    opClass: void 0
-  };
-  asc() {
-    this.indexConfig.order = "asc";
-    return this;
-  }
-  desc() {
-    this.indexConfig.order = "desc";
-    return this;
-  }
-  nullsFirst() {
-    this.indexConfig.nulls = "first";
-    return this;
-  }
-  nullsLast() {
-    this.indexConfig.nulls = "last";
-    return this;
-  }
-  /**
-   * ### PostgreSQL documentation quote
-   *
-   * > An operator class with optional parameters can be specified for each column of an index.
-   * The operator class identifies the operators to be used by the index for that column.
-   * For example, a B-tree index on four-byte integers would use the int4_ops class;
-   * this operator class includes comparison functions for four-byte integers.
-   * In practice the default operator class for the column's data type is usually sufficient.
-   * The main point of having operator classes is that for some data types, there could be more than one meaningful ordering.
-   * For example, we might want to sort a complex-number data type either by absolute value or by real part.
-   * We could do this by defining two operator classes for the data type and then selecting the proper class when creating an index.
-   * More information about operator classes check:
-   *
-   * ### Useful links
-   * https://www.postgresql.org/docs/current/sql-createindex.html
-   *
-   * https://www.postgresql.org/docs/current/indexes-opclass.html
-   *
-   * https://www.postgresql.org/docs/current/xindex.html
-   *
-   * ### Additional types
-   * If you have the `pg_vector` extension installed in your database, you can use the
-   * `vector_l2_ops`, `vector_ip_ops`, `vector_cosine_ops`, `vector_l1_ops`, `bit_hamming_ops`, `bit_jaccard_ops`, `halfvec_l2_ops`, `sparsevec_l2_ops` options, which are predefined types.
-   *
-   * **You can always specify any string you want in the operator class, in case Drizzle doesn't have it natively in its types**
-   *
-   * @param opClass
-   * @returns
-   */
-  op(opClass) {
-    this.indexConfig.opClass = opClass;
-    return this;
-  }
-};
-var IndexedColumn = class {
-  static [entityKind] = "IndexedColumn";
-  constructor(name, keyAsName, type, indexConfig) {
-    this.name = name;
-    this.keyAsName = keyAsName;
-    this.type = type;
-    this.indexConfig = indexConfig;
-  }
-  name;
-  keyAsName;
-  type;
-  indexConfig;
-};
-var PgArrayBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgArrayBuilder";
-  constructor(name, baseBuilder, size) {
-    super(name, "array", "PgArray");
-    this.config.baseBuilder = baseBuilder;
-    this.config.size = size;
-  }
-  /** @internal */
-  build(table) {
-    const baseColumn = this.config.baseBuilder.build(table);
-    return new PgArray(
-      table,
-      this.config,
-      baseColumn
-    );
-  }
-};
-var PgArray = class _PgArray extends PgColumn {
-  constructor(table, config2, baseColumn, range) {
-    super(table, config2);
-    this.baseColumn = baseColumn;
-    this.range = range;
-    this.size = config2.size;
-  }
-  size;
-  static [entityKind] = "PgArray";
-  getSQLType() {
-    return `${this.baseColumn.getSQLType()}[${typeof this.size === "number" ? this.size : ""}]`;
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") {
-      value = parsePgArray(value);
-    }
-    return value.map((v) => this.baseColumn.mapFromDriverValue(v));
-  }
-  mapToDriverValue(value, isNestedArray = false) {
-    const a = value.map(
-      (v) => v === null ? null : is(this.baseColumn, _PgArray) ? this.baseColumn.mapToDriverValue(v, true) : this.baseColumn.mapToDriverValue(v)
-    );
-    if (isNestedArray) return a;
-    return makePgArray(a);
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/enum.js
-var PgEnumObjectColumnBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgEnumObjectColumnBuilder";
-  constructor(name, enumInstance) {
-    super(name, "string", "PgEnumObjectColumn");
-    this.config.enum = enumInstance;
-  }
-  /** @internal */
-  build(table) {
-    return new PgEnumObjectColumn(
-      table,
-      this.config
-    );
-  }
-};
-var PgEnumObjectColumn = class extends PgColumn {
-  static [entityKind] = "PgEnumObjectColumn";
-  enum;
-  enumValues = this.config.enum.enumValues;
-  constructor(table, config2) {
-    super(table, config2);
-    this.enum = config2.enum;
-  }
-  getSQLType() {
-    return this.enum.enumName;
-  }
-};
-var isPgEnumSym = /* @__PURE__ */ Symbol.for("drizzle:isPgEnum");
-function isPgEnum(obj) {
-  return !!obj && typeof obj === "function" && isPgEnumSym in obj && obj[isPgEnumSym] === true;
-}
-var PgEnumColumnBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgEnumColumnBuilder";
-  constructor(name, enumInstance) {
-    super(name, "string", "PgEnumColumn");
-    this.config.enum = enumInstance;
-  }
-  /** @internal */
-  build(table) {
-    return new PgEnumColumn(
-      table,
-      this.config
-    );
-  }
-};
-var PgEnumColumn = class extends PgColumn {
-  static [entityKind] = "PgEnumColumn";
-  enum = this.config.enum;
-  enumValues = this.config.enum.enumValues;
-  constructor(table, config2) {
-    super(table, config2);
-    this.enum = config2.enum;
-  }
-  getSQLType() {
-    return this.enum.enumName;
-  }
-};
-function pgEnum(enumName, input) {
-  return Array.isArray(input) ? pgEnumWithSchema(enumName, [...input], void 0) : pgEnumObjectWithSchema(enumName, input, void 0);
-}
-function pgEnumWithSchema(enumName, values, schema) {
-  const enumInstance = Object.assign(
-    (name) => new PgEnumColumnBuilder(name ?? "", enumInstance),
-    {
-      enumName,
-      enumValues: values,
-      schema,
-      [isPgEnumSym]: true
-    }
-  );
-  return enumInstance;
-}
-function pgEnumObjectWithSchema(enumName, values, schema) {
-  const enumInstance = Object.assign(
-    (name) => new PgEnumObjectColumnBuilder(name ?? "", enumInstance),
-    {
-      enumName,
-      enumValues: Object.values(values),
-      schema,
-      [isPgEnumSym]: true
-    }
-  );
-  return enumInstance;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/subquery.js
-var Subquery = class {
-  static [entityKind] = "Subquery";
-  constructor(sql2, fields, alias, isWith = false, usedTables = []) {
-    this._ = {
-      brand: "Subquery",
-      sql: sql2,
-      selectedFields: fields,
-      alias,
-      isWith,
-      usedTables
-    };
-  }
-  // getSQL(): SQL<unknown> {
-  // 	return new SQL([this]);
-  // }
-};
-var WithSubquery = class extends Subquery {
-  static [entityKind] = "WithSubquery";
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/version.js
-var version = "0.45.2";
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/tracing.js
-var otel;
-var rawTracer;
-var tracer = {
-  startActiveSpan(name, fn) {
-    if (!otel) {
-      return fn();
-    }
-    if (!rawTracer) {
-      rawTracer = otel.trace.getTracer("drizzle-orm", version);
-    }
-    return iife(
-      (otel2, rawTracer2) => rawTracer2.startActiveSpan(
-        name,
-        (span) => {
-          try {
-            return fn(span);
-          } catch (e) {
-            span.setStatus({
-              code: otel2.SpanStatusCode.ERROR,
-              message: e instanceof Error ? e.message : "Unknown error"
-              // eslint-disable-line no-instanceof/no-instanceof
-            });
-            throw e;
-          } finally {
-            span.end();
-          }
-        }
-      ),
-      otel,
-      rawTracer
-    );
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/view-common.js
-var ViewBaseConfig = /* @__PURE__ */ Symbol.for("drizzle:ViewBaseConfig");
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/table.js
-var Schema = /* @__PURE__ */ Symbol.for("drizzle:Schema");
-var Columns = /* @__PURE__ */ Symbol.for("drizzle:Columns");
-var ExtraConfigColumns = /* @__PURE__ */ Symbol.for("drizzle:ExtraConfigColumns");
-var OriginalName = /* @__PURE__ */ Symbol.for("drizzle:OriginalName");
-var BaseName = /* @__PURE__ */ Symbol.for("drizzle:BaseName");
-var IsAlias = /* @__PURE__ */ Symbol.for("drizzle:IsAlias");
-var ExtraConfigBuilder = /* @__PURE__ */ Symbol.for("drizzle:ExtraConfigBuilder");
-var IsDrizzleTable = /* @__PURE__ */ Symbol.for("drizzle:IsDrizzleTable");
-var Table = class {
-  static [entityKind] = "Table";
-  /** @internal */
-  static Symbol = {
-    Name: TableName,
-    Schema,
-    OriginalName,
-    Columns,
-    ExtraConfigColumns,
-    BaseName,
-    IsAlias,
-    ExtraConfigBuilder
-  };
-  /**
-   * @internal
-   * Can be changed if the table is aliased.
-   */
-  [TableName];
-  /**
-   * @internal
-   * Used to store the original name of the table, before any aliasing.
-   */
-  [OriginalName];
-  /** @internal */
-  [Schema];
-  /** @internal */
-  [Columns];
-  /** @internal */
-  [ExtraConfigColumns];
-  /**
-   *  @internal
-   * Used to store the table name before the transformation via the `tableCreator` functions.
-   */
-  [BaseName];
-  /** @internal */
-  [IsAlias] = false;
-  /** @internal */
-  [IsDrizzleTable] = true;
-  /** @internal */
-  [ExtraConfigBuilder] = void 0;
-  constructor(name, schema, baseName) {
-    this[TableName] = this[OriginalName] = name;
-    this[Schema] = schema;
-    this[BaseName] = baseName;
-  }
-};
-function getTableName(table) {
-  return table[TableName];
-}
-function getTableUniqueName(table) {
-  return `${table[Schema] ?? "public"}.${table[TableName]}`;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/sql.js
-var FakePrimitiveParam = class {
-  static [entityKind] = "FakePrimitiveParam";
-};
-function isSQLWrapper(value) {
-  return value !== null && value !== void 0 && typeof value.getSQL === "function";
-}
-function mergeQueries(queries) {
-  const result = { sql: "", params: [] };
-  for (const query of queries) {
-    result.sql += query.sql;
-    result.params.push(...query.params);
-    if (query.typings?.length) {
-      if (!result.typings) {
-        result.typings = [];
-      }
-      result.typings.push(...query.typings);
-    }
-  }
-  return result;
-}
-var StringChunk = class {
-  static [entityKind] = "StringChunk";
-  value;
-  constructor(value) {
-    this.value = Array.isArray(value) ? value : [value];
-  }
-  getSQL() {
-    return new SQL([this]);
-  }
-};
-var SQL = class _SQL {
-  constructor(queryChunks) {
-    this.queryChunks = queryChunks;
-    for (const chunk of queryChunks) {
-      if (is(chunk, Table)) {
-        const schemaName = chunk[Table.Symbol.Schema];
-        this.usedTables.push(
-          schemaName === void 0 ? chunk[Table.Symbol.Name] : schemaName + "." + chunk[Table.Symbol.Name]
-        );
-      }
-    }
-  }
-  static [entityKind] = "SQL";
-  /** @internal */
-  decoder = noopDecoder;
-  shouldInlineParams = false;
-  /** @internal */
-  usedTables = [];
-  append(query) {
-    this.queryChunks.push(...query.queryChunks);
-    return this;
-  }
-  toQuery(config2) {
-    return tracer.startActiveSpan("drizzle.buildSQL", (span) => {
-      const query = this.buildQueryFromSourceParams(this.queryChunks, config2);
-      span?.setAttributes({
-        "drizzle.query.text": query.sql,
-        "drizzle.query.params": JSON.stringify(query.params)
-      });
-      return query;
-    });
-  }
-  buildQueryFromSourceParams(chunks, _config) {
-    const config2 = Object.assign({}, _config, {
-      inlineParams: _config.inlineParams || this.shouldInlineParams,
-      paramStartIndex: _config.paramStartIndex || { value: 0 }
-    });
-    const {
-      casing,
-      escapeName,
-      escapeParam,
-      prepareTyping,
-      inlineParams,
-      paramStartIndex
-    } = config2;
-    return mergeQueries(chunks.map((chunk) => {
-      if (is(chunk, StringChunk)) {
-        return { sql: chunk.value.join(""), params: [] };
-      }
-      if (is(chunk, Name)) {
-        return { sql: escapeName(chunk.value), params: [] };
-      }
-      if (chunk === void 0) {
-        return { sql: "", params: [] };
-      }
-      if (Array.isArray(chunk)) {
-        const result = [new StringChunk("(")];
-        for (const [i, p] of chunk.entries()) {
-          result.push(p);
-          if (i < chunk.length - 1) {
-            result.push(new StringChunk(", "));
-          }
-        }
-        result.push(new StringChunk(")"));
-        return this.buildQueryFromSourceParams(result, config2);
-      }
-      if (is(chunk, _SQL)) {
-        return this.buildQueryFromSourceParams(chunk.queryChunks, {
-          ...config2,
-          inlineParams: inlineParams || chunk.shouldInlineParams
-        });
-      }
-      if (is(chunk, Table)) {
-        const schemaName = chunk[Table.Symbol.Schema];
-        const tableName = chunk[Table.Symbol.Name];
-        return {
-          sql: schemaName === void 0 || chunk[IsAlias] ? escapeName(tableName) : escapeName(schemaName) + "." + escapeName(tableName),
-          params: []
-        };
-      }
-      if (is(chunk, Column)) {
-        const columnName = casing.getColumnCasing(chunk);
-        if (_config.invokeSource === "indexes") {
-          return { sql: escapeName(columnName), params: [] };
-        }
-        const schemaName = chunk.table[Table.Symbol.Schema];
-        return {
-          sql: chunk.table[IsAlias] || schemaName === void 0 ? escapeName(chunk.table[Table.Symbol.Name]) + "." + escapeName(columnName) : escapeName(schemaName) + "." + escapeName(chunk.table[Table.Symbol.Name]) + "." + escapeName(columnName),
-          params: []
-        };
-      }
-      if (is(chunk, View)) {
-        const schemaName = chunk[ViewBaseConfig].schema;
-        const viewName = chunk[ViewBaseConfig].name;
-        return {
-          sql: schemaName === void 0 || chunk[ViewBaseConfig].isAlias ? escapeName(viewName) : escapeName(schemaName) + "." + escapeName(viewName),
-          params: []
-        };
-      }
-      if (is(chunk, Param)) {
-        if (is(chunk.value, Placeholder)) {
-          return { sql: escapeParam(paramStartIndex.value++, chunk), params: [chunk], typings: ["none"] };
-        }
-        const mappedValue = chunk.value === null ? null : chunk.encoder.mapToDriverValue(chunk.value);
-        if (is(mappedValue, _SQL)) {
-          return this.buildQueryFromSourceParams([mappedValue], config2);
-        }
-        if (inlineParams) {
-          return { sql: this.mapInlineParam(mappedValue, config2), params: [] };
-        }
-        let typings = ["none"];
-        if (prepareTyping) {
-          typings = [prepareTyping(chunk.encoder)];
-        }
-        return { sql: escapeParam(paramStartIndex.value++, mappedValue), params: [mappedValue], typings };
-      }
-      if (is(chunk, Placeholder)) {
-        return { sql: escapeParam(paramStartIndex.value++, chunk), params: [chunk], typings: ["none"] };
-      }
-      if (is(chunk, _SQL.Aliased) && chunk.fieldAlias !== void 0) {
-        return { sql: escapeName(chunk.fieldAlias), params: [] };
-      }
-      if (is(chunk, Subquery)) {
-        if (chunk._.isWith) {
-          return { sql: escapeName(chunk._.alias), params: [] };
-        }
-        return this.buildQueryFromSourceParams([
-          new StringChunk("("),
-          chunk._.sql,
-          new StringChunk(") "),
-          new Name(chunk._.alias)
-        ], config2);
-      }
-      if (isPgEnum(chunk)) {
-        if (chunk.schema) {
-          return { sql: escapeName(chunk.schema) + "." + escapeName(chunk.enumName), params: [] };
-        }
-        return { sql: escapeName(chunk.enumName), params: [] };
-      }
-      if (isSQLWrapper(chunk)) {
-        if (chunk.shouldOmitSQLParens?.()) {
-          return this.buildQueryFromSourceParams([chunk.getSQL()], config2);
-        }
-        return this.buildQueryFromSourceParams([
-          new StringChunk("("),
-          chunk.getSQL(),
-          new StringChunk(")")
-        ], config2);
-      }
-      if (inlineParams) {
-        return { sql: this.mapInlineParam(chunk, config2), params: [] };
-      }
-      return { sql: escapeParam(paramStartIndex.value++, chunk), params: [chunk], typings: ["none"] };
-    }));
-  }
-  mapInlineParam(chunk, { escapeString }) {
-    if (chunk === null) {
-      return "null";
-    }
-    if (typeof chunk === "number" || typeof chunk === "boolean") {
-      return chunk.toString();
-    }
-    if (typeof chunk === "string") {
-      return escapeString(chunk);
-    }
-    if (typeof chunk === "object") {
-      const mappedValueAsString = chunk.toString();
-      if (mappedValueAsString === "[object Object]") {
-        return escapeString(JSON.stringify(chunk));
-      }
-      return escapeString(mappedValueAsString);
-    }
-    throw new Error("Unexpected param value: " + chunk);
-  }
-  getSQL() {
-    return this;
-  }
-  as(alias) {
-    if (alias === void 0) {
-      return this;
-    }
-    return new _SQL.Aliased(this, alias);
-  }
-  mapWith(decoder) {
-    this.decoder = typeof decoder === "function" ? { mapFromDriverValue: decoder } : decoder;
-    return this;
-  }
-  inlineParams() {
-    this.shouldInlineParams = true;
-    return this;
-  }
-  /**
-   * This method is used to conditionally include a part of the query.
-   *
-   * @param condition - Condition to check
-   * @returns itself if the condition is `true`, otherwise `undefined`
-   */
-  if(condition) {
-    return condition ? this : void 0;
-  }
-};
-var Name = class {
-  constructor(value) {
-    this.value = value;
-  }
-  static [entityKind] = "Name";
-  brand;
-  getSQL() {
-    return new SQL([this]);
-  }
-};
-function isDriverValueEncoder(value) {
-  return typeof value === "object" && value !== null && "mapToDriverValue" in value && typeof value.mapToDriverValue === "function";
-}
-var noopDecoder = {
-  mapFromDriverValue: (value) => value
-};
-var noopEncoder = {
-  mapToDriverValue: (value) => value
-};
-var noopMapper = {
-  ...noopDecoder,
-  ...noopEncoder
-};
-var Param = class {
-  /**
-   * @param value - Parameter value
-   * @param encoder - Encoder to convert the value to a driver parameter
-   */
-  constructor(value, encoder = noopEncoder) {
-    this.value = value;
-    this.encoder = encoder;
-  }
-  static [entityKind] = "Param";
-  brand;
-  getSQL() {
-    return new SQL([this]);
-  }
-};
-function sql(strings, ...params) {
-  const queryChunks = [];
-  if (params.length > 0 || strings.length > 0 && strings[0] !== "") {
-    queryChunks.push(new StringChunk(strings[0]));
-  }
-  for (const [paramIndex, param2] of params.entries()) {
-    queryChunks.push(param2, new StringChunk(strings[paramIndex + 1]));
-  }
-  return new SQL(queryChunks);
-}
-((sql2) => {
-  function empty() {
-    return new SQL([]);
-  }
-  sql2.empty = empty;
-  function fromList(list) {
-    return new SQL(list);
-  }
-  sql2.fromList = fromList;
-  function raw(str) {
-    return new SQL([new StringChunk(str)]);
-  }
-  sql2.raw = raw;
-  function join(chunks, separator) {
-    const result = [];
-    for (const [i, chunk] of chunks.entries()) {
-      if (i > 0 && separator !== void 0) {
-        result.push(separator);
-      }
-      result.push(chunk);
-    }
-    return new SQL(result);
-  }
-  sql2.join = join;
-  function identifier(value) {
-    return new Name(value);
-  }
-  sql2.identifier = identifier;
-  function placeholder2(name2) {
-    return new Placeholder(name2);
-  }
-  sql2.placeholder = placeholder2;
-  function param2(value, encoder) {
-    return new Param(value, encoder);
-  }
-  sql2.param = param2;
-})(sql || (sql = {}));
-((SQL2) => {
-  class Aliased {
-    constructor(sql2, fieldAlias) {
-      this.sql = sql2;
-      this.fieldAlias = fieldAlias;
-    }
-    static [entityKind] = "SQL.Aliased";
-    /** @internal */
-    isSelectionField = false;
-    getSQL() {
-      return this.sql;
-    }
-    /** @internal */
-    clone() {
-      return new Aliased(this.sql, this.fieldAlias);
-    }
-  }
-  SQL2.Aliased = Aliased;
-})(SQL || (SQL = {}));
-var Placeholder = class {
-  constructor(name2) {
-    this.name = name2;
-  }
-  static [entityKind] = "Placeholder";
-  getSQL() {
-    return new SQL([this]);
-  }
-};
-function fillPlaceholders(params, values) {
-  return params.map((p) => {
-    if (is(p, Placeholder)) {
-      if (!(p.name in values)) {
-        throw new Error(`No value for placeholder "${p.name}" was provided`);
-      }
-      return values[p.name];
-    }
-    if (is(p, Param) && is(p.value, Placeholder)) {
-      if (!(p.value.name in values)) {
-        throw new Error(`No value for placeholder "${p.value.name}" was provided`);
-      }
-      return p.encoder.mapToDriverValue(values[p.value.name]);
-    }
-    return p;
-  });
-}
-var IsDrizzleView = /* @__PURE__ */ Symbol.for("drizzle:IsDrizzleView");
-var View = class {
-  static [entityKind] = "View";
-  /** @internal */
-  [ViewBaseConfig];
-  /** @internal */
-  [IsDrizzleView] = true;
-  constructor({ name: name2, schema, selectedFields, query }) {
-    this[ViewBaseConfig] = {
-      name: name2,
-      originalName: name2,
-      schema,
-      selectedFields,
-      query,
-      isExisting: !query,
-      isAlias: false
-    };
-  }
-  getSQL() {
-    return new SQL([this]);
-  }
-};
-Column.prototype.getSQL = function() {
-  return new SQL([this]);
-};
-Table.prototype.getSQL = function() {
-  return new SQL([this]);
-};
-Subquery.prototype.getSQL = function() {
-  return new SQL([this]);
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/alias.js
-var ColumnAliasProxyHandler = class {
-  constructor(table) {
-    this.table = table;
-  }
-  static [entityKind] = "ColumnAliasProxyHandler";
-  get(columnObj, prop) {
-    if (prop === "table") {
-      return this.table;
-    }
-    return columnObj[prop];
-  }
-};
-var TableAliasProxyHandler = class {
-  constructor(alias, replaceOriginalName) {
-    this.alias = alias;
-    this.replaceOriginalName = replaceOriginalName;
-  }
-  static [entityKind] = "TableAliasProxyHandler";
-  get(target, prop) {
-    if (prop === Table.Symbol.IsAlias) {
-      return true;
-    }
-    if (prop === Table.Symbol.Name) {
-      return this.alias;
-    }
-    if (this.replaceOriginalName && prop === Table.Symbol.OriginalName) {
-      return this.alias;
-    }
-    if (prop === ViewBaseConfig) {
-      return {
-        ...target[ViewBaseConfig],
-        name: this.alias,
-        isAlias: true
-      };
-    }
-    if (prop === Table.Symbol.Columns) {
-      const columns = target[Table.Symbol.Columns];
-      if (!columns) {
-        return columns;
-      }
-      const proxiedColumns = {};
-      Object.keys(columns).map((key) => {
-        proxiedColumns[key] = new Proxy(
-          columns[key],
-          new ColumnAliasProxyHandler(new Proxy(target, this))
-        );
-      });
-      return proxiedColumns;
-    }
-    const value = target[prop];
-    if (is(value, Column)) {
-      return new Proxy(value, new ColumnAliasProxyHandler(new Proxy(target, this)));
-    }
-    return value;
-  }
-};
-var RelationTableAliasProxyHandler = class {
-  constructor(alias) {
-    this.alias = alias;
-  }
-  static [entityKind] = "RelationTableAliasProxyHandler";
-  get(target, prop) {
-    if (prop === "sourceTable") {
-      return aliasedTable(target.sourceTable, this.alias);
-    }
-    return target[prop];
-  }
-};
-function aliasedTable(table, tableAlias) {
-  return new Proxy(table, new TableAliasProxyHandler(tableAlias, false));
-}
-function aliasedTableColumn(column, tableAlias) {
-  return new Proxy(
-    column,
-    new ColumnAliasProxyHandler(new Proxy(column.table, new TableAliasProxyHandler(tableAlias, false)))
-  );
-}
-function mapColumnsInAliasedSQLToAlias(query, alias) {
-  return new SQL.Aliased(mapColumnsInSQLToAlias(query.sql, alias), query.fieldAlias);
-}
-function mapColumnsInSQLToAlias(query, alias) {
-  return sql.join(query.queryChunks.map((c) => {
-    if (is(c, Column)) {
-      return aliasedTableColumn(c, alias);
-    }
-    if (is(c, SQL)) {
-      return mapColumnsInSQLToAlias(c, alias);
-    }
-    if (is(c, SQL.Aliased)) {
-      return mapColumnsInAliasedSQLToAlias(c, alias);
-    }
-    return c;
-  }));
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/errors.js
-var DrizzleError = class extends Error {
-  static [entityKind] = "DrizzleError";
-  constructor({ message, cause }) {
-    super(message);
-    this.name = "DrizzleError";
-    this.cause = cause;
-  }
-};
-var DrizzleQueryError = class _DrizzleQueryError extends Error {
-  constructor(query, params, cause) {
-    super(`Failed query: ${query}
-params: ${params}`);
-    this.query = query;
-    this.params = params;
-    this.cause = cause;
-    Error.captureStackTrace(this, _DrizzleQueryError);
-    if (cause) this.cause = cause;
-  }
-};
-var TransactionRollbackError = class extends DrizzleError {
-  static [entityKind] = "TransactionRollbackError";
-  constructor() {
-    super({ message: "Rollback" });
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/logger.js
-var ConsoleLogWriter = class {
-  static [entityKind] = "ConsoleLogWriter";
-  write(message) {
-    console.log(message);
-  }
-};
-var DefaultLogger = class {
-  static [entityKind] = "DefaultLogger";
-  writer;
-  constructor(config2) {
-    this.writer = config2?.writer ?? new ConsoleLogWriter();
-  }
-  logQuery(query, params) {
-    const stringifiedParams = params.map((p) => {
-      try {
-        return JSON.stringify(p);
-      } catch {
-        return String(p);
-      }
-    });
-    const paramsStr = stringifiedParams.length ? ` -- params: [${stringifiedParams.join(", ")}]` : "";
-    this.writer.write(`Query: ${query}${paramsStr}`);
-  }
-};
-var NoopLogger = class {
-  static [entityKind] = "NoopLogger";
-  logQuery() {
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/query-promise.js
-var QueryPromise = class {
-  static [entityKind] = "QueryPromise";
-  [Symbol.toStringTag] = "QueryPromise";
-  catch(onRejected) {
-    return this.then(void 0, onRejected);
-  }
-  finally(onFinally) {
-    return this.then(
-      (value) => {
-        onFinally?.();
-        return value;
-      },
-      (reason) => {
-        onFinally?.();
-        throw reason;
-      }
-    );
-  }
-  then(onFulfilled, onRejected) {
-    return this.execute().then(onFulfilled, onRejected);
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/utils.js
-function mapResultRow(columns, row, joinsNotNullableMap) {
-  const nullifyMap = {};
-  const result = columns.reduce(
-    (result2, { path: path2, field }, columnIndex) => {
-      let decoder;
-      if (is(field, Column)) {
-        decoder = field;
-      } else if (is(field, SQL)) {
-        decoder = field.decoder;
-      } else if (is(field, Subquery)) {
-        decoder = field._.sql.decoder;
-      } else {
-        decoder = field.sql.decoder;
-      }
-      let node = result2;
-      for (const [pathChunkIndex, pathChunk] of path2.entries()) {
-        if (pathChunkIndex < path2.length - 1) {
-          if (!(pathChunk in node)) {
-            node[pathChunk] = {};
-          }
-          node = node[pathChunk];
-        } else {
-          const rawValue = row[columnIndex];
-          const value = node[pathChunk] = rawValue === null ? null : decoder.mapFromDriverValue(rawValue);
-          if (joinsNotNullableMap && is(field, Column) && path2.length === 2) {
-            const objectName = path2[0];
-            if (!(objectName in nullifyMap)) {
-              nullifyMap[objectName] = value === null ? getTableName(field.table) : false;
-            } else if (typeof nullifyMap[objectName] === "string" && nullifyMap[objectName] !== getTableName(field.table)) {
-              nullifyMap[objectName] = false;
-            }
-          }
-        }
-      }
-      return result2;
-    },
-    {}
-  );
-  if (joinsNotNullableMap && Object.keys(nullifyMap).length > 0) {
-    for (const [objectName, tableName] of Object.entries(nullifyMap)) {
-      if (typeof tableName === "string" && !joinsNotNullableMap[tableName]) {
-        result[objectName] = null;
-      }
-    }
-  }
-  return result;
-}
-function orderSelectedFields(fields, pathPrefix) {
-  return Object.entries(fields).reduce((result, [name, field]) => {
-    if (typeof name !== "string") {
-      return result;
-    }
-    const newPath = pathPrefix ? [...pathPrefix, name] : [name];
-    if (is(field, Column) || is(field, SQL) || is(field, SQL.Aliased) || is(field, Subquery)) {
-      result.push({ path: newPath, field });
-    } else if (is(field, Table)) {
-      result.push(...orderSelectedFields(field[Table.Symbol.Columns], newPath));
-    } else {
-      result.push(...orderSelectedFields(field, newPath));
-    }
-    return result;
-  }, []);
-}
-function haveSameKeys(left, right) {
-  const leftKeys = Object.keys(left);
-  const rightKeys = Object.keys(right);
-  if (leftKeys.length !== rightKeys.length) {
-    return false;
-  }
-  for (const [index, key] of leftKeys.entries()) {
-    if (key !== rightKeys[index]) {
-      return false;
-    }
-  }
-  return true;
-}
-function mapUpdateSet(table, values) {
-  const entries = Object.entries(values).filter(([, value]) => value !== void 0).map(([key, value]) => {
-    if (is(value, SQL) || is(value, Column)) {
-      return [key, value];
-    } else {
-      return [key, new Param(value, table[Table.Symbol.Columns][key])];
-    }
-  });
-  if (entries.length === 0) {
-    throw new Error("No values to set");
-  }
-  return Object.fromEntries(entries);
-}
-function applyMixins(baseClass, extendedClasses) {
-  for (const extendedClass of extendedClasses) {
-    for (const name of Object.getOwnPropertyNames(extendedClass.prototype)) {
-      if (name === "constructor") continue;
-      Object.defineProperty(
-        baseClass.prototype,
-        name,
-        Object.getOwnPropertyDescriptor(extendedClass.prototype, name) || /* @__PURE__ */ Object.create(null)
-      );
-    }
-  }
-}
-function getTableColumns(table) {
-  return table[Table.Symbol.Columns];
-}
-function getTableLikeName(table) {
-  return is(table, Subquery) ? table._.alias : is(table, View) ? table[ViewBaseConfig].name : is(table, SQL) ? void 0 : table[Table.Symbol.IsAlias] ? table[Table.Symbol.Name] : table[Table.Symbol.BaseName];
-}
-function getColumnNameAndConfig(a, b) {
-  return {
-    name: typeof a === "string" && a.length > 0 ? a : "",
-    config: typeof a === "object" ? a : b
-  };
-}
-function isConfig(data) {
-  if (typeof data !== "object" || data === null) return false;
-  if (data.constructor.name !== "Object") return false;
-  if ("logger" in data) {
-    const type = typeof data["logger"];
-    if (type !== "boolean" && (type !== "object" || typeof data["logger"]["logQuery"] !== "function") && type !== "undefined") return false;
-    return true;
-  }
-  if ("schema" in data) {
-    const type = typeof data["schema"];
-    if (type !== "object" && type !== "undefined") return false;
-    return true;
-  }
-  if ("casing" in data) {
-    const type = typeof data["casing"];
-    if (type !== "string" && type !== "undefined") return false;
-    return true;
-  }
-  if ("mode" in data) {
-    if (data["mode"] !== "default" || data["mode"] !== "planetscale" || data["mode"] !== void 0) return false;
-    return true;
-  }
-  if ("connection" in data) {
-    const type = typeof data["connection"];
-    if (type !== "string" && type !== "object" && type !== "undefined") return false;
-    return true;
-  }
-  if ("client" in data) {
-    const type = typeof data["client"];
-    if (type !== "object" && type !== "function" && type !== "undefined") return false;
-    return true;
-  }
-  if (Object.keys(data).length === 0) return true;
-  return false;
-}
-var textDecoder = typeof TextDecoder === "undefined" ? null : new TextDecoder();
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/int.common.js
-var PgIntColumnBaseBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgIntColumnBaseBuilder";
-  generatedAlwaysAsIdentity(sequence) {
-    if (sequence) {
-      const { name, ...options } = sequence;
-      this.config.generatedIdentity = {
-        type: "always",
-        sequenceName: name,
-        sequenceOptions: options
-      };
-    } else {
-      this.config.generatedIdentity = {
-        type: "always"
-      };
-    }
-    this.config.hasDefault = true;
-    this.config.notNull = true;
-    return this;
-  }
-  generatedByDefaultAsIdentity(sequence) {
-    if (sequence) {
-      const { name, ...options } = sequence;
-      this.config.generatedIdentity = {
-        type: "byDefault",
-        sequenceName: name,
-        sequenceOptions: options
-      };
-    } else {
-      this.config.generatedIdentity = {
-        type: "byDefault"
-      };
-    }
-    this.config.hasDefault = true;
-    this.config.notNull = true;
-    return this;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/bigint.js
-var PgBigInt53Builder = class extends PgIntColumnBaseBuilder {
-  static [entityKind] = "PgBigInt53Builder";
-  constructor(name) {
-    super(name, "number", "PgBigInt53");
-  }
-  /** @internal */
-  build(table) {
-    return new PgBigInt53(table, this.config);
-  }
-};
-var PgBigInt53 = class extends PgColumn {
-  static [entityKind] = "PgBigInt53";
-  getSQLType() {
-    return "bigint";
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "number") {
-      return value;
-    }
-    return Number(value);
-  }
-};
-var PgBigInt64Builder = class extends PgIntColumnBaseBuilder {
-  static [entityKind] = "PgBigInt64Builder";
-  constructor(name) {
-    super(name, "bigint", "PgBigInt64");
-  }
-  /** @internal */
-  build(table) {
-    return new PgBigInt64(
-      table,
-      this.config
-    );
-  }
-};
-var PgBigInt64 = class extends PgColumn {
-  static [entityKind] = "PgBigInt64";
-  getSQLType() {
-    return "bigint";
-  }
-  // eslint-disable-next-line unicorn/prefer-native-coercion-functions
-  mapFromDriverValue(value) {
-    return BigInt(value);
-  }
-};
-function bigint(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  if (config2.mode === "number") {
-    return new PgBigInt53Builder(name);
-  }
-  return new PgBigInt64Builder(name);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/bigserial.js
-var PgBigSerial53Builder = class extends PgColumnBuilder {
-  static [entityKind] = "PgBigSerial53Builder";
-  constructor(name) {
-    super(name, "number", "PgBigSerial53");
-    this.config.hasDefault = true;
-    this.config.notNull = true;
-  }
-  /** @internal */
-  build(table) {
-    return new PgBigSerial53(
-      table,
-      this.config
-    );
-  }
-};
-var PgBigSerial53 = class extends PgColumn {
-  static [entityKind] = "PgBigSerial53";
-  getSQLType() {
-    return "bigserial";
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "number") {
-      return value;
-    }
-    return Number(value);
-  }
-};
-var PgBigSerial64Builder = class extends PgColumnBuilder {
-  static [entityKind] = "PgBigSerial64Builder";
-  constructor(name) {
-    super(name, "bigint", "PgBigSerial64");
-    this.config.hasDefault = true;
-  }
-  /** @internal */
-  build(table) {
-    return new PgBigSerial64(
-      table,
-      this.config
-    );
-  }
-};
-var PgBigSerial64 = class extends PgColumn {
-  static [entityKind] = "PgBigSerial64";
-  getSQLType() {
-    return "bigserial";
-  }
-  // eslint-disable-next-line unicorn/prefer-native-coercion-functions
-  mapFromDriverValue(value) {
-    return BigInt(value);
-  }
-};
-function bigserial(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  if (config2.mode === "number") {
-    return new PgBigSerial53Builder(name);
-  }
-  return new PgBigSerial64Builder(name);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/boolean.js
-var PgBooleanBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgBooleanBuilder";
-  constructor(name) {
-    super(name, "boolean", "PgBoolean");
-  }
-  /** @internal */
-  build(table) {
-    return new PgBoolean(table, this.config);
-  }
-};
-var PgBoolean = class extends PgColumn {
-  static [entityKind] = "PgBoolean";
-  getSQLType() {
-    return "boolean";
-  }
-};
-function boolean(name) {
-  return new PgBooleanBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/char.js
-var PgCharBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgCharBuilder";
-  constructor(name, config2) {
-    super(name, "string", "PgChar");
-    this.config.length = config2.length;
-    this.config.enumValues = config2.enum;
-  }
-  /** @internal */
-  build(table) {
-    return new PgChar(
-      table,
-      this.config
-    );
-  }
-};
-var PgChar = class extends PgColumn {
-  static [entityKind] = "PgChar";
-  length = this.config.length;
-  enumValues = this.config.enumValues;
-  getSQLType() {
-    return this.length === void 0 ? `char` : `char(${this.length})`;
-  }
-};
-function char(a, b = {}) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  return new PgCharBuilder(name, config2);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/cidr.js
-var PgCidrBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgCidrBuilder";
-  constructor(name) {
-    super(name, "string", "PgCidr");
-  }
-  /** @internal */
-  build(table) {
-    return new PgCidr(table, this.config);
-  }
-};
-var PgCidr = class extends PgColumn {
-  static [entityKind] = "PgCidr";
-  getSQLType() {
-    return "cidr";
-  }
-};
-function cidr(name) {
-  return new PgCidrBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/custom.js
-var PgCustomColumnBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgCustomColumnBuilder";
-  constructor(name, fieldConfig, customTypeParams) {
-    super(name, "custom", "PgCustomColumn");
-    this.config.fieldConfig = fieldConfig;
-    this.config.customTypeParams = customTypeParams;
-  }
-  /** @internal */
-  build(table) {
-    return new PgCustomColumn(
-      table,
-      this.config
-    );
-  }
-};
-var PgCustomColumn = class extends PgColumn {
-  static [entityKind] = "PgCustomColumn";
-  sqlName;
-  mapTo;
-  mapFrom;
-  constructor(table, config2) {
-    super(table, config2);
-    this.sqlName = config2.customTypeParams.dataType(config2.fieldConfig);
-    this.mapTo = config2.customTypeParams.toDriver;
-    this.mapFrom = config2.customTypeParams.fromDriver;
-  }
-  getSQLType() {
-    return this.sqlName;
-  }
-  mapFromDriverValue(value) {
-    return typeof this.mapFrom === "function" ? this.mapFrom(value) : value;
-  }
-  mapToDriverValue(value) {
-    return typeof this.mapTo === "function" ? this.mapTo(value) : value;
-  }
-};
-function customType(customTypeParams) {
-  return (a, b) => {
-    const { name, config: config2 } = getColumnNameAndConfig(a, b);
-    return new PgCustomColumnBuilder(name, config2, customTypeParams);
-  };
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/date.common.js
-var PgDateColumnBaseBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgDateColumnBaseBuilder";
-  defaultNow() {
-    return this.default(sql`now()`);
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/date.js
-var PgDateBuilder = class extends PgDateColumnBaseBuilder {
-  static [entityKind] = "PgDateBuilder";
-  constructor(name) {
-    super(name, "date", "PgDate");
-  }
-  /** @internal */
-  build(table) {
-    return new PgDate(table, this.config);
-  }
-};
-var PgDate = class extends PgColumn {
-  static [entityKind] = "PgDate";
-  getSQLType() {
-    return "date";
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") return new Date(value);
-    return value;
-  }
-  mapToDriverValue(value) {
-    return value.toISOString();
-  }
-};
-var PgDateStringBuilder = class extends PgDateColumnBaseBuilder {
-  static [entityKind] = "PgDateStringBuilder";
-  constructor(name) {
-    super(name, "string", "PgDateString");
-  }
-  /** @internal */
-  build(table) {
-    return new PgDateString(
-      table,
-      this.config
-    );
-  }
-};
-var PgDateString = class extends PgColumn {
-  static [entityKind] = "PgDateString";
-  getSQLType() {
-    return "date";
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") return value;
-    return value.toISOString().slice(0, -14);
-  }
-};
-function date(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  if (config2?.mode === "date") {
-    return new PgDateBuilder(name);
-  }
-  return new PgDateStringBuilder(name);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/double-precision.js
-var PgDoublePrecisionBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgDoublePrecisionBuilder";
-  constructor(name) {
-    super(name, "number", "PgDoublePrecision");
-  }
-  /** @internal */
-  build(table) {
-    return new PgDoublePrecision(
-      table,
-      this.config
-    );
-  }
-};
-var PgDoublePrecision = class extends PgColumn {
-  static [entityKind] = "PgDoublePrecision";
-  getSQLType() {
-    return "double precision";
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") {
-      return Number.parseFloat(value);
-    }
-    return value;
-  }
-};
-function doublePrecision(name) {
-  return new PgDoublePrecisionBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/inet.js
-var PgInetBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgInetBuilder";
-  constructor(name) {
-    super(name, "string", "PgInet");
-  }
-  /** @internal */
-  build(table) {
-    return new PgInet(table, this.config);
-  }
-};
-var PgInet = class extends PgColumn {
-  static [entityKind] = "PgInet";
-  getSQLType() {
-    return "inet";
-  }
-};
-function inet(name) {
-  return new PgInetBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/integer.js
-var PgIntegerBuilder = class extends PgIntColumnBaseBuilder {
-  static [entityKind] = "PgIntegerBuilder";
-  constructor(name) {
-    super(name, "number", "PgInteger");
-  }
-  /** @internal */
-  build(table) {
-    return new PgInteger(table, this.config);
-  }
-};
-var PgInteger = class extends PgColumn {
-  static [entityKind] = "PgInteger";
-  getSQLType() {
-    return "integer";
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") {
-      return Number.parseInt(value);
-    }
-    return value;
-  }
-};
-function integer(name) {
-  return new PgIntegerBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/interval.js
-var PgIntervalBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgIntervalBuilder";
-  constructor(name, intervalConfig) {
-    super(name, "string", "PgInterval");
-    this.config.intervalConfig = intervalConfig;
-  }
-  /** @internal */
-  build(table) {
-    return new PgInterval(table, this.config);
-  }
-};
-var PgInterval = class extends PgColumn {
-  static [entityKind] = "PgInterval";
-  fields = this.config.intervalConfig.fields;
-  precision = this.config.intervalConfig.precision;
-  getSQLType() {
-    const fields = this.fields ? ` ${this.fields}` : "";
-    const precision = this.precision ? `(${this.precision})` : "";
-    return `interval${fields}${precision}`;
-  }
-};
-function interval(a, b = {}) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  return new PgIntervalBuilder(name, config2);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/json.js
-var PgJsonBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgJsonBuilder";
-  constructor(name) {
-    super(name, "json", "PgJson");
-  }
-  /** @internal */
-  build(table) {
-    return new PgJson(table, this.config);
-  }
-};
-var PgJson = class extends PgColumn {
-  static [entityKind] = "PgJson";
-  constructor(table, config2) {
-    super(table, config2);
-  }
-  getSQLType() {
-    return "json";
-  }
-  mapToDriverValue(value) {
-    return JSON.stringify(value);
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") {
-      try {
-        return JSON.parse(value);
-      } catch {
-        return value;
-      }
-    }
-    return value;
-  }
-};
-function json(name) {
-  return new PgJsonBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/jsonb.js
-var PgJsonbBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgJsonbBuilder";
-  constructor(name) {
-    super(name, "json", "PgJsonb");
-  }
-  /** @internal */
-  build(table) {
-    return new PgJsonb(table, this.config);
-  }
-};
-var PgJsonb = class extends PgColumn {
-  static [entityKind] = "PgJsonb";
-  constructor(table, config2) {
-    super(table, config2);
-  }
-  getSQLType() {
-    return "jsonb";
-  }
-  mapToDriverValue(value) {
-    return JSON.stringify(value);
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") {
-      try {
-        return JSON.parse(value);
-      } catch {
-        return value;
-      }
-    }
-    return value;
-  }
-};
-function jsonb(name) {
-  return new PgJsonbBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/line.js
-var PgLineBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgLineBuilder";
-  constructor(name) {
-    super(name, "array", "PgLine");
-  }
-  /** @internal */
-  build(table) {
-    return new PgLineTuple(
-      table,
-      this.config
-    );
-  }
-};
-var PgLineTuple = class extends PgColumn {
-  static [entityKind] = "PgLine";
-  getSQLType() {
-    return "line";
-  }
-  mapFromDriverValue(value) {
-    const [a, b, c] = value.slice(1, -1).split(",");
-    return [Number.parseFloat(a), Number.parseFloat(b), Number.parseFloat(c)];
-  }
-  mapToDriverValue(value) {
-    return `{${value[0]},${value[1]},${value[2]}}`;
-  }
-};
-var PgLineABCBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgLineABCBuilder";
-  constructor(name) {
-    super(name, "json", "PgLineABC");
-  }
-  /** @internal */
-  build(table) {
-    return new PgLineABC(
-      table,
-      this.config
-    );
-  }
-};
-var PgLineABC = class extends PgColumn {
-  static [entityKind] = "PgLineABC";
-  getSQLType() {
-    return "line";
-  }
-  mapFromDriverValue(value) {
-    const [a, b, c] = value.slice(1, -1).split(",");
-    return { a: Number.parseFloat(a), b: Number.parseFloat(b), c: Number.parseFloat(c) };
-  }
-  mapToDriverValue(value) {
-    return `{${value.a},${value.b},${value.c}}`;
-  }
-};
-function line(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  if (!config2?.mode || config2.mode === "tuple") {
-    return new PgLineBuilder(name);
-  }
-  return new PgLineABCBuilder(name);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/macaddr.js
-var PgMacaddrBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgMacaddrBuilder";
-  constructor(name) {
-    super(name, "string", "PgMacaddr");
-  }
-  /** @internal */
-  build(table) {
-    return new PgMacaddr(table, this.config);
-  }
-};
-var PgMacaddr = class extends PgColumn {
-  static [entityKind] = "PgMacaddr";
-  getSQLType() {
-    return "macaddr";
-  }
-};
-function macaddr(name) {
-  return new PgMacaddrBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/macaddr8.js
-var PgMacaddr8Builder = class extends PgColumnBuilder {
-  static [entityKind] = "PgMacaddr8Builder";
-  constructor(name) {
-    super(name, "string", "PgMacaddr8");
-  }
-  /** @internal */
-  build(table) {
-    return new PgMacaddr8(table, this.config);
-  }
-};
-var PgMacaddr8 = class extends PgColumn {
-  static [entityKind] = "PgMacaddr8";
-  getSQLType() {
-    return "macaddr8";
-  }
-};
-function macaddr8(name) {
-  return new PgMacaddr8Builder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/numeric.js
-var PgNumericBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgNumericBuilder";
-  constructor(name, precision, scale) {
-    super(name, "string", "PgNumeric");
-    this.config.precision = precision;
-    this.config.scale = scale;
-  }
-  /** @internal */
-  build(table) {
-    return new PgNumeric(table, this.config);
-  }
-};
-var PgNumeric = class extends PgColumn {
-  static [entityKind] = "PgNumeric";
-  precision;
-  scale;
-  constructor(table, config2) {
-    super(table, config2);
-    this.precision = config2.precision;
-    this.scale = config2.scale;
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") return value;
-    return String(value);
-  }
-  getSQLType() {
-    if (this.precision !== void 0 && this.scale !== void 0) {
-      return `numeric(${this.precision}, ${this.scale})`;
-    } else if (this.precision === void 0) {
-      return "numeric";
-    } else {
-      return `numeric(${this.precision})`;
-    }
-  }
-};
-var PgNumericNumberBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgNumericNumberBuilder";
-  constructor(name, precision, scale) {
-    super(name, "number", "PgNumericNumber");
-    this.config.precision = precision;
-    this.config.scale = scale;
-  }
-  /** @internal */
-  build(table) {
-    return new PgNumericNumber(
-      table,
-      this.config
-    );
-  }
-};
-var PgNumericNumber = class extends PgColumn {
-  static [entityKind] = "PgNumericNumber";
-  precision;
-  scale;
-  constructor(table, config2) {
-    super(table, config2);
-    this.precision = config2.precision;
-    this.scale = config2.scale;
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "number") return value;
-    return Number(value);
-  }
-  mapToDriverValue = String;
-  getSQLType() {
-    if (this.precision !== void 0 && this.scale !== void 0) {
-      return `numeric(${this.precision}, ${this.scale})`;
-    } else if (this.precision === void 0) {
-      return "numeric";
-    } else {
-      return `numeric(${this.precision})`;
-    }
-  }
-};
-var PgNumericBigIntBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgNumericBigIntBuilder";
-  constructor(name, precision, scale) {
-    super(name, "bigint", "PgNumericBigInt");
-    this.config.precision = precision;
-    this.config.scale = scale;
-  }
-  /** @internal */
-  build(table) {
-    return new PgNumericBigInt(
-      table,
-      this.config
-    );
-  }
-};
-var PgNumericBigInt = class extends PgColumn {
-  static [entityKind] = "PgNumericBigInt";
-  precision;
-  scale;
-  constructor(table, config2) {
-    super(table, config2);
-    this.precision = config2.precision;
-    this.scale = config2.scale;
-  }
-  mapFromDriverValue = BigInt;
-  mapToDriverValue = String;
-  getSQLType() {
-    if (this.precision !== void 0 && this.scale !== void 0) {
-      return `numeric(${this.precision}, ${this.scale})`;
-    } else if (this.precision === void 0) {
-      return "numeric";
-    } else {
-      return `numeric(${this.precision})`;
-    }
-  }
-};
-function numeric(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  const mode = config2?.mode;
-  return mode === "number" ? new PgNumericNumberBuilder(name, config2?.precision, config2?.scale) : mode === "bigint" ? new PgNumericBigIntBuilder(name, config2?.precision, config2?.scale) : new PgNumericBuilder(name, config2?.precision, config2?.scale);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/point.js
-var PgPointTupleBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgPointTupleBuilder";
-  constructor(name) {
-    super(name, "array", "PgPointTuple");
-  }
-  /** @internal */
-  build(table) {
-    return new PgPointTuple(
-      table,
-      this.config
-    );
-  }
-};
-var PgPointTuple = class extends PgColumn {
-  static [entityKind] = "PgPointTuple";
-  getSQLType() {
-    return "point";
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") {
-      const [x, y] = value.slice(1, -1).split(",");
-      return [Number.parseFloat(x), Number.parseFloat(y)];
-    }
-    return [value.x, value.y];
-  }
-  mapToDriverValue(value) {
-    return `(${value[0]},${value[1]})`;
-  }
-};
-var PgPointObjectBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgPointObjectBuilder";
-  constructor(name) {
-    super(name, "json", "PgPointObject");
-  }
-  /** @internal */
-  build(table) {
-    return new PgPointObject(
-      table,
-      this.config
-    );
-  }
-};
-var PgPointObject = class extends PgColumn {
-  static [entityKind] = "PgPointObject";
-  getSQLType() {
-    return "point";
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") {
-      const [x, y] = value.slice(1, -1).split(",");
-      return { x: Number.parseFloat(x), y: Number.parseFloat(y) };
-    }
-    return value;
-  }
-  mapToDriverValue(value) {
-    return `(${value.x},${value.y})`;
-  }
-};
-function point(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  if (!config2?.mode || config2.mode === "tuple") {
-    return new PgPointTupleBuilder(name);
-  }
-  return new PgPointObjectBuilder(name);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/postgis_extension/utils.js
-function hexToBytes(hex) {
-  const bytes = [];
-  for (let c = 0; c < hex.length; c += 2) {
-    bytes.push(Number.parseInt(hex.slice(c, c + 2), 16));
-  }
-  return new Uint8Array(bytes);
-}
-function bytesToFloat64(bytes, offset) {
-  const buffer = new ArrayBuffer(8);
-  const view = new DataView(buffer);
-  for (let i = 0; i < 8; i++) {
-    view.setUint8(i, bytes[offset + i]);
-  }
-  return view.getFloat64(0, true);
-}
-function parseEWKB(hex) {
-  const bytes = hexToBytes(hex);
-  let offset = 0;
-  const byteOrder = bytes[offset];
-  offset += 1;
-  const view = new DataView(bytes.buffer);
-  const geomType = view.getUint32(offset, byteOrder === 1);
-  offset += 4;
-  let _srid;
-  if (geomType & 536870912) {
-    _srid = view.getUint32(offset, byteOrder === 1);
-    offset += 4;
-  }
-  if ((geomType & 65535) === 1) {
-    const x = bytesToFloat64(bytes, offset);
-    offset += 8;
-    const y = bytesToFloat64(bytes, offset);
-    offset += 8;
-    return [x, y];
-  }
-  throw new Error("Unsupported geometry type");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/postgis_extension/geometry.js
-var PgGeometryBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgGeometryBuilder";
-  constructor(name) {
-    super(name, "array", "PgGeometry");
-  }
-  /** @internal */
-  build(table) {
-    return new PgGeometry(
-      table,
-      this.config
-    );
-  }
-};
-var PgGeometry = class extends PgColumn {
-  static [entityKind] = "PgGeometry";
-  getSQLType() {
-    return "geometry(point)";
-  }
-  mapFromDriverValue(value) {
-    return parseEWKB(value);
-  }
-  mapToDriverValue(value) {
-    return `point(${value[0]} ${value[1]})`;
-  }
-};
-var PgGeometryObjectBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgGeometryObjectBuilder";
-  constructor(name) {
-    super(name, "json", "PgGeometryObject");
-  }
-  /** @internal */
-  build(table) {
-    return new PgGeometryObject(
-      table,
-      this.config
-    );
-  }
-};
-var PgGeometryObject = class extends PgColumn {
-  static [entityKind] = "PgGeometryObject";
-  getSQLType() {
-    return "geometry(point)";
-  }
-  mapFromDriverValue(value) {
-    const parsed = parseEWKB(value);
-    return { x: parsed[0], y: parsed[1] };
-  }
-  mapToDriverValue(value) {
-    return `point(${value.x} ${value.y})`;
-  }
-};
-function geometry(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  if (!config2?.mode || config2.mode === "tuple") {
-    return new PgGeometryBuilder(name);
-  }
-  return new PgGeometryObjectBuilder(name);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/real.js
-var PgRealBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgRealBuilder";
-  constructor(name, length) {
-    super(name, "number", "PgReal");
-    this.config.length = length;
-  }
-  /** @internal */
-  build(table) {
-    return new PgReal(table, this.config);
-  }
-};
-var PgReal = class extends PgColumn {
-  static [entityKind] = "PgReal";
-  constructor(table, config2) {
-    super(table, config2);
-  }
-  getSQLType() {
-    return "real";
-  }
-  mapFromDriverValue = (value) => {
-    if (typeof value === "string") {
-      return Number.parseFloat(value);
-    }
-    return value;
-  };
-};
-function real(name) {
-  return new PgRealBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/serial.js
-var PgSerialBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgSerialBuilder";
-  constructor(name) {
-    super(name, "number", "PgSerial");
-    this.config.hasDefault = true;
-    this.config.notNull = true;
-  }
-  /** @internal */
-  build(table) {
-    return new PgSerial(table, this.config);
-  }
-};
-var PgSerial = class extends PgColumn {
-  static [entityKind] = "PgSerial";
-  getSQLType() {
-    return "serial";
-  }
-};
-function serial(name) {
-  return new PgSerialBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/smallint.js
-var PgSmallIntBuilder = class extends PgIntColumnBaseBuilder {
-  static [entityKind] = "PgSmallIntBuilder";
-  constructor(name) {
-    super(name, "number", "PgSmallInt");
-  }
-  /** @internal */
-  build(table) {
-    return new PgSmallInt(table, this.config);
-  }
-};
-var PgSmallInt = class extends PgColumn {
-  static [entityKind] = "PgSmallInt";
-  getSQLType() {
-    return "smallint";
-  }
-  mapFromDriverValue = (value) => {
-    if (typeof value === "string") {
-      return Number(value);
-    }
-    return value;
-  };
-};
-function smallint(name) {
-  return new PgSmallIntBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/smallserial.js
-var PgSmallSerialBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgSmallSerialBuilder";
-  constructor(name) {
-    super(name, "number", "PgSmallSerial");
-    this.config.hasDefault = true;
-    this.config.notNull = true;
-  }
-  /** @internal */
-  build(table) {
-    return new PgSmallSerial(
-      table,
-      this.config
-    );
-  }
-};
-var PgSmallSerial = class extends PgColumn {
-  static [entityKind] = "PgSmallSerial";
-  getSQLType() {
-    return "smallserial";
-  }
-};
-function smallserial(name) {
-  return new PgSmallSerialBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/text.js
-var PgTextBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgTextBuilder";
-  constructor(name, config2) {
-    super(name, "string", "PgText");
-    this.config.enumValues = config2.enum;
-  }
-  /** @internal */
-  build(table) {
-    return new PgText(table, this.config);
-  }
-};
-var PgText = class extends PgColumn {
-  static [entityKind] = "PgText";
-  enumValues = this.config.enumValues;
-  getSQLType() {
-    return "text";
-  }
-};
-function text(a, b = {}) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  return new PgTextBuilder(name, config2);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/time.js
-var PgTimeBuilder = class extends PgDateColumnBaseBuilder {
-  constructor(name, withTimezone, precision) {
-    super(name, "string", "PgTime");
-    this.withTimezone = withTimezone;
-    this.precision = precision;
-    this.config.withTimezone = withTimezone;
-    this.config.precision = precision;
-  }
-  static [entityKind] = "PgTimeBuilder";
-  /** @internal */
-  build(table) {
-    return new PgTime(table, this.config);
-  }
-};
-var PgTime = class extends PgColumn {
-  static [entityKind] = "PgTime";
-  withTimezone;
-  precision;
-  constructor(table, config2) {
-    super(table, config2);
-    this.withTimezone = config2.withTimezone;
-    this.precision = config2.precision;
-  }
-  getSQLType() {
-    const precision = this.precision === void 0 ? "" : `(${this.precision})`;
-    return `time${precision}${this.withTimezone ? " with time zone" : ""}`;
-  }
-};
-function time(a, b = {}) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  return new PgTimeBuilder(name, config2.withTimezone ?? false, config2.precision);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/timestamp.js
-var PgTimestampBuilder = class extends PgDateColumnBaseBuilder {
-  static [entityKind] = "PgTimestampBuilder";
-  constructor(name, withTimezone, precision) {
-    super(name, "date", "PgTimestamp");
-    this.config.withTimezone = withTimezone;
-    this.config.precision = precision;
-  }
-  /** @internal */
-  build(table) {
-    return new PgTimestamp(table, this.config);
-  }
-};
-var PgTimestamp = class extends PgColumn {
-  static [entityKind] = "PgTimestamp";
-  withTimezone;
-  precision;
-  constructor(table, config2) {
-    super(table, config2);
-    this.withTimezone = config2.withTimezone;
-    this.precision = config2.precision;
-  }
-  getSQLType() {
-    const precision = this.precision === void 0 ? "" : ` (${this.precision})`;
-    return `timestamp${precision}${this.withTimezone ? " with time zone" : ""}`;
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") return new Date(this.withTimezone ? value : value + "+0000");
-    return value;
-  }
-  mapToDriverValue = (value) => {
-    return value.toISOString();
-  };
-};
-var PgTimestampStringBuilder = class extends PgDateColumnBaseBuilder {
-  static [entityKind] = "PgTimestampStringBuilder";
-  constructor(name, withTimezone, precision) {
-    super(name, "string", "PgTimestampString");
-    this.config.withTimezone = withTimezone;
-    this.config.precision = precision;
-  }
-  /** @internal */
-  build(table) {
-    return new PgTimestampString(
-      table,
-      this.config
-    );
-  }
-};
-var PgTimestampString = class extends PgColumn {
-  static [entityKind] = "PgTimestampString";
-  withTimezone;
-  precision;
-  constructor(table, config2) {
-    super(table, config2);
-    this.withTimezone = config2.withTimezone;
-    this.precision = config2.precision;
-  }
-  getSQLType() {
-    const precision = this.precision === void 0 ? "" : `(${this.precision})`;
-    return `timestamp${precision}${this.withTimezone ? " with time zone" : ""}`;
-  }
-  mapFromDriverValue(value) {
-    if (typeof value === "string") return value;
-    const shortened = value.toISOString().slice(0, -1).replace("T", " ");
-    if (this.withTimezone) {
-      const offset = value.getTimezoneOffset();
-      const sign = offset <= 0 ? "+" : "-";
-      return `${shortened}${sign}${Math.floor(Math.abs(offset) / 60).toString().padStart(2, "0")}`;
-    }
-    return shortened;
-  }
-};
-function timestamp(a, b = {}) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  if (config2?.mode === "string") {
-    return new PgTimestampStringBuilder(name, config2.withTimezone ?? false, config2.precision);
-  }
-  return new PgTimestampBuilder(name, config2?.withTimezone ?? false, config2?.precision);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/uuid.js
-var PgUUIDBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgUUIDBuilder";
-  constructor(name) {
-    super(name, "string", "PgUUID");
-  }
-  /**
-   * Adds `default gen_random_uuid()` to the column definition.
-   */
-  defaultRandom() {
-    return this.default(sql`gen_random_uuid()`);
-  }
-  /** @internal */
-  build(table) {
-    return new PgUUID(table, this.config);
-  }
-};
-var PgUUID = class extends PgColumn {
-  static [entityKind] = "PgUUID";
-  getSQLType() {
-    return "uuid";
-  }
-};
-function uuid(name) {
-  return new PgUUIDBuilder(name ?? "");
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/varchar.js
-var PgVarcharBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgVarcharBuilder";
-  constructor(name, config2) {
-    super(name, "string", "PgVarchar");
-    this.config.length = config2.length;
-    this.config.enumValues = config2.enum;
-  }
-  /** @internal */
-  build(table) {
-    return new PgVarchar(
-      table,
-      this.config
-    );
-  }
-};
-var PgVarchar = class extends PgColumn {
-  static [entityKind] = "PgVarchar";
-  length = this.config.length;
-  enumValues = this.config.enumValues;
-  getSQLType() {
-    return this.length === void 0 ? `varchar` : `varchar(${this.length})`;
-  }
-};
-function varchar(a, b = {}) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  return new PgVarcharBuilder(name, config2);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/bit.js
-var PgBinaryVectorBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgBinaryVectorBuilder";
-  constructor(name, config2) {
-    super(name, "string", "PgBinaryVector");
-    this.config.dimensions = config2.dimensions;
-  }
-  /** @internal */
-  build(table) {
-    return new PgBinaryVector(
-      table,
-      this.config
-    );
-  }
-};
-var PgBinaryVector = class extends PgColumn {
-  static [entityKind] = "PgBinaryVector";
-  dimensions = this.config.dimensions;
-  getSQLType() {
-    return `bit(${this.dimensions})`;
-  }
-};
-function bit(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  return new PgBinaryVectorBuilder(name, config2);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/halfvec.js
-var PgHalfVectorBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgHalfVectorBuilder";
-  constructor(name, config2) {
-    super(name, "array", "PgHalfVector");
-    this.config.dimensions = config2.dimensions;
-  }
-  /** @internal */
-  build(table) {
-    return new PgHalfVector(
-      table,
-      this.config
-    );
-  }
-};
-var PgHalfVector = class extends PgColumn {
-  static [entityKind] = "PgHalfVector";
-  dimensions = this.config.dimensions;
-  getSQLType() {
-    return `halfvec(${this.dimensions})`;
-  }
-  mapToDriverValue(value) {
-    return JSON.stringify(value);
-  }
-  mapFromDriverValue(value) {
-    return value.slice(1, -1).split(",").map((v) => Number.parseFloat(v));
-  }
-};
-function halfvec(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  return new PgHalfVectorBuilder(name, config2);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/sparsevec.js
-var PgSparseVectorBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgSparseVectorBuilder";
-  constructor(name, config2) {
-    super(name, "string", "PgSparseVector");
-    this.config.dimensions = config2.dimensions;
-  }
-  /** @internal */
-  build(table) {
-    return new PgSparseVector(
-      table,
-      this.config
-    );
-  }
-};
-var PgSparseVector = class extends PgColumn {
-  static [entityKind] = "PgSparseVector";
-  dimensions = this.config.dimensions;
-  getSQLType() {
-    return `sparsevec(${this.dimensions})`;
-  }
-};
-function sparsevec(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  return new PgSparseVectorBuilder(name, config2);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/vector_extension/vector.js
-var PgVectorBuilder = class extends PgColumnBuilder {
-  static [entityKind] = "PgVectorBuilder";
-  constructor(name, config2) {
-    super(name, "array", "PgVector");
-    this.config.dimensions = config2.dimensions;
-  }
-  /** @internal */
-  build(table) {
-    return new PgVector(
-      table,
-      this.config
-    );
-  }
-};
-var PgVector = class extends PgColumn {
-  static [entityKind] = "PgVector";
-  dimensions = this.config.dimensions;
-  getSQLType() {
-    return `vector(${this.dimensions})`;
-  }
-  mapToDriverValue(value) {
-    return JSON.stringify(value);
-  }
-  mapFromDriverValue(value) {
-    return value.slice(1, -1).split(",").map((v) => Number.parseFloat(v));
-  }
-};
-function vector(a, b) {
-  const { name, config: config2 } = getColumnNameAndConfig(a, b);
-  return new PgVectorBuilder(name, config2);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/columns/all.js
-function getPgColumnBuilders() {
-  return {
-    bigint,
-    bigserial,
-    boolean,
-    char,
-    cidr,
-    customType,
-    date,
-    doublePrecision,
-    inet,
-    integer,
-    interval,
-    json,
-    jsonb,
-    line,
-    macaddr,
-    macaddr8,
-    numeric,
-    point,
-    geometry,
-    real,
-    serial,
-    smallint,
-    smallserial,
-    text,
-    time,
-    timestamp,
-    uuid,
-    varchar,
-    bit,
-    halfvec,
-    sparsevec,
-    vector
-  };
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/table.js
-var InlineForeignKeys = /* @__PURE__ */ Symbol.for("drizzle:PgInlineForeignKeys");
-var EnableRLS = /* @__PURE__ */ Symbol.for("drizzle:EnableRLS");
-var PgTable = class extends Table {
-  static [entityKind] = "PgTable";
-  /** @internal */
-  static Symbol = Object.assign({}, Table.Symbol, {
-    InlineForeignKeys,
-    EnableRLS
-  });
-  /**@internal */
-  [InlineForeignKeys] = [];
-  /** @internal */
-  [EnableRLS] = false;
-  /** @internal */
-  [Table.Symbol.ExtraConfigBuilder] = void 0;
-  /** @internal */
-  [Table.Symbol.ExtraConfigColumns] = {};
-};
-function pgTableWithSchema(name, columns, extraConfig, schema, baseName = name) {
-  const rawTable = new PgTable(name, schema, baseName);
-  const parsedColumns = typeof columns === "function" ? columns(getPgColumnBuilders()) : columns;
-  const builtColumns = Object.fromEntries(
-    Object.entries(parsedColumns).map(([name2, colBuilderBase]) => {
-      const colBuilder = colBuilderBase;
-      colBuilder.setName(name2);
-      const column = colBuilder.build(rawTable);
-      rawTable[InlineForeignKeys].push(...colBuilder.buildForeignKeys(column, rawTable));
-      return [name2, column];
-    })
-  );
-  const builtColumnsForExtraConfig = Object.fromEntries(
-    Object.entries(parsedColumns).map(([name2, colBuilderBase]) => {
-      const colBuilder = colBuilderBase;
-      colBuilder.setName(name2);
-      const column = colBuilder.buildExtraConfigColumn(rawTable);
-      return [name2, column];
-    })
-  );
-  const table = Object.assign(rawTable, builtColumns);
-  table[Table.Symbol.Columns] = builtColumns;
-  table[Table.Symbol.ExtraConfigColumns] = builtColumnsForExtraConfig;
-  if (extraConfig) {
-    table[PgTable.Symbol.ExtraConfigBuilder] = extraConfig;
-  }
-  return Object.assign(table, {
-    enableRLS: () => {
-      table[PgTable.Symbol.EnableRLS] = true;
-      return table;
-    }
-  });
-}
-var pgTable = (name, columns, extraConfig) => {
-  return pgTableWithSchema(name, columns, extraConfig, void 0);
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/primary-keys.js
-var PrimaryKeyBuilder = class {
-  static [entityKind] = "PgPrimaryKeyBuilder";
-  /** @internal */
-  columns;
-  /** @internal */
-  name;
-  constructor(columns, name) {
-    this.columns = columns;
-    this.name = name;
-  }
-  /** @internal */
-  build(table) {
-    return new PrimaryKey(table, this.columns, this.name);
-  }
-};
-var PrimaryKey = class {
-  constructor(table, columns, name) {
-    this.table = table;
-    this.columns = columns;
-    this.name = name;
-  }
-  static [entityKind] = "PgPrimaryKey";
-  columns;
-  name;
-  getName() {
-    return this.name ?? `${this.table[PgTable.Symbol.Name]}_${this.columns.map((column) => column.name).join("_")}_pk`;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/expressions/conditions.js
-function bindIfParam(value, column) {
-  if (isDriverValueEncoder(column) && !isSQLWrapper(value) && !is(value, Param) && !is(value, Placeholder) && !is(value, Column) && !is(value, Table) && !is(value, View)) {
-    return new Param(value, column);
-  }
-  return value;
-}
-var eq = (left, right) => {
-  return sql`${left} = ${bindIfParam(right, left)}`;
-};
-var ne = (left, right) => {
-  return sql`${left} <> ${bindIfParam(right, left)}`;
-};
-function and(...unfilteredConditions) {
-  const conditions = unfilteredConditions.filter(
-    (c) => c !== void 0
-  );
-  if (conditions.length === 0) {
-    return void 0;
-  }
-  if (conditions.length === 1) {
-    return new SQL(conditions);
-  }
-  return new SQL([
-    new StringChunk("("),
-    sql.join(conditions, new StringChunk(" and ")),
-    new StringChunk(")")
-  ]);
-}
-function or(...unfilteredConditions) {
-  const conditions = unfilteredConditions.filter(
-    (c) => c !== void 0
-  );
-  if (conditions.length === 0) {
-    return void 0;
-  }
-  if (conditions.length === 1) {
-    return new SQL(conditions);
-  }
-  return new SQL([
-    new StringChunk("("),
-    sql.join(conditions, new StringChunk(" or ")),
-    new StringChunk(")")
-  ]);
-}
-function not(condition) {
-  return sql`not ${condition}`;
-}
-var gt = (left, right) => {
-  return sql`${left} > ${bindIfParam(right, left)}`;
-};
-var gte = (left, right) => {
-  return sql`${left} >= ${bindIfParam(right, left)}`;
-};
-var lt = (left, right) => {
-  return sql`${left} < ${bindIfParam(right, left)}`;
-};
-var lte = (left, right) => {
-  return sql`${left} <= ${bindIfParam(right, left)}`;
-};
-function inArray(column, values) {
-  if (Array.isArray(values)) {
-    if (values.length === 0) {
-      return sql`false`;
-    }
-    return sql`${column} in ${values.map((v) => bindIfParam(v, column))}`;
-  }
-  return sql`${column} in ${bindIfParam(values, column)}`;
-}
-function notInArray(column, values) {
-  if (Array.isArray(values)) {
-    if (values.length === 0) {
-      return sql`true`;
-    }
-    return sql`${column} not in ${values.map((v) => bindIfParam(v, column))}`;
-  }
-  return sql`${column} not in ${bindIfParam(values, column)}`;
-}
-function isNull(value) {
-  return sql`${value} is null`;
-}
-function isNotNull(value) {
-  return sql`${value} is not null`;
-}
-function exists(subquery) {
-  return sql`exists ${subquery}`;
-}
-function notExists(subquery) {
-  return sql`not exists ${subquery}`;
-}
-function between(column, min, max) {
-  return sql`${column} between ${bindIfParam(min, column)} and ${bindIfParam(
-    max,
-    column
-  )}`;
-}
-function notBetween(column, min, max) {
-  return sql`${column} not between ${bindIfParam(
-    min,
-    column
-  )} and ${bindIfParam(max, column)}`;
-}
-function like(column, value) {
-  return sql`${column} like ${value}`;
-}
-function notLike(column, value) {
-  return sql`${column} not like ${value}`;
-}
-function ilike(column, value) {
-  return sql`${column} ilike ${value}`;
-}
-function notIlike(column, value) {
-  return sql`${column} not ilike ${value}`;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/expressions/select.js
-function asc(column) {
-  return sql`${column} asc`;
-}
-function desc(column) {
-  return sql`${column} desc`;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/relations.js
-var Relation = class {
-  constructor(sourceTable, referencedTable, relationName) {
-    this.sourceTable = sourceTable;
-    this.referencedTable = referencedTable;
-    this.relationName = relationName;
-    this.referencedTableName = referencedTable[Table.Symbol.Name];
-  }
-  static [entityKind] = "Relation";
-  referencedTableName;
-  fieldName;
-};
-var Relations = class {
-  constructor(table, config2) {
-    this.table = table;
-    this.config = config2;
-  }
-  static [entityKind] = "Relations";
-};
-var One = class _One extends Relation {
-  constructor(sourceTable, referencedTable, config2, isNullable) {
-    super(sourceTable, referencedTable, config2?.relationName);
-    this.config = config2;
-    this.isNullable = isNullable;
-  }
-  static [entityKind] = "One";
-  withFieldName(fieldName) {
-    const relation = new _One(
-      this.sourceTable,
-      this.referencedTable,
-      this.config,
-      this.isNullable
-    );
-    relation.fieldName = fieldName;
-    return relation;
-  }
-};
-var Many = class _Many extends Relation {
-  constructor(sourceTable, referencedTable, config2) {
-    super(sourceTable, referencedTable, config2?.relationName);
-    this.config = config2;
-  }
-  static [entityKind] = "Many";
-  withFieldName(fieldName) {
-    const relation = new _Many(
-      this.sourceTable,
-      this.referencedTable,
-      this.config
-    );
-    relation.fieldName = fieldName;
-    return relation;
-  }
-};
-function getOperators() {
-  return {
-    and,
-    between,
-    eq,
-    exists,
-    gt,
-    gte,
-    ilike,
-    inArray,
-    isNull,
-    isNotNull,
-    like,
-    lt,
-    lte,
-    ne,
-    not,
-    notBetween,
-    notExists,
-    notLike,
-    notIlike,
-    notInArray,
-    or,
-    sql
-  };
-}
-function getOrderByOperators() {
-  return {
-    sql,
-    asc,
-    desc
-  };
-}
-function extractTablesRelationalConfig(schema, configHelpers) {
-  if (Object.keys(schema).length === 1 && "default" in schema && !is(schema["default"], Table)) {
-    schema = schema["default"];
-  }
-  const tableNamesMap = {};
-  const relationsBuffer = {};
-  const tablesConfig = {};
-  for (const [key, value] of Object.entries(schema)) {
-    if (is(value, Table)) {
-      const dbName = getTableUniqueName(value);
-      const bufferedRelations = relationsBuffer[dbName];
-      tableNamesMap[dbName] = key;
-      tablesConfig[key] = {
-        tsName: key,
-        dbName: value[Table.Symbol.Name],
-        schema: value[Table.Symbol.Schema],
-        columns: value[Table.Symbol.Columns],
-        relations: bufferedRelations?.relations ?? {},
-        primaryKey: bufferedRelations?.primaryKey ?? []
-      };
-      for (const column of Object.values(
-        value[Table.Symbol.Columns]
-      )) {
-        if (column.primary) {
-          tablesConfig[key].primaryKey.push(column);
-        }
-      }
-      const extraConfig = value[Table.Symbol.ExtraConfigBuilder]?.(value[Table.Symbol.ExtraConfigColumns]);
-      if (extraConfig) {
-        for (const configEntry of Object.values(extraConfig)) {
-          if (is(configEntry, PrimaryKeyBuilder)) {
-            tablesConfig[key].primaryKey.push(...configEntry.columns);
-          }
-        }
-      }
-    } else if (is(value, Relations)) {
-      const dbName = getTableUniqueName(value.table);
-      const tableName = tableNamesMap[dbName];
-      const relations2 = value.config(
-        configHelpers(value.table)
-      );
-      let primaryKey;
-      for (const [relationName, relation] of Object.entries(relations2)) {
-        if (tableName) {
-          const tableConfig = tablesConfig[tableName];
-          tableConfig.relations[relationName] = relation;
-          if (primaryKey) {
-            tableConfig.primaryKey.push(...primaryKey);
-          }
-        } else {
-          if (!(dbName in relationsBuffer)) {
-            relationsBuffer[dbName] = {
-              relations: {},
-              primaryKey
-            };
-          }
-          relationsBuffer[dbName].relations[relationName] = relation;
-        }
-      }
-    }
-  }
-  return { tables: tablesConfig, tableNamesMap };
-}
-function createOne(sourceTable) {
-  return function one(table, config2) {
-    return new One(
-      sourceTable,
-      table,
-      config2,
-      config2?.fields.reduce((res, f) => res && f.notNull, true) ?? false
-    );
-  };
-}
-function createMany(sourceTable) {
-  return function many(referencedTable, config2) {
-    return new Many(sourceTable, referencedTable, config2);
-  };
-}
-function normalizeRelation(schema, tableNamesMap, relation) {
-  if (is(relation, One) && relation.config) {
-    return {
-      fields: relation.config.fields,
-      references: relation.config.references
-    };
-  }
-  const referencedTableTsName = tableNamesMap[getTableUniqueName(relation.referencedTable)];
-  if (!referencedTableTsName) {
-    throw new Error(
-      `Table "${relation.referencedTable[Table.Symbol.Name]}" not found in schema`
-    );
-  }
-  const referencedTableConfig = schema[referencedTableTsName];
-  if (!referencedTableConfig) {
-    throw new Error(`Table "${referencedTableTsName}" not found in schema`);
-  }
-  const sourceTable = relation.sourceTable;
-  const sourceTableTsName = tableNamesMap[getTableUniqueName(sourceTable)];
-  if (!sourceTableTsName) {
-    throw new Error(
-      `Table "${sourceTable[Table.Symbol.Name]}" not found in schema`
-    );
-  }
-  const reverseRelations = [];
-  for (const referencedTableRelation of Object.values(
-    referencedTableConfig.relations
-  )) {
-    if (relation.relationName && relation !== referencedTableRelation && referencedTableRelation.relationName === relation.relationName || !relation.relationName && referencedTableRelation.referencedTable === relation.sourceTable) {
-      reverseRelations.push(referencedTableRelation);
-    }
-  }
-  if (reverseRelations.length > 1) {
-    throw relation.relationName ? new Error(
-      `There are multiple relations with name "${relation.relationName}" in table "${referencedTableTsName}"`
-    ) : new Error(
-      `There are multiple relations between "${referencedTableTsName}" and "${relation.sourceTable[Table.Symbol.Name]}". Please specify relation name`
-    );
-  }
-  if (reverseRelations[0] && is(reverseRelations[0], One) && reverseRelations[0].config) {
-    return {
-      fields: reverseRelations[0].config.references,
-      references: reverseRelations[0].config.fields
-    };
-  }
-  throw new Error(
-    `There is not enough information to infer relation "${sourceTableTsName}.${relation.fieldName}"`
-  );
-}
-function createTableRelationsHelpers(sourceTable) {
-  return {
-    one: createOne(sourceTable),
-    many: createMany(sourceTable)
-  };
-}
-function mapRelationalRow(tablesConfig, tableConfig, row, buildQueryResultSelection, mapColumnValue = (value) => value) {
-  const result = {};
-  for (const [
-    selectionItemIndex,
-    selectionItem
-  ] of buildQueryResultSelection.entries()) {
-    if (selectionItem.isJson) {
-      const relation = tableConfig.relations[selectionItem.tsKey];
-      const rawSubRows = row[selectionItemIndex];
-      const subRows = typeof rawSubRows === "string" ? JSON.parse(rawSubRows) : rawSubRows;
-      result[selectionItem.tsKey] = is(relation, One) ? subRows && mapRelationalRow(
-        tablesConfig,
-        tablesConfig[selectionItem.relationTableTsKey],
-        subRows,
-        selectionItem.selection,
-        mapColumnValue
-      ) : subRows.map(
-        (subRow) => mapRelationalRow(
-          tablesConfig,
-          tablesConfig[selectionItem.relationTableTsKey],
-          subRow,
-          selectionItem.selection,
-          mapColumnValue
-        )
-      );
-    } else {
-      const value = mapColumnValue(row[selectionItemIndex]);
-      const field = selectionItem.field;
-      let decoder;
-      if (is(field, Column)) {
-        decoder = field;
-      } else if (is(field, SQL)) {
-        decoder = field.decoder;
-      } else {
-        decoder = field.sql.decoder;
-      }
-      result[selectionItem.tsKey] = value === null ? null : decoder.mapFromDriverValue(value);
-    }
-  }
-  return result;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/sql/functions/aggregate.js
-function count(expression) {
-  return sql`count(${expression || sql.raw("*")})`.mapWith(Number);
-}
-
-// src/lib/user-app-service.ts
-import * as kron2 from "@kronsdk/kron-sdk";
-import { loadKaspa as loadKaspa2 } from "@kronsdk/kron-sdk/wasm";
-
-// ../../node_modules/.pnpm/pg@8.23.0/node_modules/pg/esm/index.mjs
-var import_lib = __toESM(require_lib5(), 1);
-var Client = import_lib.default.Client;
-var Pool = import_lib.default.Pool;
-var Connection = import_lib.default.Connection;
-var types = import_lib.default.types;
-var Query = import_lib.default.Query;
-var DatabaseError = import_lib.default.DatabaseError;
-var escapeIdentifier = import_lib.default.escapeIdentifier;
-var escapeLiteral = import_lib.default.escapeLiteral;
-var Result = import_lib.default.Result;
-var TypeOverrides = import_lib.default.TypeOverrides;
-var defaults = import_lib.default.defaults;
-var esm_default = import_lib.default;
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/selection-proxy.js
-var SelectionProxyHandler = class _SelectionProxyHandler {
-  static [entityKind] = "SelectionProxyHandler";
-  config;
-  constructor(config2) {
-    this.config = { ...config2 };
-  }
-  get(subquery, prop) {
-    if (prop === "_") {
-      return {
-        ...subquery["_"],
-        selectedFields: new Proxy(
-          subquery._.selectedFields,
-          this
-        )
-      };
-    }
-    if (prop === ViewBaseConfig) {
-      return {
-        ...subquery[ViewBaseConfig],
-        selectedFields: new Proxy(
-          subquery[ViewBaseConfig].selectedFields,
-          this
-        )
-      };
-    }
-    if (typeof prop === "symbol") {
-      return subquery[prop];
-    }
-    const columns = is(subquery, Subquery) ? subquery._.selectedFields : is(subquery, View) ? subquery[ViewBaseConfig].selectedFields : subquery;
-    const value = columns[prop];
-    if (is(value, SQL.Aliased)) {
-      if (this.config.sqlAliasedBehavior === "sql" && !value.isSelectionField) {
-        return value.sql;
-      }
-      const newValue = value.clone();
-      newValue.isSelectionField = true;
-      return newValue;
-    }
-    if (is(value, SQL)) {
-      if (this.config.sqlBehavior === "sql") {
-        return value;
-      }
-      throw new Error(
-        `You tried to reference "${prop}" field from a subquery, which is a raw SQL field, but it doesn't have an alias declared. Please add an alias to the field using ".as('alias')" method.`
-      );
-    }
-    if (is(value, Column)) {
-      if (this.config.alias) {
-        return new Proxy(
-          value,
-          new ColumnAliasProxyHandler(
-            new Proxy(
-              value.table,
-              new TableAliasProxyHandler(this.config.alias, this.config.replaceOriginalName ?? false)
-            )
-          )
-        );
-      }
-      return value;
-    }
-    if (typeof value !== "object" || value === null) {
-      return value;
-    }
-    return new Proxy(value, new _SelectionProxyHandler(this.config));
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/indexes.js
-var IndexBuilderOn = class {
-  constructor(unique, name) {
-    this.unique = unique;
-    this.name = name;
-  }
-  static [entityKind] = "PgIndexBuilderOn";
-  on(...columns) {
-    return new IndexBuilder(
-      columns.map((it) => {
-        if (is(it, SQL)) {
-          return it;
-        }
-        it = it;
-        const clonedIndexedColumn = new IndexedColumn(it.name, !!it.keyAsName, it.columnType, it.indexConfig);
-        it.indexConfig = JSON.parse(JSON.stringify(it.defaultConfig));
-        return clonedIndexedColumn;
-      }),
-      this.unique,
-      false,
-      this.name
-    );
-  }
-  onOnly(...columns) {
-    return new IndexBuilder(
-      columns.map((it) => {
-        if (is(it, SQL)) {
-          return it;
-        }
-        it = it;
-        const clonedIndexedColumn = new IndexedColumn(it.name, !!it.keyAsName, it.columnType, it.indexConfig);
-        it.indexConfig = it.defaultConfig;
-        return clonedIndexedColumn;
-      }),
-      this.unique,
-      true,
-      this.name
-    );
-  }
-  /**
-   * Specify what index method to use. Choices are `btree`, `hash`, `gist`, `spgist`, `gin`, `brin`, or user-installed access methods like `bloom`. The default method is `btree.
-   *
-   * If you have the `pg_vector` extension installed in your database, you can use the `hnsw` and `ivfflat` options, which are predefined types.
-   *
-   * **You can always specify any string you want in the method, in case Drizzle doesn't have it natively in its types**
-   *
-   * @param method The name of the index method to be used
-   * @param columns
-   * @returns
-   */
-  using(method, ...columns) {
-    return new IndexBuilder(
-      columns.map((it) => {
-        if (is(it, SQL)) {
-          return it;
-        }
-        it = it;
-        const clonedIndexedColumn = new IndexedColumn(it.name, !!it.keyAsName, it.columnType, it.indexConfig);
-        it.indexConfig = JSON.parse(JSON.stringify(it.defaultConfig));
-        return clonedIndexedColumn;
-      }),
-      this.unique,
-      true,
-      this.name,
-      method
-    );
-  }
-};
-var IndexBuilder = class {
-  static [entityKind] = "PgIndexBuilder";
-  /** @internal */
-  config;
-  constructor(columns, unique, only, name, method = "btree") {
-    this.config = {
-      name,
-      columns,
-      unique,
-      only,
-      method
-    };
-  }
-  concurrently() {
-    this.config.concurrently = true;
-    return this;
-  }
-  with(obj) {
-    this.config.with = obj;
-    return this;
-  }
-  where(condition) {
-    this.config.where = condition;
-    return this;
-  }
-  /** @internal */
-  build(table) {
-    return new Index(this.config, table);
-  }
-};
-var Index = class {
-  static [entityKind] = "PgIndex";
-  config;
-  constructor(config2, table) {
-    this.config = { ...config2, table };
-  }
-};
-function uniqueIndex(name) {
-  return new IndexBuilderOn(true, name);
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/casing.js
-function toSnakeCase(input) {
-  const words = input.replace(/['\u2019]/g, "").match(/[\da-z]+|[A-Z]+(?![a-z])|[A-Z][\da-z]+/g) ?? [];
-  return words.map((word) => word.toLowerCase()).join("_");
-}
-function toCamelCase(input) {
-  const words = input.replace(/['\u2019]/g, "").match(/[\da-z]+|[A-Z]+(?![a-z])|[A-Z][\da-z]+/g) ?? [];
-  return words.reduce((acc, word, i) => {
-    const formattedWord = i === 0 ? word.toLowerCase() : `${word[0].toUpperCase()}${word.slice(1)}`;
-    return acc + formattedWord;
-  }, "");
-}
-function noopCase(input) {
-  return input;
-}
-var CasingCache = class {
-  static [entityKind] = "CasingCache";
-  /** @internal */
-  cache = {};
-  cachedTables = {};
-  convert;
-  constructor(casing) {
-    this.convert = casing === "snake_case" ? toSnakeCase : casing === "camelCase" ? toCamelCase : noopCase;
-  }
-  getColumnCasing(column) {
-    if (!column.keyAsName) return column.name;
-    const schema = column.table[Table.Symbol.Schema] ?? "public";
-    const tableName = column.table[Table.Symbol.OriginalName];
-    const key = `${schema}.${tableName}.${column.name}`;
-    if (!this.cache[key]) {
-      this.cacheTable(column.table);
-    }
-    return this.cache[key];
-  }
-  cacheTable(table) {
-    const schema = table[Table.Symbol.Schema] ?? "public";
-    const tableName = table[Table.Symbol.OriginalName];
-    const tableKey = `${schema}.${tableName}`;
-    if (!this.cachedTables[tableKey]) {
-      for (const column of Object.values(table[Table.Symbol.Columns])) {
-        const columnKey = `${tableKey}.${column.name}`;
-        this.cache[columnKey] = this.convert(column.name);
-      }
-      this.cachedTables[tableKey] = true;
-    }
-  }
-  clearCache() {
-    this.cache = {};
-    this.cachedTables = {};
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/view-base.js
-var PgViewBase = class extends View {
-  static [entityKind] = "PgViewBase";
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/dialect.js
-var PgDialect = class {
-  static [entityKind] = "PgDialect";
-  /** @internal */
-  casing;
-  constructor(config2) {
-    this.casing = new CasingCache(config2?.casing);
-  }
-  async migrate(migrations, session, config2) {
-    const migrationsTable = typeof config2 === "string" ? "__drizzle_migrations" : config2.migrationsTable ?? "__drizzle_migrations";
-    const migrationsSchema = typeof config2 === "string" ? "drizzle" : config2.migrationsSchema ?? "drizzle";
-    const migrationTableCreate = sql`
-			CREATE TABLE IF NOT EXISTS ${sql.identifier(migrationsSchema)}.${sql.identifier(migrationsTable)} (
-				id SERIAL PRIMARY KEY,
-				hash text NOT NULL,
-				created_at bigint
-			)
-		`;
-    await session.execute(sql`CREATE SCHEMA IF NOT EXISTS ${sql.identifier(migrationsSchema)}`);
-    await session.execute(migrationTableCreate);
-    const dbMigrations = await session.all(
-      sql`select id, hash, created_at from ${sql.identifier(migrationsSchema)}.${sql.identifier(migrationsTable)} order by created_at desc limit 1`
-    );
-    const lastDbMigration = dbMigrations[0];
-    await session.transaction(async (tx) => {
-      for await (const migration of migrations) {
-        if (!lastDbMigration || Number(lastDbMigration.created_at) < migration.folderMillis) {
-          for (const stmt of migration.sql) {
-            await tx.execute(sql.raw(stmt));
-          }
-          await tx.execute(
-            sql`insert into ${sql.identifier(migrationsSchema)}.${sql.identifier(migrationsTable)} ("hash", "created_at") values(${migration.hash}, ${migration.folderMillis})`
-          );
-        }
-      }
-    });
-  }
-  escapeName(name) {
-    return `"${name.replace(/"/g, '""')}"`;
-  }
-  escapeParam(num) {
-    return `$${num + 1}`;
-  }
-  escapeString(str) {
-    return `'${str.replace(/'/g, "''")}'`;
-  }
-  buildWithCTE(queries) {
-    if (!queries?.length) return void 0;
-    const withSqlChunks = [sql`with `];
-    for (const [i, w] of queries.entries()) {
-      withSqlChunks.push(sql`${sql.identifier(w._.alias)} as (${w._.sql})`);
-      if (i < queries.length - 1) {
-        withSqlChunks.push(sql`, `);
-      }
-    }
-    withSqlChunks.push(sql` `);
-    return sql.join(withSqlChunks);
-  }
-  buildDeleteQuery({ table, where, returning, withList }) {
-    const withSql = this.buildWithCTE(withList);
-    const returningSql = returning ? sql` returning ${this.buildSelection(returning, { isSingleTable: true })}` : void 0;
-    const whereSql = where ? sql` where ${where}` : void 0;
-    return sql`${withSql}delete from ${table}${whereSql}${returningSql}`;
-  }
-  buildUpdateSet(table, set) {
-    const tableColumns = table[Table.Symbol.Columns];
-    const columnNames = Object.keys(tableColumns).filter(
-      (colName) => set[colName] !== void 0 || tableColumns[colName]?.onUpdateFn !== void 0
-    );
-    const setSize = columnNames.length;
-    return sql.join(columnNames.flatMap((colName, i) => {
-      const col = tableColumns[colName];
-      const onUpdateFnResult = col.onUpdateFn?.();
-      const value = set[colName] ?? (is(onUpdateFnResult, SQL) ? onUpdateFnResult : sql.param(onUpdateFnResult, col));
-      const res = sql`${sql.identifier(this.casing.getColumnCasing(col))} = ${value}`;
-      if (i < setSize - 1) {
-        return [res, sql.raw(", ")];
-      }
-      return [res];
-    }));
-  }
-  buildUpdateQuery({ table, set, where, returning, withList, from, joins }) {
-    const withSql = this.buildWithCTE(withList);
-    const tableName = table[PgTable.Symbol.Name];
-    const tableSchema = table[PgTable.Symbol.Schema];
-    const origTableName = table[PgTable.Symbol.OriginalName];
-    const alias = tableName === origTableName ? void 0 : tableName;
-    const tableSql = sql`${tableSchema ? sql`${sql.identifier(tableSchema)}.` : void 0}${sql.identifier(origTableName)}${alias && sql` ${sql.identifier(alias)}`}`;
-    const setSql = this.buildUpdateSet(table, set);
-    const fromSql = from && sql.join([sql.raw(" from "), this.buildFromTable(from)]);
-    const joinsSql = this.buildJoins(joins);
-    const returningSql = returning ? sql` returning ${this.buildSelection(returning, { isSingleTable: !from })}` : void 0;
-    const whereSql = where ? sql` where ${where}` : void 0;
-    return sql`${withSql}update ${tableSql} set ${setSql}${fromSql}${joinsSql}${whereSql}${returningSql}`;
-  }
-  /**
-   * Builds selection SQL with provided fields/expressions
-   *
-   * Examples:
-   *
-   * `select <selection> from`
-   *
-   * `insert ... returning <selection>`
-   *
-   * If `isSingleTable` is true, then columns won't be prefixed with table name
-   */
-  buildSelection(fields, { isSingleTable = false } = {}) {
-    const columnsLen = fields.length;
-    const chunks = fields.flatMap(({ field }, i) => {
-      const chunk = [];
-      if (is(field, SQL.Aliased) && field.isSelectionField) {
-        chunk.push(sql.identifier(field.fieldAlias));
-      } else if (is(field, SQL.Aliased) || is(field, SQL)) {
-        const query = is(field, SQL.Aliased) ? field.sql : field;
-        if (isSingleTable) {
-          chunk.push(
-            new SQL(
-              query.queryChunks.map((c) => {
-                if (is(c, PgColumn)) {
-                  return sql.identifier(this.casing.getColumnCasing(c));
-                }
-                return c;
-              })
-            )
-          );
-        } else {
-          chunk.push(query);
-        }
-        if (is(field, SQL.Aliased)) {
-          chunk.push(sql` as ${sql.identifier(field.fieldAlias)}`);
-        }
-      } else if (is(field, Column)) {
-        if (isSingleTable) {
-          chunk.push(sql.identifier(this.casing.getColumnCasing(field)));
-        } else {
-          chunk.push(field);
-        }
-      } else if (is(field, Subquery)) {
-        const entries = Object.entries(field._.selectedFields);
-        if (entries.length === 1) {
-          const entry = entries[0][1];
-          const fieldDecoder = is(entry, SQL) ? entry.decoder : is(entry, Column) ? { mapFromDriverValue: (v) => entry.mapFromDriverValue(v) } : entry.sql.decoder;
-          if (fieldDecoder) {
-            field._.sql.decoder = fieldDecoder;
-          }
-        }
-        chunk.push(field);
-      }
-      if (i < columnsLen - 1) {
-        chunk.push(sql`, `);
-      }
-      return chunk;
-    });
-    return sql.join(chunks);
-  }
-  buildJoins(joins) {
-    if (!joins || joins.length === 0) {
-      return void 0;
-    }
-    const joinsArray = [];
-    for (const [index, joinMeta] of joins.entries()) {
-      if (index === 0) {
-        joinsArray.push(sql` `);
-      }
-      const table = joinMeta.table;
-      const lateralSql = joinMeta.lateral ? sql` lateral` : void 0;
-      const onSql = joinMeta.on ? sql` on ${joinMeta.on}` : void 0;
-      if (is(table, PgTable)) {
-        const tableName = table[PgTable.Symbol.Name];
-        const tableSchema = table[PgTable.Symbol.Schema];
-        const origTableName = table[PgTable.Symbol.OriginalName];
-        const alias = tableName === origTableName ? void 0 : joinMeta.alias;
-        joinsArray.push(
-          sql`${sql.raw(joinMeta.joinType)} join${lateralSql} ${tableSchema ? sql`${sql.identifier(tableSchema)}.` : void 0}${sql.identifier(origTableName)}${alias && sql` ${sql.identifier(alias)}`}${onSql}`
-        );
-      } else if (is(table, View)) {
-        const viewName = table[ViewBaseConfig].name;
-        const viewSchema = table[ViewBaseConfig].schema;
-        const origViewName = table[ViewBaseConfig].originalName;
-        const alias = viewName === origViewName ? void 0 : joinMeta.alias;
-        joinsArray.push(
-          sql`${sql.raw(joinMeta.joinType)} join${lateralSql} ${viewSchema ? sql`${sql.identifier(viewSchema)}.` : void 0}${sql.identifier(origViewName)}${alias && sql` ${sql.identifier(alias)}`}${onSql}`
-        );
-      } else {
-        joinsArray.push(
-          sql`${sql.raw(joinMeta.joinType)} join${lateralSql} ${table}${onSql}`
-        );
-      }
-      if (index < joins.length - 1) {
-        joinsArray.push(sql` `);
-      }
-    }
-    return sql.join(joinsArray);
-  }
-  buildFromTable(table) {
-    if (is(table, Table) && table[Table.Symbol.IsAlias]) {
-      let fullName = sql`${sql.identifier(table[Table.Symbol.OriginalName])}`;
-      if (table[Table.Symbol.Schema]) {
-        fullName = sql`${sql.identifier(table[Table.Symbol.Schema])}.${fullName}`;
-      }
-      return sql`${fullName} ${sql.identifier(table[Table.Symbol.Name])}`;
-    }
-    return table;
-  }
-  buildSelectQuery({
-    withList,
-    fields,
-    fieldsFlat,
-    where,
-    having,
-    table,
-    joins,
-    orderBy,
-    groupBy,
-    limit,
-    offset,
-    lockingClause,
-    distinct,
-    setOperators
-  }) {
-    const fieldsList = fieldsFlat ?? orderSelectedFields(fields);
-    for (const f of fieldsList) {
-      if (is(f.field, Column) && getTableName(f.field.table) !== (is(table, Subquery) ? table._.alias : is(table, PgViewBase) ? table[ViewBaseConfig].name : is(table, SQL) ? void 0 : getTableName(table)) && !((table2) => joins?.some(
-        ({ alias }) => alias === (table2[Table.Symbol.IsAlias] ? getTableName(table2) : table2[Table.Symbol.BaseName])
-      ))(f.field.table)) {
-        const tableName = getTableName(f.field.table);
-        throw new Error(
-          `Your "${f.path.join("->")}" field references a column "${tableName}"."${f.field.name}", but the table "${tableName}" is not part of the query! Did you forget to join it?`
-        );
-      }
-    }
-    const isSingleTable = !joins || joins.length === 0;
-    const withSql = this.buildWithCTE(withList);
-    let distinctSql;
-    if (distinct) {
-      distinctSql = distinct === true ? sql` distinct` : sql` distinct on (${sql.join(distinct.on, sql`, `)})`;
-    }
-    const selection = this.buildSelection(fieldsList, { isSingleTable });
-    const tableSql = this.buildFromTable(table);
-    const joinsSql = this.buildJoins(joins);
-    const whereSql = where ? sql` where ${where}` : void 0;
-    const havingSql = having ? sql` having ${having}` : void 0;
-    let orderBySql;
-    if (orderBy && orderBy.length > 0) {
-      orderBySql = sql` order by ${sql.join(orderBy, sql`, `)}`;
-    }
-    let groupBySql;
-    if (groupBy && groupBy.length > 0) {
-      groupBySql = sql` group by ${sql.join(groupBy, sql`, `)}`;
-    }
-    const limitSql = typeof limit === "object" || typeof limit === "number" && limit >= 0 ? sql` limit ${limit}` : void 0;
-    const offsetSql = offset ? sql` offset ${offset}` : void 0;
-    const lockingClauseSql = sql.empty();
-    if (lockingClause) {
-      const clauseSql = sql` for ${sql.raw(lockingClause.strength)}`;
-      if (lockingClause.config.of) {
-        clauseSql.append(
-          sql` of ${sql.join(
-            Array.isArray(lockingClause.config.of) ? lockingClause.config.of : [lockingClause.config.of],
-            sql`, `
-          )}`
-        );
-      }
-      if (lockingClause.config.noWait) {
-        clauseSql.append(sql` nowait`);
-      } else if (lockingClause.config.skipLocked) {
-        clauseSql.append(sql` skip locked`);
-      }
-      lockingClauseSql.append(clauseSql);
-    }
-    const finalQuery = sql`${withSql}select${distinctSql} ${selection} from ${tableSql}${joinsSql}${whereSql}${groupBySql}${havingSql}${orderBySql}${limitSql}${offsetSql}${lockingClauseSql}`;
-    if (setOperators.length > 0) {
-      return this.buildSetOperations(finalQuery, setOperators);
-    }
-    return finalQuery;
-  }
-  buildSetOperations(leftSelect, setOperators) {
-    const [setOperator, ...rest] = setOperators;
-    if (!setOperator) {
-      throw new Error("Cannot pass undefined values to any set operator");
-    }
-    if (rest.length === 0) {
-      return this.buildSetOperationQuery({ leftSelect, setOperator });
-    }
-    return this.buildSetOperations(
-      this.buildSetOperationQuery({ leftSelect, setOperator }),
-      rest
-    );
-  }
-  buildSetOperationQuery({
-    leftSelect,
-    setOperator: { type, isAll, rightSelect, limit, orderBy, offset }
-  }) {
-    const leftChunk = sql`(${leftSelect.getSQL()}) `;
-    const rightChunk = sql`(${rightSelect.getSQL()})`;
-    let orderBySql;
-    if (orderBy && orderBy.length > 0) {
-      const orderByValues = [];
-      for (const singleOrderBy of orderBy) {
-        if (is(singleOrderBy, PgColumn)) {
-          orderByValues.push(sql.identifier(singleOrderBy.name));
-        } else if (is(singleOrderBy, SQL)) {
-          for (let i = 0; i < singleOrderBy.queryChunks.length; i++) {
-            const chunk = singleOrderBy.queryChunks[i];
-            if (is(chunk, PgColumn)) {
-              singleOrderBy.queryChunks[i] = sql.identifier(chunk.name);
-            }
-          }
-          orderByValues.push(sql`${singleOrderBy}`);
-        } else {
-          orderByValues.push(sql`${singleOrderBy}`);
-        }
-      }
-      orderBySql = sql` order by ${sql.join(orderByValues, sql`, `)} `;
-    }
-    const limitSql = typeof limit === "object" || typeof limit === "number" && limit >= 0 ? sql` limit ${limit}` : void 0;
-    const operatorChunk = sql.raw(`${type} ${isAll ? "all " : ""}`);
-    const offsetSql = offset ? sql` offset ${offset}` : void 0;
-    return sql`${leftChunk}${operatorChunk}${rightChunk}${orderBySql}${limitSql}${offsetSql}`;
-  }
-  buildInsertQuery({ table, values: valuesOrSelect, onConflict, returning, withList, select, overridingSystemValue_ }) {
-    const valuesSqlList = [];
-    const columns = table[Table.Symbol.Columns];
-    const colEntries = Object.entries(columns).filter(([_, col]) => !col.shouldDisableInsert());
-    const insertOrder = colEntries.map(
-      ([, column]) => sql.identifier(this.casing.getColumnCasing(column))
-    );
-    if (select) {
-      const select2 = valuesOrSelect;
-      if (is(select2, SQL)) {
-        valuesSqlList.push(select2);
-      } else {
-        valuesSqlList.push(select2.getSQL());
-      }
-    } else {
-      const values = valuesOrSelect;
-      valuesSqlList.push(sql.raw("values "));
-      for (const [valueIndex, value] of values.entries()) {
-        const valueList = [];
-        for (const [fieldName, col] of colEntries) {
-          const colValue = value[fieldName];
-          if (colValue === void 0 || is(colValue, Param) && colValue.value === void 0) {
-            if (col.defaultFn !== void 0) {
-              const defaultFnResult = col.defaultFn();
-              const defaultValue = is(defaultFnResult, SQL) ? defaultFnResult : sql.param(defaultFnResult, col);
-              valueList.push(defaultValue);
-            } else if (!col.default && col.onUpdateFn !== void 0) {
-              const onUpdateFnResult = col.onUpdateFn();
-              const newValue = is(onUpdateFnResult, SQL) ? onUpdateFnResult : sql.param(onUpdateFnResult, col);
-              valueList.push(newValue);
-            } else {
-              valueList.push(sql`default`);
-            }
-          } else {
-            valueList.push(colValue);
-          }
-        }
-        valuesSqlList.push(valueList);
-        if (valueIndex < values.length - 1) {
-          valuesSqlList.push(sql`, `);
-        }
-      }
-    }
-    const withSql = this.buildWithCTE(withList);
-    const valuesSql = sql.join(valuesSqlList);
-    const returningSql = returning ? sql` returning ${this.buildSelection(returning, { isSingleTable: true })}` : void 0;
-    const onConflictSql = onConflict ? sql` on conflict ${onConflict}` : void 0;
-    const overridingSql = overridingSystemValue_ === true ? sql`overriding system value ` : void 0;
-    return sql`${withSql}insert into ${table} ${insertOrder} ${overridingSql}${valuesSql}${onConflictSql}${returningSql}`;
-  }
-  buildRefreshMaterializedViewQuery({ view, concurrently, withNoData }) {
-    const concurrentlySql = concurrently ? sql` concurrently` : void 0;
-    const withNoDataSql = withNoData ? sql` with no data` : void 0;
-    return sql`refresh materialized view${concurrentlySql} ${view}${withNoDataSql}`;
-  }
-  prepareTyping(encoder) {
-    if (is(encoder, PgJsonb) || is(encoder, PgJson)) {
-      return "json";
-    } else if (is(encoder, PgNumeric)) {
-      return "decimal";
-    } else if (is(encoder, PgTime)) {
-      return "time";
-    } else if (is(encoder, PgTimestamp) || is(encoder, PgTimestampString)) {
-      return "timestamp";
-    } else if (is(encoder, PgDate) || is(encoder, PgDateString)) {
-      return "date";
-    } else if (is(encoder, PgUUID)) {
-      return "uuid";
-    } else {
-      return "none";
-    }
-  }
-  sqlToQuery(sql2, invokeSource) {
-    return sql2.toQuery({
-      casing: this.casing,
-      escapeName: this.escapeName,
-      escapeParam: this.escapeParam,
-      escapeString: this.escapeString,
-      prepareTyping: this.prepareTyping,
-      invokeSource
-    });
-  }
-  // buildRelationalQueryWithPK({
-  // 	fullSchema,
-  // 	schema,
-  // 	tableNamesMap,
-  // 	table,
-  // 	tableConfig,
-  // 	queryConfig: config,
-  // 	tableAlias,
-  // 	isRoot = false,
-  // 	joinOn,
-  // }: {
-  // 	fullSchema: Record<string, unknown>;
-  // 	schema: TablesRelationalConfig;
-  // 	tableNamesMap: Record<string, string>;
-  // 	table: PgTable;
-  // 	tableConfig: TableRelationalConfig;
-  // 	queryConfig: true | DBQueryConfig<'many', true>;
-  // 	tableAlias: string;
-  // 	isRoot?: boolean;
-  // 	joinOn?: SQL;
-  // }): BuildRelationalQueryResult<PgTable, PgColumn> {
-  // 	// For { "<relation>": true }, return a table with selection of all columns
-  // 	if (config === true) {
-  // 		const selectionEntries = Object.entries(tableConfig.columns);
-  // 		const selection: BuildRelationalQueryResult<PgTable, PgColumn>['selection'] = selectionEntries.map((
-  // 			[key, value],
-  // 		) => ({
-  // 			dbKey: value.name,
-  // 			tsKey: key,
-  // 			field: value as PgColumn,
-  // 			relationTableTsKey: undefined,
-  // 			isJson: false,
-  // 			selection: [],
-  // 		}));
-  // 		return {
-  // 			tableTsKey: tableConfig.tsName,
-  // 			sql: table,
-  // 			selection,
-  // 		};
-  // 	}
-  // 	// let selection: BuildRelationalQueryResult<PgTable, PgColumn>['selection'] = [];
-  // 	// let selectionForBuild = selection;
-  // 	const aliasedColumns = Object.fromEntries(
-  // 		Object.entries(tableConfig.columns).map(([key, value]) => [key, aliasedTableColumn(value, tableAlias)]),
-  // 	);
-  // 	const aliasedRelations = Object.fromEntries(
-  // 		Object.entries(tableConfig.relations).map(([key, value]) => [key, aliasedRelation(value, tableAlias)]),
-  // 	);
-  // 	const aliasedFields = Object.assign({}, aliasedColumns, aliasedRelations);
-  // 	let where, hasUserDefinedWhere;
-  // 	if (config.where) {
-  // 		const whereSql = typeof config.where === 'function' ? config.where(aliasedFields, operators) : config.where;
-  // 		where = whereSql && mapColumnsInSQLToAlias(whereSql, tableAlias);
-  // 		hasUserDefinedWhere = !!where;
-  // 	}
-  // 	where = and(joinOn, where);
-  // 	// const fieldsSelection: { tsKey: string; value: PgColumn | SQL.Aliased; isExtra?: boolean }[] = [];
-  // 	let joins: Join[] = [];
-  // 	let selectedColumns: string[] = [];
-  // 	// Figure out which columns to select
-  // 	if (config.columns) {
-  // 		let isIncludeMode = false;
-  // 		for (const [field, value] of Object.entries(config.columns)) {
-  // 			if (value === undefined) {
-  // 				continue;
-  // 			}
-  // 			if (field in tableConfig.columns) {
-  // 				if (!isIncludeMode && value === true) {
-  // 					isIncludeMode = true;
-  // 				}
-  // 				selectedColumns.push(field);
-  // 			}
-  // 		}
-  // 		if (selectedColumns.length > 0) {
-  // 			selectedColumns = isIncludeMode
-  // 				? selectedColumns.filter((c) => config.columns?.[c] === true)
-  // 				: Object.keys(tableConfig.columns).filter((key) => !selectedColumns.includes(key));
-  // 		}
-  // 	} else {
-  // 		// Select all columns if selection is not specified
-  // 		selectedColumns = Object.keys(tableConfig.columns);
-  // 	}
-  // 	// for (const field of selectedColumns) {
-  // 	// 	const column = tableConfig.columns[field]! as PgColumn;
-  // 	// 	fieldsSelection.push({ tsKey: field, value: column });
-  // 	// }
-  // 	let initiallySelectedRelations: {
-  // 		tsKey: string;
-  // 		queryConfig: true | DBQueryConfig<'many', false>;
-  // 		relation: Relation;
-  // 	}[] = [];
-  // 	// let selectedRelations: BuildRelationalQueryResult<PgTable, PgColumn>['selection'] = [];
-  // 	// Figure out which relations to select
-  // 	if (config.with) {
-  // 		initiallySelectedRelations = Object.entries(config.with)
-  // 			.filter((entry): entry is [typeof entry[0], NonNullable<typeof entry[1]>] => !!entry[1])
-  // 			.map(([tsKey, queryConfig]) => ({ tsKey, queryConfig, relation: tableConfig.relations[tsKey]! }));
-  // 	}
-  // 	const manyRelations = initiallySelectedRelations.filter((r) =>
-  // 		is(r.relation, Many)
-  // 		&& (schema[tableNamesMap[r.relation.referencedTable[Table.Symbol.Name]]!]?.primaryKey.length ?? 0) > 0
-  // 	);
-  // 	// If this is the last Many relation (or there are no Many relations), we are on the innermost subquery level
-  // 	const isInnermostQuery = manyRelations.length < 2;
-  // 	const selectedExtras: {
-  // 		tsKey: string;
-  // 		value: SQL.Aliased;
-  // 	}[] = [];
-  // 	// Figure out which extras to select
-  // 	if (isInnermostQuery && config.extras) {
-  // 		const extras = typeof config.extras === 'function'
-  // 			? config.extras(aliasedFields, { sql })
-  // 			: config.extras;
-  // 		for (const [tsKey, value] of Object.entries(extras)) {
-  // 			selectedExtras.push({
-  // 				tsKey,
-  // 				value: mapColumnsInAliasedSQLToAlias(value, tableAlias),
-  // 			});
-  // 		}
-  // 	}
-  // 	// Transform `fieldsSelection` into `selection`
-  // 	// `fieldsSelection` shouldn't be used after this point
-  // 	// for (const { tsKey, value, isExtra } of fieldsSelection) {
-  // 	// 	selection.push({
-  // 	// 		dbKey: is(value, SQL.Aliased) ? value.fieldAlias : tableConfig.columns[tsKey]!.name,
-  // 	// 		tsKey,
-  // 	// 		field: is(value, Column) ? aliasedTableColumn(value, tableAlias) : value,
-  // 	// 		relationTableTsKey: undefined,
-  // 	// 		isJson: false,
-  // 	// 		isExtra,
-  // 	// 		selection: [],
-  // 	// 	});
-  // 	// }
-  // 	let orderByOrig = typeof config.orderBy === 'function'
-  // 		? config.orderBy(aliasedFields, orderByOperators)
-  // 		: config.orderBy ?? [];
-  // 	if (!Array.isArray(orderByOrig)) {
-  // 		orderByOrig = [orderByOrig];
-  // 	}
-  // 	const orderBy = orderByOrig.map((orderByValue) => {
-  // 		if (is(orderByValue, Column)) {
-  // 			return aliasedTableColumn(orderByValue, tableAlias) as PgColumn;
-  // 		}
-  // 		return mapColumnsInSQLToAlias(orderByValue, tableAlias);
-  // 	});
-  // 	const limit = isInnermostQuery ? config.limit : undefined;
-  // 	const offset = isInnermostQuery ? config.offset : undefined;
-  // 	// For non-root queries without additional config except columns, return a table with selection
-  // 	if (
-  // 		!isRoot
-  // 		&& initiallySelectedRelations.length === 0
-  // 		&& selectedExtras.length === 0
-  // 		&& !where
-  // 		&& orderBy.length === 0
-  // 		&& limit === undefined
-  // 		&& offset === undefined
-  // 	) {
-  // 		return {
-  // 			tableTsKey: tableConfig.tsName,
-  // 			sql: table,
-  // 			selection: selectedColumns.map((key) => ({
-  // 				dbKey: tableConfig.columns[key]!.name,
-  // 				tsKey: key,
-  // 				field: tableConfig.columns[key] as PgColumn,
-  // 				relationTableTsKey: undefined,
-  // 				isJson: false,
-  // 				selection: [],
-  // 			})),
-  // 		};
-  // 	}
-  // 	const selectedRelationsWithoutPK:
-  // 	// Process all relations without primary keys, because they need to be joined differently and will all be on the same query level
-  // 	for (
-  // 		const {
-  // 			tsKey: selectedRelationTsKey,
-  // 			queryConfig: selectedRelationConfigValue,
-  // 			relation,
-  // 		} of initiallySelectedRelations
-  // 	) {
-  // 		const normalizedRelation = normalizeRelation(schema, tableNamesMap, relation);
-  // 		const relationTableName = relation.referencedTable[Table.Symbol.Name];
-  // 		const relationTableTsName = tableNamesMap[relationTableName]!;
-  // 		const relationTable = schema[relationTableTsName]!;
-  // 		if (relationTable.primaryKey.length > 0) {
-  // 			continue;
-  // 		}
-  // 		const relationTableAlias = `${tableAlias}_${selectedRelationTsKey}`;
-  // 		const joinOn = and(
-  // 			...normalizedRelation.fields.map((field, i) =>
-  // 				eq(
-  // 					aliasedTableColumn(normalizedRelation.references[i]!, relationTableAlias),
-  // 					aliasedTableColumn(field, tableAlias),
-  // 				)
-  // 			),
-  // 		);
-  // 		const builtRelation = this.buildRelationalQueryWithoutPK({
-  // 			fullSchema,
-  // 			schema,
-  // 			tableNamesMap,
-  // 			table: fullSchema[relationTableTsName] as PgTable,
-  // 			tableConfig: schema[relationTableTsName]!,
-  // 			queryConfig: selectedRelationConfigValue,
-  // 			tableAlias: relationTableAlias,
-  // 			joinOn,
-  // 			nestedQueryRelation: relation,
-  // 		});
-  // 		const field = sql`${sql.identifier(relationTableAlias)}.${sql.identifier('data')}`.as(selectedRelationTsKey);
-  // 		joins.push({
-  // 			on: sql`true`,
-  // 			table: new Subquery(builtRelation.sql as SQL, {}, relationTableAlias),
-  // 			alias: relationTableAlias,
-  // 			joinType: 'left',
-  // 			lateral: true,
-  // 		});
-  // 		selectedRelations.push({
-  // 			dbKey: selectedRelationTsKey,
-  // 			tsKey: selectedRelationTsKey,
-  // 			field,
-  // 			relationTableTsKey: relationTableTsName,
-  // 			isJson: true,
-  // 			selection: builtRelation.selection,
-  // 		});
-  // 	}
-  // 	const oneRelations = initiallySelectedRelations.filter((r): r is typeof r & { relation: One } =>
-  // 		is(r.relation, One)
-  // 	);
-  // 	// Process all One relations with PKs, because they can all be joined on the same level
-  // 	for (
-  // 		const {
-  // 			tsKey: selectedRelationTsKey,
-  // 			queryConfig: selectedRelationConfigValue,
-  // 			relation,
-  // 		} of oneRelations
-  // 	) {
-  // 		const normalizedRelation = normalizeRelation(schema, tableNamesMap, relation);
-  // 		const relationTableName = relation.referencedTable[Table.Symbol.Name];
-  // 		const relationTableTsName = tableNamesMap[relationTableName]!;
-  // 		const relationTableAlias = `${tableAlias}_${selectedRelationTsKey}`;
-  // 		const relationTable = schema[relationTableTsName]!;
-  // 		if (relationTable.primaryKey.length === 0) {
-  // 			continue;
-  // 		}
-  // 		const joinOn = and(
-  // 			...normalizedRelation.fields.map((field, i) =>
-  // 				eq(
-  // 					aliasedTableColumn(normalizedRelation.references[i]!, relationTableAlias),
-  // 					aliasedTableColumn(field, tableAlias),
-  // 				)
-  // 			),
-  // 		);
-  // 		const builtRelation = this.buildRelationalQueryWithPK({
-  // 			fullSchema,
-  // 			schema,
-  // 			tableNamesMap,
-  // 			table: fullSchema[relationTableTsName] as PgTable,
-  // 			tableConfig: schema[relationTableTsName]!,
-  // 			queryConfig: selectedRelationConfigValue,
-  // 			tableAlias: relationTableAlias,
-  // 			joinOn,
-  // 		});
-  // 		const field = sql`case when ${sql.identifier(relationTableAlias)} is null then null else json_build_array(${
-  // 			sql.join(
-  // 				builtRelation.selection.map(({ field }) =>
-  // 					is(field, SQL.Aliased)
-  // 						? sql`${sql.identifier(relationTableAlias)}.${sql.identifier(field.fieldAlias)}`
-  // 						: is(field, Column)
-  // 						? aliasedTableColumn(field, relationTableAlias)
-  // 						: field
-  // 				),
-  // 				sql`, `,
-  // 			)
-  // 		}) end`.as(selectedRelationTsKey);
-  // 		const isLateralJoin = is(builtRelation.sql, SQL);
-  // 		joins.push({
-  // 			on: isLateralJoin ? sql`true` : joinOn,
-  // 			table: is(builtRelation.sql, SQL)
-  // 				? new Subquery(builtRelation.sql, {}, relationTableAlias)
-  // 				: aliasedTable(builtRelation.sql, relationTableAlias),
-  // 			alias: relationTableAlias,
-  // 			joinType: 'left',
-  // 			lateral: is(builtRelation.sql, SQL),
-  // 		});
-  // 		selectedRelations.push({
-  // 			dbKey: selectedRelationTsKey,
-  // 			tsKey: selectedRelationTsKey,
-  // 			field,
-  // 			relationTableTsKey: relationTableTsName,
-  // 			isJson: true,
-  // 			selection: builtRelation.selection,
-  // 		});
-  // 	}
-  // 	let distinct: PgSelectConfig['distinct'];
-  // 	let tableFrom: PgTable | Subquery = table;
-  // 	// Process first Many relation - each one requires a nested subquery
-  // 	const manyRelation = manyRelations[0];
-  // 	if (manyRelation) {
-  // 		const {
-  // 			tsKey: selectedRelationTsKey,
-  // 			queryConfig: selectedRelationQueryConfig,
-  // 			relation,
-  // 		} = manyRelation;
-  // 		distinct = {
-  // 			on: tableConfig.primaryKey.map((c) => aliasedTableColumn(c as PgColumn, tableAlias)),
-  // 		};
-  // 		const normalizedRelation = normalizeRelation(schema, tableNamesMap, relation);
-  // 		const relationTableName = relation.referencedTable[Table.Symbol.Name];
-  // 		const relationTableTsName = tableNamesMap[relationTableName]!;
-  // 		const relationTableAlias = `${tableAlias}_${selectedRelationTsKey}`;
-  // 		const joinOn = and(
-  // 			...normalizedRelation.fields.map((field, i) =>
-  // 				eq(
-  // 					aliasedTableColumn(normalizedRelation.references[i]!, relationTableAlias),
-  // 					aliasedTableColumn(field, tableAlias),
-  // 				)
-  // 			),
-  // 		);
-  // 		const builtRelationJoin = this.buildRelationalQueryWithPK({
-  // 			fullSchema,
-  // 			schema,
-  // 			tableNamesMap,
-  // 			table: fullSchema[relationTableTsName] as PgTable,
-  // 			tableConfig: schema[relationTableTsName]!,
-  // 			queryConfig: selectedRelationQueryConfig,
-  // 			tableAlias: relationTableAlias,
-  // 			joinOn,
-  // 		});
-  // 		const builtRelationSelectionField = sql`case when ${
-  // 			sql.identifier(relationTableAlias)
-  // 		} is null then '[]' else json_agg(json_build_array(${
-  // 			sql.join(
-  // 				builtRelationJoin.selection.map(({ field }) =>
-  // 					is(field, SQL.Aliased)
-  // 						? sql`${sql.identifier(relationTableAlias)}.${sql.identifier(field.fieldAlias)}`
-  // 						: is(field, Column)
-  // 						? aliasedTableColumn(field, relationTableAlias)
-  // 						: field
-  // 				),
-  // 				sql`, `,
-  // 			)
-  // 		})) over (partition by ${sql.join(distinct.on, sql`, `)}) end`.as(selectedRelationTsKey);
-  // 		const isLateralJoin = is(builtRelationJoin.sql, SQL);
-  // 		joins.push({
-  // 			on: isLateralJoin ? sql`true` : joinOn,
-  // 			table: isLateralJoin
-  // 				? new Subquery(builtRelationJoin.sql as SQL, {}, relationTableAlias)
-  // 				: aliasedTable(builtRelationJoin.sql as PgTable, relationTableAlias),
-  // 			alias: relationTableAlias,
-  // 			joinType: 'left',
-  // 			lateral: isLateralJoin,
-  // 		});
-  // 		// Build the "from" subquery with the remaining Many relations
-  // 		const builtTableFrom = this.buildRelationalQueryWithPK({
-  // 			fullSchema,
-  // 			schema,
-  // 			tableNamesMap,
-  // 			table,
-  // 			tableConfig,
-  // 			queryConfig: {
-  // 				...config,
-  // 				where: undefined,
-  // 				orderBy: undefined,
-  // 				limit: undefined,
-  // 				offset: undefined,
-  // 				with: manyRelations.slice(1).reduce<NonNullable<typeof config['with']>>(
-  // 					(result, { tsKey, queryConfig: configValue }) => {
-  // 						result[tsKey] = configValue;
-  // 						return result;
-  // 					},
-  // 					{},
-  // 				),
-  // 			},
-  // 			tableAlias,
-  // 		});
-  // 		selectedRelations.push({
-  // 			dbKey: selectedRelationTsKey,
-  // 			tsKey: selectedRelationTsKey,
-  // 			field: builtRelationSelectionField,
-  // 			relationTableTsKey: relationTableTsName,
-  // 			isJson: true,
-  // 			selection: builtRelationJoin.selection,
-  // 		});
-  // 		// selection = builtTableFrom.selection.map((item) =>
-  // 		// 	is(item.field, SQL.Aliased)
-  // 		// 		? { ...item, field: sql`${sql.identifier(tableAlias)}.${sql.identifier(item.field.fieldAlias)}` }
-  // 		// 		: item
-  // 		// );
-  // 		// selectionForBuild = [{
-  // 		// 	dbKey: '*',
-  // 		// 	tsKey: '*',
-  // 		// 	field: sql`${sql.identifier(tableAlias)}.*`,
-  // 		// 	selection: [],
-  // 		// 	isJson: false,
-  // 		// 	relationTableTsKey: undefined,
-  // 		// }];
-  // 		// const newSelectionItem: (typeof selection)[number] = {
-  // 		// 	dbKey: selectedRelationTsKey,
-  // 		// 	tsKey: selectedRelationTsKey,
-  // 		// 	field,
-  // 		// 	relationTableTsKey: relationTableTsName,
-  // 		// 	isJson: true,
-  // 		// 	selection: builtRelationJoin.selection,
-  // 		// };
-  // 		// selection.push(newSelectionItem);
-  // 		// selectionForBuild.push(newSelectionItem);
-  // 		tableFrom = is(builtTableFrom.sql, PgTable)
-  // 			? builtTableFrom.sql
-  // 			: new Subquery(builtTableFrom.sql, {}, tableAlias);
-  // 	}
-  // 	if (selectedColumns.length === 0 && selectedRelations.length === 0 && selectedExtras.length === 0) {
-  // 		throw new DrizzleError(`No fields selected for table "${tableConfig.tsName}" ("${tableAlias}")`);
-  // 	}
-  // 	let selection: BuildRelationalQueryResult<PgTable, PgColumn>['selection'];
-  // 	function prepareSelectedColumns() {
-  // 		return selectedColumns.map((key) => ({
-  // 			dbKey: tableConfig.columns[key]!.name,
-  // 			tsKey: key,
-  // 			field: tableConfig.columns[key] as PgColumn,
-  // 			relationTableTsKey: undefined,
-  // 			isJson: false,
-  // 			selection: [],
-  // 		}));
-  // 	}
-  // 	function prepareSelectedExtras() {
-  // 		return selectedExtras.map((item) => ({
-  // 			dbKey: item.value.fieldAlias,
-  // 			tsKey: item.tsKey,
-  // 			field: item.value,
-  // 			relationTableTsKey: undefined,
-  // 			isJson: false,
-  // 			selection: [],
-  // 		}));
-  // 	}
-  // 	if (isRoot) {
-  // 		selection = [
-  // 			...prepareSelectedColumns(),
-  // 			...prepareSelectedExtras(),
-  // 		];
-  // 	}
-  // 	if (hasUserDefinedWhere || orderBy.length > 0) {
-  // 		tableFrom = new Subquery(
-  // 			this.buildSelectQuery({
-  // 				table: is(tableFrom, PgTable) ? aliasedTable(tableFrom, tableAlias) : tableFrom,
-  // 				fields: {},
-  // 				fieldsFlat: selectionForBuild.map(({ field }) => ({
-  // 					path: [],
-  // 					field: is(field, Column) ? aliasedTableColumn(field, tableAlias) : field,
-  // 				})),
-  // 				joins,
-  // 				distinct,
-  // 			}),
-  // 			{},
-  // 			tableAlias,
-  // 		);
-  // 		selectionForBuild = selection.map((item) =>
-  // 			is(item.field, SQL.Aliased)
-  // 				? { ...item, field: sql`${sql.identifier(tableAlias)}.${sql.identifier(item.field.fieldAlias)}` }
-  // 				: item
-  // 		);
-  // 		joins = [];
-  // 		distinct = undefined;
-  // 	}
-  // 	const result = this.buildSelectQuery({
-  // 		table: is(tableFrom, PgTable) ? aliasedTable(tableFrom, tableAlias) : tableFrom,
-  // 		fields: {},
-  // 		fieldsFlat: selectionForBuild.map(({ field }) => ({
-  // 			path: [],
-  // 			field: is(field, Column) ? aliasedTableColumn(field, tableAlias) : field,
-  // 		})),
-  // 		where,
-  // 		limit,
-  // 		offset,
-  // 		joins,
-  // 		orderBy,
-  // 		distinct,
-  // 	});
-  // 	return {
-  // 		tableTsKey: tableConfig.tsName,
-  // 		sql: result,
-  // 		selection,
-  // 	};
-  // }
-  buildRelationalQueryWithoutPK({
-    fullSchema,
-    schema,
-    tableNamesMap,
-    table,
-    tableConfig,
-    queryConfig: config2,
-    tableAlias,
-    nestedQueryRelation,
-    joinOn
-  }) {
-    let selection = [];
-    let limit, offset, orderBy = [], where;
-    const joins = [];
-    if (config2 === true) {
-      const selectionEntries = Object.entries(tableConfig.columns);
-      selection = selectionEntries.map(([key, value]) => ({
-        dbKey: value.name,
-        tsKey: key,
-        field: aliasedTableColumn(value, tableAlias),
-        relationTableTsKey: void 0,
-        isJson: false,
-        selection: []
-      }));
-    } else {
-      const aliasedColumns = Object.fromEntries(
-        Object.entries(tableConfig.columns).map(([key, value]) => [key, aliasedTableColumn(value, tableAlias)])
-      );
-      if (config2.where) {
-        const whereSql = typeof config2.where === "function" ? config2.where(aliasedColumns, getOperators()) : config2.where;
-        where = whereSql && mapColumnsInSQLToAlias(whereSql, tableAlias);
-      }
-      const fieldsSelection = [];
-      let selectedColumns = [];
-      if (config2.columns) {
-        let isIncludeMode = false;
-        for (const [field, value] of Object.entries(config2.columns)) {
-          if (value === void 0) {
-            continue;
-          }
-          if (field in tableConfig.columns) {
-            if (!isIncludeMode && value === true) {
-              isIncludeMode = true;
-            }
-            selectedColumns.push(field);
-          }
-        }
-        if (selectedColumns.length > 0) {
-          selectedColumns = isIncludeMode ? selectedColumns.filter((c) => config2.columns?.[c] === true) : Object.keys(tableConfig.columns).filter((key) => !selectedColumns.includes(key));
-        }
-      } else {
-        selectedColumns = Object.keys(tableConfig.columns);
-      }
-      for (const field of selectedColumns) {
-        const column = tableConfig.columns[field];
-        fieldsSelection.push({ tsKey: field, value: column });
-      }
-      let selectedRelations = [];
-      if (config2.with) {
-        selectedRelations = Object.entries(config2.with).filter((entry) => !!entry[1]).map(([tsKey, queryConfig]) => ({ tsKey, queryConfig, relation: tableConfig.relations[tsKey] }));
-      }
-      let extras;
-      if (config2.extras) {
-        extras = typeof config2.extras === "function" ? config2.extras(aliasedColumns, { sql }) : config2.extras;
-        for (const [tsKey, value] of Object.entries(extras)) {
-          fieldsSelection.push({
-            tsKey,
-            value: mapColumnsInAliasedSQLToAlias(value, tableAlias)
-          });
-        }
-      }
-      for (const { tsKey, value } of fieldsSelection) {
-        selection.push({
-          dbKey: is(value, SQL.Aliased) ? value.fieldAlias : tableConfig.columns[tsKey].name,
-          tsKey,
-          field: is(value, Column) ? aliasedTableColumn(value, tableAlias) : value,
-          relationTableTsKey: void 0,
-          isJson: false,
-          selection: []
-        });
-      }
-      let orderByOrig = typeof config2.orderBy === "function" ? config2.orderBy(aliasedColumns, getOrderByOperators()) : config2.orderBy ?? [];
-      if (!Array.isArray(orderByOrig)) {
-        orderByOrig = [orderByOrig];
-      }
-      orderBy = orderByOrig.map((orderByValue) => {
-        if (is(orderByValue, Column)) {
-          return aliasedTableColumn(orderByValue, tableAlias);
-        }
-        return mapColumnsInSQLToAlias(orderByValue, tableAlias);
-      });
-      limit = config2.limit;
-      offset = config2.offset;
-      for (const {
-        tsKey: selectedRelationTsKey,
-        queryConfig: selectedRelationConfigValue,
-        relation
-      } of selectedRelations) {
-        const normalizedRelation = normalizeRelation(schema, tableNamesMap, relation);
-        const relationTableName = getTableUniqueName(relation.referencedTable);
-        const relationTableTsName = tableNamesMap[relationTableName];
-        const relationTableAlias = `${tableAlias}_${selectedRelationTsKey}`;
-        const joinOn2 = and(
-          ...normalizedRelation.fields.map(
-            (field2, i) => eq(
-              aliasedTableColumn(normalizedRelation.references[i], relationTableAlias),
-              aliasedTableColumn(field2, tableAlias)
-            )
-          )
-        );
-        const builtRelation = this.buildRelationalQueryWithoutPK({
-          fullSchema,
-          schema,
-          tableNamesMap,
-          table: fullSchema[relationTableTsName],
-          tableConfig: schema[relationTableTsName],
-          queryConfig: is(relation, One) ? selectedRelationConfigValue === true ? { limit: 1 } : { ...selectedRelationConfigValue, limit: 1 } : selectedRelationConfigValue,
-          tableAlias: relationTableAlias,
-          joinOn: joinOn2,
-          nestedQueryRelation: relation
-        });
-        const field = sql`${sql.identifier(relationTableAlias)}.${sql.identifier("data")}`.as(selectedRelationTsKey);
-        joins.push({
-          on: sql`true`,
-          table: new Subquery(builtRelation.sql, {}, relationTableAlias),
-          alias: relationTableAlias,
-          joinType: "left",
-          lateral: true
-        });
-        selection.push({
-          dbKey: selectedRelationTsKey,
-          tsKey: selectedRelationTsKey,
-          field,
-          relationTableTsKey: relationTableTsName,
-          isJson: true,
-          selection: builtRelation.selection
-        });
-      }
-    }
-    if (selection.length === 0) {
-      throw new DrizzleError({ message: `No fields selected for table "${tableConfig.tsName}" ("${tableAlias}")` });
-    }
-    let result;
-    where = and(joinOn, where);
-    if (nestedQueryRelation) {
-      let field = sql`json_build_array(${sql.join(
-        selection.map(
-          ({ field: field2, tsKey, isJson }) => isJson ? sql`${sql.identifier(`${tableAlias}_${tsKey}`)}.${sql.identifier("data")}` : is(field2, SQL.Aliased) ? field2.sql : field2
-        ),
-        sql`, `
-      )})`;
-      if (is(nestedQueryRelation, Many)) {
-        field = sql`coalesce(json_agg(${field}${orderBy.length > 0 ? sql` order by ${sql.join(orderBy, sql`, `)}` : void 0}), '[]'::json)`;
-      }
-      const nestedSelection = [{
-        dbKey: "data",
-        tsKey: "data",
-        field: field.as("data"),
-        isJson: true,
-        relationTableTsKey: tableConfig.tsName,
-        selection
-      }];
-      const needsSubquery = limit !== void 0 || offset !== void 0 || orderBy.length > 0;
-      if (needsSubquery) {
-        result = this.buildSelectQuery({
-          table: aliasedTable(table, tableAlias),
-          fields: {},
-          fieldsFlat: [{
-            path: [],
-            field: sql.raw("*")
-          }],
-          where,
-          limit,
-          offset,
-          orderBy,
-          setOperators: []
-        });
-        where = void 0;
-        limit = void 0;
-        offset = void 0;
-        orderBy = [];
-      } else {
-        result = aliasedTable(table, tableAlias);
-      }
-      result = this.buildSelectQuery({
-        table: is(result, PgTable) ? result : new Subquery(result, {}, tableAlias),
-        fields: {},
-        fieldsFlat: nestedSelection.map(({ field: field2 }) => ({
-          path: [],
-          field: is(field2, Column) ? aliasedTableColumn(field2, tableAlias) : field2
-        })),
-        joins,
-        where,
-        limit,
-        offset,
-        orderBy,
-        setOperators: []
-      });
-    } else {
-      result = this.buildSelectQuery({
-        table: aliasedTable(table, tableAlias),
-        fields: {},
-        fieldsFlat: selection.map(({ field }) => ({
-          path: [],
-          field: is(field, Column) ? aliasedTableColumn(field, tableAlias) : field
-        })),
-        joins,
-        where,
-        limit,
-        offset,
-        orderBy,
-        setOperators: []
-      });
-    }
-    return {
-      tableTsKey: tableConfig.tsName,
-      sql: result,
-      selection
-    };
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/query-builders/query-builder.js
-var TypedQueryBuilder = class {
-  static [entityKind] = "TypedQueryBuilder";
-  /** @internal */
-  getSelectedFields() {
-    return this._.selectedFields;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/select.js
-var PgSelectBuilder = class {
-  static [entityKind] = "PgSelectBuilder";
-  fields;
-  session;
-  dialect;
-  withList = [];
-  distinct;
-  constructor(config2) {
-    this.fields = config2.fields;
-    this.session = config2.session;
-    this.dialect = config2.dialect;
-    if (config2.withList) {
-      this.withList = config2.withList;
-    }
-    this.distinct = config2.distinct;
-  }
-  authToken;
-  /** @internal */
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  /**
-   * Specify the table, subquery, or other target that you're
-   * building a select query against.
-   *
-   * {@link https://www.postgresql.org/docs/current/sql-select.html#SQL-FROM | Postgres from documentation}
-   */
-  from(source) {
-    const isPartialSelect = !!this.fields;
-    const src = source;
-    let fields;
-    if (this.fields) {
-      fields = this.fields;
-    } else if (is(src, Subquery)) {
-      fields = Object.fromEntries(
-        Object.keys(src._.selectedFields).map((key) => [key, src[key]])
-      );
-    } else if (is(src, PgViewBase)) {
-      fields = src[ViewBaseConfig].selectedFields;
-    } else if (is(src, SQL)) {
-      fields = {};
-    } else {
-      fields = getTableColumns(src);
-    }
-    return new PgSelectBase({
-      table: src,
-      fields,
-      isPartialSelect,
-      session: this.session,
-      dialect: this.dialect,
-      withList: this.withList,
-      distinct: this.distinct
-    }).setToken(this.authToken);
-  }
-};
-var PgSelectQueryBuilderBase = class extends TypedQueryBuilder {
-  static [entityKind] = "PgSelectQueryBuilder";
-  _;
-  config;
-  joinsNotNullableMap;
-  tableName;
-  isPartialSelect;
-  session;
-  dialect;
-  cacheConfig = void 0;
-  usedTables = /* @__PURE__ */ new Set();
-  constructor({ table, fields, isPartialSelect, session, dialect, withList, distinct }) {
-    super();
-    this.config = {
-      withList,
-      table,
-      fields: { ...fields },
-      distinct,
-      setOperators: []
-    };
-    this.isPartialSelect = isPartialSelect;
-    this.session = session;
-    this.dialect = dialect;
-    this._ = {
-      selectedFields: fields,
-      config: this.config
-    };
-    this.tableName = getTableLikeName(table);
-    this.joinsNotNullableMap = typeof this.tableName === "string" ? { [this.tableName]: true } : {};
-    for (const item of extractUsedTable(table)) this.usedTables.add(item);
-  }
-  /** @internal */
-  getUsedTables() {
-    return [...this.usedTables];
-  }
-  createJoin(joinType, lateral) {
-    return (table, on) => {
-      const baseTableName = this.tableName;
-      const tableName = getTableLikeName(table);
-      for (const item of extractUsedTable(table)) this.usedTables.add(item);
-      if (typeof tableName === "string" && this.config.joins?.some((join) => join.alias === tableName)) {
-        throw new Error(`Alias "${tableName}" is already used in this query`);
-      }
-      if (!this.isPartialSelect) {
-        if (Object.keys(this.joinsNotNullableMap).length === 1 && typeof baseTableName === "string") {
-          this.config.fields = {
-            [baseTableName]: this.config.fields
-          };
-        }
-        if (typeof tableName === "string" && !is(table, SQL)) {
-          const selection = is(table, Subquery) ? table._.selectedFields : is(table, View) ? table[ViewBaseConfig].selectedFields : table[Table.Symbol.Columns];
-          this.config.fields[tableName] = selection;
-        }
-      }
-      if (typeof on === "function") {
-        on = on(
-          new Proxy(
-            this.config.fields,
-            new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
-          )
-        );
-      }
-      if (!this.config.joins) {
-        this.config.joins = [];
-      }
-      this.config.joins.push({ on, table, joinType, alias: tableName, lateral });
-      if (typeof tableName === "string") {
-        switch (joinType) {
-          case "left": {
-            this.joinsNotNullableMap[tableName] = false;
-            break;
-          }
-          case "right": {
-            this.joinsNotNullableMap = Object.fromEntries(
-              Object.entries(this.joinsNotNullableMap).map(([key]) => [key, false])
-            );
-            this.joinsNotNullableMap[tableName] = true;
-            break;
-          }
-          case "cross":
-          case "inner": {
-            this.joinsNotNullableMap[tableName] = true;
-            break;
-          }
-          case "full": {
-            this.joinsNotNullableMap = Object.fromEntries(
-              Object.entries(this.joinsNotNullableMap).map(([key]) => [key, false])
-            );
-            this.joinsNotNullableMap[tableName] = false;
-            break;
-          }
-        }
-      }
-      return this;
-    };
-  }
-  /**
-   * Executes a `left join` operation by adding another table to the current query.
-   *
-   * Calling this method associates each row of the table with the corresponding row from the joined table, if a match is found. If no matching row exists, it sets all columns of the joined table to null.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/joins#left-join}
-   *
-   * @param table the table to join.
-   * @param on the `on` clause.
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all users and their pets
-   * const usersWithPets: { user: User; pets: Pet | null; }[] = await db.select()
-   *   .from(users)
-   *   .leftJoin(pets, eq(users.id, pets.ownerId))
-   *
-   * // Select userId and petId
-   * const usersIdsAndPetIds: { userId: number; petId: number | null; }[] = await db.select({
-   *   userId: users.id,
-   *   petId: pets.id,
-   * })
-   *   .from(users)
-   *   .leftJoin(pets, eq(users.id, pets.ownerId))
-   * ```
-   */
-  leftJoin = this.createJoin("left", false);
-  /**
-   * Executes a `left join lateral` operation by adding subquery to the current query.
-   *
-   * A `lateral` join allows the right-hand expression to refer to columns from the left-hand side.
-   *
-   * Calling this method associates each row of the table with the corresponding row from the joined table, if a match is found. If no matching row exists, it sets all columns of the joined table to null.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/joins#left-join-lateral}
-   *
-   * @param table the subquery to join.
-   * @param on the `on` clause.
-   */
-  leftJoinLateral = this.createJoin("left", true);
-  /**
-   * Executes a `right join` operation by adding another table to the current query.
-   *
-   * Calling this method associates each row of the joined table with the corresponding row from the main table, if a match is found. If no matching row exists, it sets all columns of the main table to null.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/joins#right-join}
-   *
-   * @param table the table to join.
-   * @param on the `on` clause.
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all users and their pets
-   * const usersWithPets: { user: User | null; pets: Pet; }[] = await db.select()
-   *   .from(users)
-   *   .rightJoin(pets, eq(users.id, pets.ownerId))
-   *
-   * // Select userId and petId
-   * const usersIdsAndPetIds: { userId: number | null; petId: number; }[] = await db.select({
-   *   userId: users.id,
-   *   petId: pets.id,
-   * })
-   *   .from(users)
-   *   .rightJoin(pets, eq(users.id, pets.ownerId))
-   * ```
-   */
-  rightJoin = this.createJoin("right", false);
-  /**
-   * Executes an `inner join` operation, creating a new table by combining rows from two tables that have matching values.
-   *
-   * Calling this method retrieves rows that have corresponding entries in both joined tables. Rows without matching entries in either table are excluded, resulting in a table that includes only matching pairs.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/joins#inner-join}
-   *
-   * @param table the table to join.
-   * @param on the `on` clause.
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all users and their pets
-   * const usersWithPets: { user: User; pets: Pet; }[] = await db.select()
-   *   .from(users)
-   *   .innerJoin(pets, eq(users.id, pets.ownerId))
-   *
-   * // Select userId and petId
-   * const usersIdsAndPetIds: { userId: number; petId: number; }[] = await db.select({
-   *   userId: users.id,
-   *   petId: pets.id,
-   * })
-   *   .from(users)
-   *   .innerJoin(pets, eq(users.id, pets.ownerId))
-   * ```
-   */
-  innerJoin = this.createJoin("inner", false);
-  /**
-   * Executes an `inner join lateral` operation, creating a new table by combining rows from two queries that have matching values.
-   *
-   * A `lateral` join allows the right-hand expression to refer to columns from the left-hand side.
-   *
-   * Calling this method retrieves rows that have corresponding entries in both joined tables. Rows without matching entries in either table are excluded, resulting in a table that includes only matching pairs.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/joins#inner-join-lateral}
-   *
-   * @param table the subquery to join.
-   * @param on the `on` clause.
-   */
-  innerJoinLateral = this.createJoin("inner", true);
-  /**
-   * Executes a `full join` operation by combining rows from two tables into a new table.
-   *
-   * Calling this method retrieves all rows from both main and joined tables, merging rows with matching values and filling in `null` for non-matching columns.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/joins#full-join}
-   *
-   * @param table the table to join.
-   * @param on the `on` clause.
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all users and their pets
-   * const usersWithPets: { user: User | null; pets: Pet | null; }[] = await db.select()
-   *   .from(users)
-   *   .fullJoin(pets, eq(users.id, pets.ownerId))
-   *
-   * // Select userId and petId
-   * const usersIdsAndPetIds: { userId: number | null; petId: number | null; }[] = await db.select({
-   *   userId: users.id,
-   *   petId: pets.id,
-   * })
-   *   .from(users)
-   *   .fullJoin(pets, eq(users.id, pets.ownerId))
-   * ```
-   */
-  fullJoin = this.createJoin("full", false);
-  /**
-   * Executes a `cross join` operation by combining rows from two tables into a new table.
-   *
-   * Calling this method retrieves all rows from both main and joined tables, merging all rows from each table.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/joins#cross-join}
-   *
-   * @param table the table to join.
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all users, each user with every pet
-   * const usersWithPets: { user: User; pets: Pet; }[] = await db.select()
-   *   .from(users)
-   *   .crossJoin(pets)
-   *
-   * // Select userId and petId
-   * const usersIdsAndPetIds: { userId: number; petId: number; }[] = await db.select({
-   *   userId: users.id,
-   *   petId: pets.id,
-   * })
-   *   .from(users)
-   *   .crossJoin(pets)
-   * ```
-   */
-  crossJoin = this.createJoin("cross", false);
-  /**
-   * Executes a `cross join lateral` operation by combining rows from two queries into a new table.
-   *
-   * A `lateral` join allows the right-hand expression to refer to columns from the left-hand side.
-   *
-   * Calling this method retrieves all rows from both main and joined queries, merging all rows from each query.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/joins#cross-join-lateral}
-   *
-   * @param table the query to join.
-   */
-  crossJoinLateral = this.createJoin("cross", true);
-  createSetOperator(type, isAll) {
-    return (rightSelection) => {
-      const rightSelect = typeof rightSelection === "function" ? rightSelection(getPgSetOperators()) : rightSelection;
-      if (!haveSameKeys(this.getSelectedFields(), rightSelect.getSelectedFields())) {
-        throw new Error(
-          "Set operator error (union / intersect / except): selected fields are not the same or are in a different order"
-        );
-      }
-      this.config.setOperators.push({ type, isAll, rightSelect });
-      return this;
-    };
-  }
-  /**
-   * Adds `union` set operator to the query.
-   *
-   * Calling this method will combine the result sets of the `select` statements and remove any duplicate rows that appear across them.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/set-operations#union}
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all unique names from customers and users tables
-   * await db.select({ name: users.name })
-   *   .from(users)
-   *   .union(
-   *     db.select({ name: customers.name }).from(customers)
-   *   );
-   * // or
-   * import { union } from 'drizzle-orm/pg-core'
-   *
-   * await union(
-   *   db.select({ name: users.name }).from(users),
-   *   db.select({ name: customers.name }).from(customers)
-   * );
-   * ```
-   */
-  union = this.createSetOperator("union", false);
-  /**
-   * Adds `union all` set operator to the query.
-   *
-   * Calling this method will combine the result-set of the `select` statements and keep all duplicate rows that appear across them.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/set-operations#union-all}
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all transaction ids from both online and in-store sales
-   * await db.select({ transaction: onlineSales.transactionId })
-   *   .from(onlineSales)
-   *   .unionAll(
-   *     db.select({ transaction: inStoreSales.transactionId }).from(inStoreSales)
-   *   );
-   * // or
-   * import { unionAll } from 'drizzle-orm/pg-core'
-   *
-   * await unionAll(
-   *   db.select({ transaction: onlineSales.transactionId }).from(onlineSales),
-   *   db.select({ transaction: inStoreSales.transactionId }).from(inStoreSales)
-   * );
-   * ```
-   */
-  unionAll = this.createSetOperator("union", true);
-  /**
-   * Adds `intersect` set operator to the query.
-   *
-   * Calling this method will retain only the rows that are present in both result sets and eliminate duplicates.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/set-operations#intersect}
-   *
-   * @example
-   *
-   * ```ts
-   * // Select course names that are offered in both departments A and B
-   * await db.select({ courseName: depA.courseName })
-   *   .from(depA)
-   *   .intersect(
-   *     db.select({ courseName: depB.courseName }).from(depB)
-   *   );
-   * // or
-   * import { intersect } from 'drizzle-orm/pg-core'
-   *
-   * await intersect(
-   *   db.select({ courseName: depA.courseName }).from(depA),
-   *   db.select({ courseName: depB.courseName }).from(depB)
-   * );
-   * ```
-   */
-  intersect = this.createSetOperator("intersect", false);
-  /**
-   * Adds `intersect all` set operator to the query.
-   *
-   * Calling this method will retain only the rows that are present in both result sets including all duplicates.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/set-operations#intersect-all}
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all products and quantities that are ordered by both regular and VIP customers
-   * await db.select({
-   *   productId: regularCustomerOrders.productId,
-   *   quantityOrdered: regularCustomerOrders.quantityOrdered
-   * })
-   * .from(regularCustomerOrders)
-   * .intersectAll(
-   *   db.select({
-   *     productId: vipCustomerOrders.productId,
-   *     quantityOrdered: vipCustomerOrders.quantityOrdered
-   *   })
-   *   .from(vipCustomerOrders)
-   * );
-   * // or
-   * import { intersectAll } from 'drizzle-orm/pg-core'
-   *
-   * await intersectAll(
-   *   db.select({
-   *     productId: regularCustomerOrders.productId,
-   *     quantityOrdered: regularCustomerOrders.quantityOrdered
-   *   })
-   *   .from(regularCustomerOrders),
-   *   db.select({
-   *     productId: vipCustomerOrders.productId,
-   *     quantityOrdered: vipCustomerOrders.quantityOrdered
-   *   })
-   *   .from(vipCustomerOrders)
-   * );
-   * ```
-   */
-  intersectAll = this.createSetOperator("intersect", true);
-  /**
-   * Adds `except` set operator to the query.
-   *
-   * Calling this method will retrieve all unique rows from the left query, except for the rows that are present in the result set of the right query.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/set-operations#except}
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all courses offered in department A but not in department B
-   * await db.select({ courseName: depA.courseName })
-   *   .from(depA)
-   *   .except(
-   *     db.select({ courseName: depB.courseName }).from(depB)
-   *   );
-   * // or
-   * import { except } from 'drizzle-orm/pg-core'
-   *
-   * await except(
-   *   db.select({ courseName: depA.courseName }).from(depA),
-   *   db.select({ courseName: depB.courseName }).from(depB)
-   * );
-   * ```
-   */
-  except = this.createSetOperator("except", false);
-  /**
-   * Adds `except all` set operator to the query.
-   *
-   * Calling this method will retrieve all rows from the left query, except for the rows that are present in the result set of the right query.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/set-operations#except-all}
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all products that are ordered by regular customers but not by VIP customers
-   * await db.select({
-   *   productId: regularCustomerOrders.productId,
-   *   quantityOrdered: regularCustomerOrders.quantityOrdered,
-   * })
-   * .from(regularCustomerOrders)
-   * .exceptAll(
-   *   db.select({
-   *     productId: vipCustomerOrders.productId,
-   *     quantityOrdered: vipCustomerOrders.quantityOrdered,
-   *   })
-   *   .from(vipCustomerOrders)
-   * );
-   * // or
-   * import { exceptAll } from 'drizzle-orm/pg-core'
-   *
-   * await exceptAll(
-   *   db.select({
-   *     productId: regularCustomerOrders.productId,
-   *     quantityOrdered: regularCustomerOrders.quantityOrdered
-   *   })
-   *   .from(regularCustomerOrders),
-   *   db.select({
-   *     productId: vipCustomerOrders.productId,
-   *     quantityOrdered: vipCustomerOrders.quantityOrdered
-   *   })
-   *   .from(vipCustomerOrders)
-   * );
-   * ```
-   */
-  exceptAll = this.createSetOperator("except", true);
-  /** @internal */
-  addSetOperators(setOperators) {
-    this.config.setOperators.push(...setOperators);
-    return this;
-  }
-  /**
-   * Adds a `where` clause to the query.
-   *
-   * Calling this method will select only those rows that fulfill a specified condition.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/select#filtering}
-   *
-   * @param where the `where` clause.
-   *
-   * @example
-   * You can use conditional operators and `sql function` to filter the rows to be selected.
-   *
-   * ```ts
-   * // Select all cars with green color
-   * await db.select().from(cars).where(eq(cars.color, 'green'));
-   * // or
-   * await db.select().from(cars).where(sql`${cars.color} = 'green'`)
-   * ```
-   *
-   * You can logically combine conditional operators with `and()` and `or()` operators:
-   *
-   * ```ts
-   * // Select all BMW cars with a green color
-   * await db.select().from(cars).where(and(eq(cars.color, 'green'), eq(cars.brand, 'BMW')));
-   *
-   * // Select all cars with the green or blue color
-   * await db.select().from(cars).where(or(eq(cars.color, 'green'), eq(cars.color, 'blue')));
-   * ```
-   */
-  where(where) {
-    if (typeof where === "function") {
-      where = where(
-        new Proxy(
-          this.config.fields,
-          new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
-        )
-      );
-    }
-    this.config.where = where;
-    return this;
-  }
-  /**
-   * Adds a `having` clause to the query.
-   *
-   * Calling this method will select only those rows that fulfill a specified condition. It is typically used with aggregate functions to filter the aggregated data based on a specified condition.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/select#aggregations}
-   *
-   * @param having the `having` clause.
-   *
-   * @example
-   *
-   * ```ts
-   * // Select all brands with more than one car
-   * await db.select({
-   * 	brand: cars.brand,
-   * 	count: sql<number>`cast(count(${cars.id}) as int)`,
-   * })
-   *   .from(cars)
-   *   .groupBy(cars.brand)
-   *   .having(({ count }) => gt(count, 1));
-   * ```
-   */
-  having(having) {
-    if (typeof having === "function") {
-      having = having(
-        new Proxy(
-          this.config.fields,
-          new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
-        )
-      );
-    }
-    this.config.having = having;
-    return this;
-  }
-  groupBy(...columns) {
-    if (typeof columns[0] === "function") {
-      const groupBy = columns[0](
-        new Proxy(
-          this.config.fields,
-          new SelectionProxyHandler({ sqlAliasedBehavior: "alias", sqlBehavior: "sql" })
-        )
-      );
-      this.config.groupBy = Array.isArray(groupBy) ? groupBy : [groupBy];
-    } else {
-      this.config.groupBy = columns;
-    }
-    return this;
-  }
-  orderBy(...columns) {
-    if (typeof columns[0] === "function") {
-      const orderBy = columns[0](
-        new Proxy(
-          this.config.fields,
-          new SelectionProxyHandler({ sqlAliasedBehavior: "alias", sqlBehavior: "sql" })
-        )
-      );
-      const orderByArray = Array.isArray(orderBy) ? orderBy : [orderBy];
-      if (this.config.setOperators.length > 0) {
-        this.config.setOperators.at(-1).orderBy = orderByArray;
-      } else {
-        this.config.orderBy = orderByArray;
-      }
-    } else {
-      const orderByArray = columns;
-      if (this.config.setOperators.length > 0) {
-        this.config.setOperators.at(-1).orderBy = orderByArray;
-      } else {
-        this.config.orderBy = orderByArray;
-      }
-    }
-    return this;
-  }
-  /**
-   * Adds a `limit` clause to the query.
-   *
-   * Calling this method will set the maximum number of rows that will be returned by this query.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/select#limit--offset}
-   *
-   * @param limit the `limit` clause.
-   *
-   * @example
-   *
-   * ```ts
-   * // Get the first 10 people from this query.
-   * await db.select().from(people).limit(10);
-   * ```
-   */
-  limit(limit) {
-    if (this.config.setOperators.length > 0) {
-      this.config.setOperators.at(-1).limit = limit;
-    } else {
-      this.config.limit = limit;
-    }
-    return this;
-  }
-  /**
-   * Adds an `offset` clause to the query.
-   *
-   * Calling this method will skip a number of rows when returning results from this query.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/select#limit--offset}
-   *
-   * @param offset the `offset` clause.
-   *
-   * @example
-   *
-   * ```ts
-   * // Get the 10th-20th people from this query.
-   * await db.select().from(people).offset(10).limit(10);
-   * ```
-   */
-  offset(offset) {
-    if (this.config.setOperators.length > 0) {
-      this.config.setOperators.at(-1).offset = offset;
-    } else {
-      this.config.offset = offset;
-    }
-    return this;
-  }
-  /**
-   * Adds a `for` clause to the query.
-   *
-   * Calling this method will specify a lock strength for this query that controls how strictly it acquires exclusive access to the rows being queried.
-   *
-   * See docs: {@link https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE}
-   *
-   * @param strength the lock strength.
-   * @param config the lock configuration.
-   */
-  for(strength, config2 = {}) {
-    this.config.lockingClause = { strength, config: config2 };
-    return this;
-  }
-  /** @internal */
-  getSQL() {
-    return this.dialect.buildSelectQuery(this.config);
-  }
-  toSQL() {
-    const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-    return rest;
-  }
-  as(alias) {
-    const usedTables = [];
-    usedTables.push(...extractUsedTable(this.config.table));
-    if (this.config.joins) {
-      for (const it of this.config.joins) usedTables.push(...extractUsedTable(it.table));
-    }
-    return new Proxy(
-      new Subquery(this.getSQL(), this.config.fields, alias, false, [...new Set(usedTables)]),
-      new SelectionProxyHandler({ alias, sqlAliasedBehavior: "alias", sqlBehavior: "error" })
-    );
-  }
-  /** @internal */
-  getSelectedFields() {
-    return new Proxy(
-      this.config.fields,
-      new SelectionProxyHandler({ alias: this.tableName, sqlAliasedBehavior: "alias", sqlBehavior: "error" })
-    );
-  }
-  $dynamic() {
-    return this;
-  }
-  $withCache(config2) {
-    this.cacheConfig = config2 === void 0 ? { config: {}, enable: true, autoInvalidate: true } : config2 === false ? { enable: false } : { enable: true, autoInvalidate: true, ...config2 };
-    return this;
-  }
-};
-var PgSelectBase = class extends PgSelectQueryBuilderBase {
-  static [entityKind] = "PgSelect";
-  /** @internal */
-  _prepare(name) {
-    const { session, config: config2, dialect, joinsNotNullableMap, authToken, cacheConfig, usedTables } = this;
-    if (!session) {
-      throw new Error("Cannot execute a query on a query builder. Please use a database instance instead.");
-    }
-    const { fields } = config2;
-    return tracer.startActiveSpan("drizzle.prepareQuery", () => {
-      const fieldsList = orderSelectedFields(fields);
-      const query = session.prepareQuery(dialect.sqlToQuery(this.getSQL()), fieldsList, name, true, void 0, {
-        type: "select",
-        tables: [...usedTables]
-      }, cacheConfig);
-      query.joinsNotNullableMap = joinsNotNullableMap;
-      return query.setToken(authToken);
-    });
-  }
-  /**
-   * Create a prepared statement for this query. This allows
-   * the database to remember this query for the given session
-   * and call it by name, rather than specifying the full query.
-   *
-   * {@link https://www.postgresql.org/docs/current/sql-prepare.html | Postgres prepare documentation}
-   */
-  prepare(name) {
-    return this._prepare(name);
-  }
-  authToken;
-  /** @internal */
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  execute = (placeholderValues) => {
-    return tracer.startActiveSpan("drizzle.operation", () => {
-      return this._prepare().execute(placeholderValues, this.authToken);
-    });
-  };
-};
-applyMixins(PgSelectBase, [QueryPromise]);
-function createSetOperator(type, isAll) {
-  return (leftSelect, rightSelect, ...restSelects) => {
-    const setOperators = [rightSelect, ...restSelects].map((select) => ({
-      type,
-      isAll,
-      rightSelect: select
-    }));
-    for (const setOperator of setOperators) {
-      if (!haveSameKeys(leftSelect.getSelectedFields(), setOperator.rightSelect.getSelectedFields())) {
-        throw new Error(
-          "Set operator error (union / intersect / except): selected fields are not the same or are in a different order"
-        );
-      }
-    }
-    return leftSelect.addSetOperators(setOperators);
-  };
-}
-var getPgSetOperators = () => ({
-  union,
-  unionAll,
-  intersect,
-  intersectAll,
-  except,
-  exceptAll
-});
-var union = createSetOperator("union", false);
-var unionAll = createSetOperator("union", true);
-var intersect = createSetOperator("intersect", false);
-var intersectAll = createSetOperator("intersect", true);
-var except = createSetOperator("except", false);
-var exceptAll = createSetOperator("except", true);
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/query-builder.js
-var QueryBuilder = class {
-  static [entityKind] = "PgQueryBuilder";
-  dialect;
-  dialectConfig;
-  constructor(dialect) {
-    this.dialect = is(dialect, PgDialect) ? dialect : void 0;
-    this.dialectConfig = is(dialect, PgDialect) ? void 0 : dialect;
-  }
-  $with = (alias, selection) => {
-    const queryBuilder = this;
-    const as = (qb) => {
-      if (typeof qb === "function") {
-        qb = qb(queryBuilder);
-      }
-      return new Proxy(
-        new WithSubquery(
-          qb.getSQL(),
-          selection ?? ("getSelectedFields" in qb ? qb.getSelectedFields() ?? {} : {}),
-          alias,
-          true
-        ),
-        new SelectionProxyHandler({ alias, sqlAliasedBehavior: "alias", sqlBehavior: "error" })
-      );
-    };
-    return { as };
-  };
-  with(...queries) {
-    const self = this;
-    function select(fields) {
-      return new PgSelectBuilder({
-        fields: fields ?? void 0,
-        session: void 0,
-        dialect: self.getDialect(),
-        withList: queries
-      });
-    }
-    function selectDistinct(fields) {
-      return new PgSelectBuilder({
-        fields: fields ?? void 0,
-        session: void 0,
-        dialect: self.getDialect(),
-        distinct: true
-      });
-    }
-    function selectDistinctOn(on, fields) {
-      return new PgSelectBuilder({
-        fields: fields ?? void 0,
-        session: void 0,
-        dialect: self.getDialect(),
-        distinct: { on }
-      });
-    }
-    return { select, selectDistinct, selectDistinctOn };
-  }
-  select(fields) {
-    return new PgSelectBuilder({
-      fields: fields ?? void 0,
-      session: void 0,
-      dialect: this.getDialect()
-    });
-  }
-  selectDistinct(fields) {
-    return new PgSelectBuilder({
-      fields: fields ?? void 0,
-      session: void 0,
-      dialect: this.getDialect(),
-      distinct: true
-    });
-  }
-  selectDistinctOn(on, fields) {
-    return new PgSelectBuilder({
-      fields: fields ?? void 0,
-      session: void 0,
-      dialect: this.getDialect(),
-      distinct: { on }
-    });
-  }
-  // Lazy load dialect to avoid circular dependency
-  getDialect() {
-    if (!this.dialect) {
-      this.dialect = new PgDialect(this.dialectConfig);
-    }
-    return this.dialect;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/utils.js
-function extractUsedTable(table) {
-  if (is(table, PgTable)) {
-    return [table[Schema] ? `${table[Schema]}.${table[Table.Symbol.BaseName]}` : table[Table.Symbol.BaseName]];
-  }
-  if (is(table, Subquery)) {
-    return table._.usedTables ?? [];
-  }
-  if (is(table, SQL)) {
-    return table.usedTables ?? [];
-  }
-  return [];
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/delete.js
-var PgDeleteBase = class extends QueryPromise {
-  constructor(table, session, dialect, withList) {
-    super();
-    this.session = session;
-    this.dialect = dialect;
-    this.config = { table, withList };
-  }
-  static [entityKind] = "PgDelete";
-  config;
-  cacheConfig;
-  /**
-   * Adds a `where` clause to the query.
-   *
-   * Calling this method will delete only those rows that fulfill a specified condition.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/delete}
-   *
-   * @param where the `where` clause.
-   *
-   * @example
-   * You can use conditional operators and `sql function` to filter the rows to be deleted.
-   *
-   * ```ts
-   * // Delete all cars with green color
-   * await db.delete(cars).where(eq(cars.color, 'green'));
-   * // or
-   * await db.delete(cars).where(sql`${cars.color} = 'green'`)
-   * ```
-   *
-   * You can logically combine conditional operators with `and()` and `or()` operators:
-   *
-   * ```ts
-   * // Delete all BMW cars with a green color
-   * await db.delete(cars).where(and(eq(cars.color, 'green'), eq(cars.brand, 'BMW')));
-   *
-   * // Delete all cars with the green or blue color
-   * await db.delete(cars).where(or(eq(cars.color, 'green'), eq(cars.color, 'blue')));
-   * ```
-   */
-  where(where) {
-    this.config.where = where;
-    return this;
-  }
-  returning(fields = this.config.table[Table.Symbol.Columns]) {
-    this.config.returningFields = fields;
-    this.config.returning = orderSelectedFields(fields);
-    return this;
-  }
-  /** @internal */
-  getSQL() {
-    return this.dialect.buildDeleteQuery(this.config);
-  }
-  toSQL() {
-    const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-    return rest;
-  }
-  /** @internal */
-  _prepare(name) {
-    return tracer.startActiveSpan("drizzle.prepareQuery", () => {
-      return this.session.prepareQuery(this.dialect.sqlToQuery(this.getSQL()), this.config.returning, name, true, void 0, {
-        type: "delete",
-        tables: extractUsedTable(this.config.table)
-      }, this.cacheConfig);
-    });
-  }
-  prepare(name) {
-    return this._prepare(name);
-  }
-  authToken;
-  /** @internal */
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  execute = (placeholderValues) => {
-    return tracer.startActiveSpan("drizzle.operation", () => {
-      return this._prepare().execute(placeholderValues, this.authToken);
-    });
-  };
-  /** @internal */
-  getSelectedFields() {
-    return this.config.returningFields ? new Proxy(
-      this.config.returningFields,
-      new SelectionProxyHandler({
-        alias: getTableName(this.config.table),
-        sqlAliasedBehavior: "alias",
-        sqlBehavior: "error"
-      })
-    ) : void 0;
-  }
-  $dynamic() {
-    return this;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/insert.js
-var PgInsertBuilder = class {
-  constructor(table, session, dialect, withList, overridingSystemValue_) {
-    this.table = table;
-    this.session = session;
-    this.dialect = dialect;
-    this.withList = withList;
-    this.overridingSystemValue_ = overridingSystemValue_;
-  }
-  static [entityKind] = "PgInsertBuilder";
-  authToken;
-  /** @internal */
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  overridingSystemValue() {
-    this.overridingSystemValue_ = true;
-    return this;
-  }
-  values(values) {
-    values = Array.isArray(values) ? values : [values];
-    if (values.length === 0) {
-      throw new Error("values() must be called with at least one value");
-    }
-    const mappedValues = values.map((entry) => {
-      const result = {};
-      const cols = this.table[Table.Symbol.Columns];
-      for (const colKey of Object.keys(entry)) {
-        const colValue = entry[colKey];
-        result[colKey] = is(colValue, SQL) ? colValue : new Param(colValue, cols[colKey]);
-      }
-      return result;
-    });
-    return new PgInsertBase(
-      this.table,
-      mappedValues,
-      this.session,
-      this.dialect,
-      this.withList,
-      false,
-      this.overridingSystemValue_
-    ).setToken(this.authToken);
-  }
-  select(selectQuery) {
-    const select = typeof selectQuery === "function" ? selectQuery(new QueryBuilder()) : selectQuery;
-    if (!is(select, SQL) && !haveSameKeys(this.table[Columns], select._.selectedFields)) {
-      throw new Error(
-        "Insert select error: selected fields are not the same or are in a different order compared to the table definition"
-      );
-    }
-    return new PgInsertBase(this.table, select, this.session, this.dialect, this.withList, true);
-  }
-};
-var PgInsertBase = class extends QueryPromise {
-  constructor(table, values, session, dialect, withList, select, overridingSystemValue_) {
-    super();
-    this.session = session;
-    this.dialect = dialect;
-    this.config = { table, values, withList, select, overridingSystemValue_ };
-  }
-  static [entityKind] = "PgInsert";
-  config;
-  cacheConfig;
-  returning(fields = this.config.table[Table.Symbol.Columns]) {
-    this.config.returningFields = fields;
-    this.config.returning = orderSelectedFields(fields);
-    return this;
-  }
-  /**
-   * Adds an `on conflict do nothing` clause to the query.
-   *
-   * Calling this method simply avoids inserting a row as its alternative action.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/insert#on-conflict-do-nothing}
-   *
-   * @param config The `target` and `where` clauses.
-   *
-   * @example
-   * ```ts
-   * // Insert one row and cancel the insert if there's a conflict
-   * await db.insert(cars)
-   *   .values({ id: 1, brand: 'BMW' })
-   *   .onConflictDoNothing();
-   *
-   * // Explicitly specify conflict target
-   * await db.insert(cars)
-   *   .values({ id: 1, brand: 'BMW' })
-   *   .onConflictDoNothing({ target: cars.id });
-   * ```
-   */
-  onConflictDoNothing(config2 = {}) {
-    if (config2.target === void 0) {
-      this.config.onConflict = sql`do nothing`;
-    } else {
-      let targetColumn = "";
-      targetColumn = Array.isArray(config2.target) ? config2.target.map((it) => this.dialect.escapeName(this.dialect.casing.getColumnCasing(it))).join(",") : this.dialect.escapeName(this.dialect.casing.getColumnCasing(config2.target));
-      const whereSql = config2.where ? sql` where ${config2.where}` : void 0;
-      this.config.onConflict = sql`(${sql.raw(targetColumn)})${whereSql} do nothing`;
-    }
-    return this;
-  }
-  /**
-   * Adds an `on conflict do update` clause to the query.
-   *
-   * Calling this method will update the existing row that conflicts with the row proposed for insertion as its alternative action.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/insert#upserts-and-conflicts}
-   *
-   * @param config The `target`, `set` and `where` clauses.
-   *
-   * @example
-   * ```ts
-   * // Update the row if there's a conflict
-   * await db.insert(cars)
-   *   .values({ id: 1, brand: 'BMW' })
-   *   .onConflictDoUpdate({
-   *     target: cars.id,
-   *     set: { brand: 'Porsche' }
-   *   });
-   *
-   * // Upsert with 'where' clause
-   * await db.insert(cars)
-   *   .values({ id: 1, brand: 'BMW' })
-   *   .onConflictDoUpdate({
-   *     target: cars.id,
-   *     set: { brand: 'newBMW' },
-   *     targetWhere: sql`${cars.createdAt} > '2023-01-01'::date`,
-   *   });
-   * ```
-   */
-  onConflictDoUpdate(config2) {
-    if (config2.where && (config2.targetWhere || config2.setWhere)) {
-      throw new Error(
-        'You cannot use both "where" and "targetWhere"/"setWhere" at the same time - "where" is deprecated, use "targetWhere" or "setWhere" instead.'
-      );
-    }
-    const whereSql = config2.where ? sql` where ${config2.where}` : void 0;
-    const targetWhereSql = config2.targetWhere ? sql` where ${config2.targetWhere}` : void 0;
-    const setWhereSql = config2.setWhere ? sql` where ${config2.setWhere}` : void 0;
-    const setSql = this.dialect.buildUpdateSet(this.config.table, mapUpdateSet(this.config.table, config2.set));
-    let targetColumn = "";
-    targetColumn = Array.isArray(config2.target) ? config2.target.map((it) => this.dialect.escapeName(this.dialect.casing.getColumnCasing(it))).join(",") : this.dialect.escapeName(this.dialect.casing.getColumnCasing(config2.target));
-    this.config.onConflict = sql`(${sql.raw(targetColumn)})${targetWhereSql} do update set ${setSql}${whereSql}${setWhereSql}`;
-    return this;
-  }
-  /** @internal */
-  getSQL() {
-    return this.dialect.buildInsertQuery(this.config);
-  }
-  toSQL() {
-    const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-    return rest;
-  }
-  /** @internal */
-  _prepare(name) {
-    return tracer.startActiveSpan("drizzle.prepareQuery", () => {
-      return this.session.prepareQuery(this.dialect.sqlToQuery(this.getSQL()), this.config.returning, name, true, void 0, {
-        type: "insert",
-        tables: extractUsedTable(this.config.table)
-      }, this.cacheConfig);
-    });
-  }
-  prepare(name) {
-    return this._prepare(name);
-  }
-  authToken;
-  /** @internal */
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  execute = (placeholderValues) => {
-    return tracer.startActiveSpan("drizzle.operation", () => {
-      return this._prepare().execute(placeholderValues, this.authToken);
-    });
-  };
-  /** @internal */
-  getSelectedFields() {
-    return this.config.returningFields ? new Proxy(
-      this.config.returningFields,
-      new SelectionProxyHandler({
-        alias: getTableName(this.config.table),
-        sqlAliasedBehavior: "alias",
-        sqlBehavior: "error"
-      })
-    ) : void 0;
-  }
-  $dynamic() {
-    return this;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/refresh-materialized-view.js
-var PgRefreshMaterializedView = class extends QueryPromise {
-  constructor(view, session, dialect) {
-    super();
-    this.session = session;
-    this.dialect = dialect;
-    this.config = { view };
-  }
-  static [entityKind] = "PgRefreshMaterializedView";
-  config;
-  concurrently() {
-    if (this.config.withNoData !== void 0) {
-      throw new Error("Cannot use concurrently and withNoData together");
-    }
-    this.config.concurrently = true;
-    return this;
-  }
-  withNoData() {
-    if (this.config.concurrently !== void 0) {
-      throw new Error("Cannot use concurrently and withNoData together");
-    }
-    this.config.withNoData = true;
-    return this;
-  }
-  /** @internal */
-  getSQL() {
-    return this.dialect.buildRefreshMaterializedViewQuery(this.config);
-  }
-  toSQL() {
-    const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-    return rest;
-  }
-  /** @internal */
-  _prepare(name) {
-    return tracer.startActiveSpan("drizzle.prepareQuery", () => {
-      return this.session.prepareQuery(this.dialect.sqlToQuery(this.getSQL()), void 0, name, true);
-    });
-  }
-  prepare(name) {
-    return this._prepare(name);
-  }
-  authToken;
-  /** @internal */
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  execute = (placeholderValues) => {
-    return tracer.startActiveSpan("drizzle.operation", () => {
-      return this._prepare().execute(placeholderValues, this.authToken);
-    });
-  };
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/update.js
-var PgUpdateBuilder = class {
-  constructor(table, session, dialect, withList) {
-    this.table = table;
-    this.session = session;
-    this.dialect = dialect;
-    this.withList = withList;
-  }
-  static [entityKind] = "PgUpdateBuilder";
-  authToken;
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  set(values) {
-    return new PgUpdateBase(
-      this.table,
-      mapUpdateSet(this.table, values),
-      this.session,
-      this.dialect,
-      this.withList
-    ).setToken(this.authToken);
-  }
-};
-var PgUpdateBase = class extends QueryPromise {
-  constructor(table, set, session, dialect, withList) {
-    super();
-    this.session = session;
-    this.dialect = dialect;
-    this.config = { set, table, withList, joins: [] };
-    this.tableName = getTableLikeName(table);
-    this.joinsNotNullableMap = typeof this.tableName === "string" ? { [this.tableName]: true } : {};
-  }
-  static [entityKind] = "PgUpdate";
-  config;
-  tableName;
-  joinsNotNullableMap;
-  cacheConfig;
-  from(source) {
-    const src = source;
-    const tableName = getTableLikeName(src);
-    if (typeof tableName === "string") {
-      this.joinsNotNullableMap[tableName] = true;
-    }
-    this.config.from = src;
-    return this;
-  }
-  getTableLikeFields(table) {
-    if (is(table, PgTable)) {
-      return table[Table.Symbol.Columns];
-    } else if (is(table, Subquery)) {
-      return table._.selectedFields;
-    }
-    return table[ViewBaseConfig].selectedFields;
-  }
-  createJoin(joinType) {
-    return (table, on) => {
-      const tableName = getTableLikeName(table);
-      if (typeof tableName === "string" && this.config.joins.some((join) => join.alias === tableName)) {
-        throw new Error(`Alias "${tableName}" is already used in this query`);
-      }
-      if (typeof on === "function") {
-        const from = this.config.from && !is(this.config.from, SQL) ? this.getTableLikeFields(this.config.from) : void 0;
-        on = on(
-          new Proxy(
-            this.config.table[Table.Symbol.Columns],
-            new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
-          ),
-          from && new Proxy(
-            from,
-            new SelectionProxyHandler({ sqlAliasedBehavior: "sql", sqlBehavior: "sql" })
-          )
-        );
-      }
-      this.config.joins.push({ on, table, joinType, alias: tableName });
-      if (typeof tableName === "string") {
-        switch (joinType) {
-          case "left": {
-            this.joinsNotNullableMap[tableName] = false;
-            break;
-          }
-          case "right": {
-            this.joinsNotNullableMap = Object.fromEntries(
-              Object.entries(this.joinsNotNullableMap).map(([key]) => [key, false])
-            );
-            this.joinsNotNullableMap[tableName] = true;
-            break;
-          }
-          case "inner": {
-            this.joinsNotNullableMap[tableName] = true;
-            break;
-          }
-          case "full": {
-            this.joinsNotNullableMap = Object.fromEntries(
-              Object.entries(this.joinsNotNullableMap).map(([key]) => [key, false])
-            );
-            this.joinsNotNullableMap[tableName] = false;
-            break;
-          }
-        }
-      }
-      return this;
-    };
-  }
-  leftJoin = this.createJoin("left");
-  rightJoin = this.createJoin("right");
-  innerJoin = this.createJoin("inner");
-  fullJoin = this.createJoin("full");
-  /**
-   * Adds a 'where' clause to the query.
-   *
-   * Calling this method will update only those rows that fulfill a specified condition.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/update}
-   *
-   * @param where the 'where' clause.
-   *
-   * @example
-   * You can use conditional operators and `sql function` to filter the rows to be updated.
-   *
-   * ```ts
-   * // Update all cars with green color
-   * await db.update(cars).set({ color: 'red' })
-   *   .where(eq(cars.color, 'green'));
-   * // or
-   * await db.update(cars).set({ color: 'red' })
-   *   .where(sql`${cars.color} = 'green'`)
-   * ```
-   *
-   * You can logically combine conditional operators with `and()` and `or()` operators:
-   *
-   * ```ts
-   * // Update all BMW cars with a green color
-   * await db.update(cars).set({ color: 'red' })
-   *   .where(and(eq(cars.color, 'green'), eq(cars.brand, 'BMW')));
-   *
-   * // Update all cars with the green or blue color
-   * await db.update(cars).set({ color: 'red' })
-   *   .where(or(eq(cars.color, 'green'), eq(cars.color, 'blue')));
-   * ```
-   */
-  where(where) {
-    this.config.where = where;
-    return this;
-  }
-  returning(fields) {
-    if (!fields) {
-      fields = Object.assign({}, this.config.table[Table.Symbol.Columns]);
-      if (this.config.from) {
-        const tableName = getTableLikeName(this.config.from);
-        if (typeof tableName === "string" && this.config.from && !is(this.config.from, SQL)) {
-          const fromFields = this.getTableLikeFields(this.config.from);
-          fields[tableName] = fromFields;
-        }
-        for (const join of this.config.joins) {
-          const tableName2 = getTableLikeName(join.table);
-          if (typeof tableName2 === "string" && !is(join.table, SQL)) {
-            const fromFields = this.getTableLikeFields(join.table);
-            fields[tableName2] = fromFields;
-          }
-        }
-      }
-    }
-    this.config.returningFields = fields;
-    this.config.returning = orderSelectedFields(fields);
-    return this;
-  }
-  /** @internal */
-  getSQL() {
-    return this.dialect.buildUpdateQuery(this.config);
-  }
-  toSQL() {
-    const { typings: _typings, ...rest } = this.dialect.sqlToQuery(this.getSQL());
-    return rest;
-  }
-  /** @internal */
-  _prepare(name) {
-    const query = this.session.prepareQuery(this.dialect.sqlToQuery(this.getSQL()), this.config.returning, name, true, void 0, {
-      type: "insert",
-      tables: extractUsedTable(this.config.table)
-    }, this.cacheConfig);
-    query.joinsNotNullableMap = this.joinsNotNullableMap;
-    return query;
-  }
-  prepare(name) {
-    return this._prepare(name);
-  }
-  authToken;
-  /** @internal */
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  execute = (placeholderValues) => {
-    return this._prepare().execute(placeholderValues, this.authToken);
-  };
-  /** @internal */
-  getSelectedFields() {
-    return this.config.returningFields ? new Proxy(
-      this.config.returningFields,
-      new SelectionProxyHandler({
-        alias: getTableName(this.config.table),
-        sqlAliasedBehavior: "alias",
-        sqlBehavior: "error"
-      })
-    ) : void 0;
-  }
-  $dynamic() {
-    return this;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/count.js
-var PgCountBuilder = class _PgCountBuilder extends SQL {
-  constructor(params) {
-    super(_PgCountBuilder.buildEmbeddedCount(params.source, params.filters).queryChunks);
-    this.params = params;
-    this.mapWith(Number);
-    this.session = params.session;
-    this.sql = _PgCountBuilder.buildCount(
-      params.source,
-      params.filters
-    );
-  }
-  sql;
-  token;
-  static [entityKind] = "PgCountBuilder";
-  [Symbol.toStringTag] = "PgCountBuilder";
-  session;
-  static buildEmbeddedCount(source, filters) {
-    return sql`(select count(*) from ${source}${sql.raw(" where ").if(filters)}${filters})`;
-  }
-  static buildCount(source, filters) {
-    return sql`select count(*) as count from ${source}${sql.raw(" where ").if(filters)}${filters};`;
-  }
-  /** @intrnal */
-  setToken(token) {
-    this.token = token;
-    return this;
-  }
-  then(onfulfilled, onrejected) {
-    return Promise.resolve(this.session.count(this.sql, this.token)).then(
-      onfulfilled,
-      onrejected
-    );
-  }
-  catch(onRejected) {
-    return this.then(void 0, onRejected);
-  }
-  finally(onFinally) {
-    return this.then(
-      (value) => {
-        onFinally?.();
-        return value;
-      },
-      (reason) => {
-        onFinally?.();
-        throw reason;
-      }
-    );
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/query.js
-var RelationalQueryBuilder = class {
-  constructor(fullSchema, schema, tableNamesMap, table, tableConfig, dialect, session) {
-    this.fullSchema = fullSchema;
-    this.schema = schema;
-    this.tableNamesMap = tableNamesMap;
-    this.table = table;
-    this.tableConfig = tableConfig;
-    this.dialect = dialect;
-    this.session = session;
-  }
-  static [entityKind] = "PgRelationalQueryBuilder";
-  findMany(config2) {
-    return new PgRelationalQuery(
-      this.fullSchema,
-      this.schema,
-      this.tableNamesMap,
-      this.table,
-      this.tableConfig,
-      this.dialect,
-      this.session,
-      config2 ? config2 : {},
-      "many"
-    );
-  }
-  findFirst(config2) {
-    return new PgRelationalQuery(
-      this.fullSchema,
-      this.schema,
-      this.tableNamesMap,
-      this.table,
-      this.tableConfig,
-      this.dialect,
-      this.session,
-      config2 ? { ...config2, limit: 1 } : { limit: 1 },
-      "first"
-    );
-  }
-};
-var PgRelationalQuery = class extends QueryPromise {
-  constructor(fullSchema, schema, tableNamesMap, table, tableConfig, dialect, session, config2, mode) {
-    super();
-    this.fullSchema = fullSchema;
-    this.schema = schema;
-    this.tableNamesMap = tableNamesMap;
-    this.table = table;
-    this.tableConfig = tableConfig;
-    this.dialect = dialect;
-    this.session = session;
-    this.config = config2;
-    this.mode = mode;
-  }
-  static [entityKind] = "PgRelationalQuery";
-  /** @internal */
-  _prepare(name) {
-    return tracer.startActiveSpan("drizzle.prepareQuery", () => {
-      const { query, builtQuery } = this._toSQL();
-      return this.session.prepareQuery(
-        builtQuery,
-        void 0,
-        name,
-        true,
-        (rawRows, mapColumnValue) => {
-          const rows = rawRows.map(
-            (row) => mapRelationalRow(this.schema, this.tableConfig, row, query.selection, mapColumnValue)
-          );
-          if (this.mode === "first") {
-            return rows[0];
-          }
-          return rows;
-        }
-      );
-    });
-  }
-  prepare(name) {
-    return this._prepare(name);
-  }
-  _getQuery() {
-    return this.dialect.buildRelationalQueryWithoutPK({
-      fullSchema: this.fullSchema,
-      schema: this.schema,
-      tableNamesMap: this.tableNamesMap,
-      table: this.table,
-      tableConfig: this.tableConfig,
-      queryConfig: this.config,
-      tableAlias: this.tableConfig.tsName
-    });
-  }
-  /** @internal */
-  getSQL() {
-    return this._getQuery().sql;
-  }
-  _toSQL() {
-    const query = this._getQuery();
-    const builtQuery = this.dialect.sqlToQuery(query.sql);
-    return { query, builtQuery };
-  }
-  toSQL() {
-    return this._toSQL().builtQuery;
-  }
-  authToken;
-  /** @internal */
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  execute() {
-    return tracer.startActiveSpan("drizzle.operation", () => {
-      return this._prepare().execute(void 0, this.authToken);
-    });
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/query-builders/raw.js
-var PgRaw = class extends QueryPromise {
-  constructor(execute, sql2, query, mapBatchResult) {
-    super();
-    this.execute = execute;
-    this.sql = sql2;
-    this.query = query;
-    this.mapBatchResult = mapBatchResult;
-  }
-  static [entityKind] = "PgRaw";
-  /** @internal */
-  getSQL() {
-    return this.sql;
-  }
-  getQuery() {
-    return this.query;
-  }
-  mapResult(result, isFromBatch) {
-    return isFromBatch ? this.mapBatchResult(result) : result;
-  }
-  _prepare() {
-    return this;
-  }
-  /** @internal */
-  isResponseInArrayMode() {
-    return false;
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/db.js
-var PgDatabase = class {
-  constructor(dialect, session, schema) {
-    this.dialect = dialect;
-    this.session = session;
-    this._ = schema ? {
-      schema: schema.schema,
-      fullSchema: schema.fullSchema,
-      tableNamesMap: schema.tableNamesMap,
-      session
-    } : {
-      schema: void 0,
-      fullSchema: {},
-      tableNamesMap: {},
-      session
-    };
-    this.query = {};
-    if (this._.schema) {
-      for (const [tableName, columns] of Object.entries(this._.schema)) {
-        this.query[tableName] = new RelationalQueryBuilder(
-          schema.fullSchema,
-          this._.schema,
-          this._.tableNamesMap,
-          schema.fullSchema[tableName],
-          columns,
-          dialect,
-          session
-        );
-      }
-    }
-    this.$cache = { invalidate: async (_params) => {
-    } };
-  }
-  static [entityKind] = "PgDatabase";
-  query;
-  /**
-   * Creates a subquery that defines a temporary named result set as a CTE.
-   *
-   * It is useful for breaking down complex queries into simpler parts and for reusing the result set in subsequent parts of the query.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/select#with-clause}
-   *
-   * @param alias The alias for the subquery.
-   *
-   * Failure to provide an alias will result in a DrizzleTypeError, preventing the subquery from being referenced in other queries.
-   *
-   * @example
-   *
-   * ```ts
-   * // Create a subquery with alias 'sq' and use it in the select query
-   * const sq = db.$with('sq').as(db.select().from(users).where(eq(users.id, 42)));
-   *
-   * const result = await db.with(sq).select().from(sq);
-   * ```
-   *
-   * To select arbitrary SQL values as fields in a CTE and reference them in other CTEs or in the main query, you need to add aliases to them:
-   *
-   * ```ts
-   * // Select an arbitrary SQL value as a field in a CTE and reference it in the main query
-   * const sq = db.$with('sq').as(db.select({
-   *   name: sql<string>`upper(${users.name})`.as('name'),
-   * })
-   * .from(users));
-   *
-   * const result = await db.with(sq).select({ name: sq.name }).from(sq);
-   * ```
-   */
-  $with = (alias, selection) => {
-    const self = this;
-    const as = (qb) => {
-      if (typeof qb === "function") {
-        qb = qb(new QueryBuilder(self.dialect));
-      }
-      return new Proxy(
-        new WithSubquery(
-          qb.getSQL(),
-          selection ?? ("getSelectedFields" in qb ? qb.getSelectedFields() ?? {} : {}),
-          alias,
-          true
-        ),
-        new SelectionProxyHandler({ alias, sqlAliasedBehavior: "alias", sqlBehavior: "error" })
-      );
-    };
-    return { as };
-  };
-  $count(source, filters) {
-    return new PgCountBuilder({ source, filters, session: this.session });
-  }
-  $cache;
-  /**
-   * Incorporates a previously defined CTE (using `$with`) into the main query.
-   *
-   * This method allows the main query to reference a temporary named result set.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/select#with-clause}
-   *
-   * @param queries The CTEs to incorporate into the main query.
-   *
-   * @example
-   *
-   * ```ts
-   * // Define a subquery 'sq' as a CTE using $with
-   * const sq = db.$with('sq').as(db.select().from(users).where(eq(users.id, 42)));
-   *
-   * // Incorporate the CTE 'sq' into the main query and select from it
-   * const result = await db.with(sq).select().from(sq);
-   * ```
-   */
-  with(...queries) {
-    const self = this;
-    function select(fields) {
-      return new PgSelectBuilder({
-        fields: fields ?? void 0,
-        session: self.session,
-        dialect: self.dialect,
-        withList: queries
-      });
-    }
-    function selectDistinct(fields) {
-      return new PgSelectBuilder({
-        fields: fields ?? void 0,
-        session: self.session,
-        dialect: self.dialect,
-        withList: queries,
-        distinct: true
-      });
-    }
-    function selectDistinctOn(on, fields) {
-      return new PgSelectBuilder({
-        fields: fields ?? void 0,
-        session: self.session,
-        dialect: self.dialect,
-        withList: queries,
-        distinct: { on }
-      });
-    }
-    function update(table) {
-      return new PgUpdateBuilder(table, self.session, self.dialect, queries);
-    }
-    function insert(table) {
-      return new PgInsertBuilder(table, self.session, self.dialect, queries);
-    }
-    function delete_(table) {
-      return new PgDeleteBase(table, self.session, self.dialect, queries);
-    }
-    return { select, selectDistinct, selectDistinctOn, update, insert, delete: delete_ };
-  }
-  select(fields) {
-    return new PgSelectBuilder({
-      fields: fields ?? void 0,
-      session: this.session,
-      dialect: this.dialect
-    });
-  }
-  selectDistinct(fields) {
-    return new PgSelectBuilder({
-      fields: fields ?? void 0,
-      session: this.session,
-      dialect: this.dialect,
-      distinct: true
-    });
-  }
-  selectDistinctOn(on, fields) {
-    return new PgSelectBuilder({
-      fields: fields ?? void 0,
-      session: this.session,
-      dialect: this.dialect,
-      distinct: { on }
-    });
-  }
-  /**
-   * Creates an update query.
-   *
-   * Calling this method without `.where()` clause will update all rows in a table. The `.where()` clause specifies which rows should be updated.
-   *
-   * Use `.set()` method to specify which values to update.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/update}
-   *
-   * @param table The table to update.
-   *
-   * @example
-   *
-   * ```ts
-   * // Update all rows in the 'cars' table
-   * await db.update(cars).set({ color: 'red' });
-   *
-   * // Update rows with filters and conditions
-   * await db.update(cars).set({ color: 'red' }).where(eq(cars.brand, 'BMW'));
-   *
-   * // Update with returning clause
-   * const updatedCar: Car[] = await db.update(cars)
-   *   .set({ color: 'red' })
-   *   .where(eq(cars.id, 1))
-   *   .returning();
-   * ```
-   */
-  update(table) {
-    return new PgUpdateBuilder(table, this.session, this.dialect);
-  }
-  /**
-   * Creates an insert query.
-   *
-   * Calling this method will create new rows in a table. Use `.values()` method to specify which values to insert.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/insert}
-   *
-   * @param table The table to insert into.
-   *
-   * @example
-   *
-   * ```ts
-   * // Insert one row
-   * await db.insert(cars).values({ brand: 'BMW' });
-   *
-   * // Insert multiple rows
-   * await db.insert(cars).values([{ brand: 'BMW' }, { brand: 'Porsche' }]);
-   *
-   * // Insert with returning clause
-   * const insertedCar: Car[] = await db.insert(cars)
-   *   .values({ brand: 'BMW' })
-   *   .returning();
-   * ```
-   */
-  insert(table) {
-    return new PgInsertBuilder(table, this.session, this.dialect);
-  }
-  /**
-   * Creates a delete query.
-   *
-   * Calling this method without `.where()` clause will delete all rows in a table. The `.where()` clause specifies which rows should be deleted.
-   *
-   * See docs: {@link https://orm.drizzle.team/docs/delete}
-   *
-   * @param table The table to delete from.
-   *
-   * @example
-   *
-   * ```ts
-   * // Delete all rows in the 'cars' table
-   * await db.delete(cars);
-   *
-   * // Delete rows with filters and conditions
-   * await db.delete(cars).where(eq(cars.color, 'green'));
-   *
-   * // Delete with returning clause
-   * const deletedCar: Car[] = await db.delete(cars)
-   *   .where(eq(cars.id, 1))
-   *   .returning();
-   * ```
-   */
-  delete(table) {
-    return new PgDeleteBase(table, this.session, this.dialect);
-  }
-  refreshMaterializedView(view) {
-    return new PgRefreshMaterializedView(view, this.session, this.dialect);
-  }
-  authToken;
-  execute(query) {
-    const sequel = typeof query === "string" ? sql.raw(query) : query.getSQL();
-    const builtQuery = this.dialect.sqlToQuery(sequel);
-    const prepared = this.session.prepareQuery(
-      builtQuery,
-      void 0,
-      void 0,
-      false
-    );
-    return new PgRaw(
-      () => prepared.execute(void 0, this.authToken),
-      sequel,
-      builtQuery,
-      (result) => prepared.mapResult(result, true)
-    );
-  }
-  transaction(transaction, config2) {
-    return this.session.transaction(transaction, config2);
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/cache/core/cache.js
-var Cache = class {
-  static [entityKind] = "Cache";
-};
-var NoopCache = class extends Cache {
-  strategy() {
-    return "all";
-  }
-  static [entityKind] = "NoopCache";
-  async get(_key) {
-    return void 0;
-  }
-  async put(_hashedQuery, _response, _tables, _config) {
-  }
-  async onMutate(_params) {
-  }
-};
-async function hashQuery(sql2, params) {
-  const dataToHash = `${sql2}-${JSON.stringify(params)}`;
-  const encoder = new TextEncoder();
-  const data = encoder.encode(dataToHash);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = [...new Uint8Array(hashBuffer)];
-  const hashHex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-  return hashHex;
-}
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/pg-core/session.js
-var PgPreparedQuery = class {
-  constructor(query, cache, queryMetadata, cacheConfig) {
-    this.query = query;
-    this.cache = cache;
-    this.queryMetadata = queryMetadata;
-    this.cacheConfig = cacheConfig;
-    if (cache && cache.strategy() === "all" && cacheConfig === void 0) {
-      this.cacheConfig = { enable: true, autoInvalidate: true };
-    }
-    if (!this.cacheConfig?.enable) {
-      this.cacheConfig = void 0;
-    }
-  }
-  authToken;
-  getQuery() {
-    return this.query;
-  }
-  mapResult(response, _isFromBatch) {
-    return response;
-  }
-  /** @internal */
-  setToken(token) {
-    this.authToken = token;
-    return this;
-  }
-  static [entityKind] = "PgPreparedQuery";
-  /** @internal */
-  joinsNotNullableMap;
-  /** @internal */
-  async queryWithCache(queryString, params, query) {
-    if (this.cache === void 0 || is(this.cache, NoopCache) || this.queryMetadata === void 0) {
-      try {
-        return await query();
-      } catch (e) {
-        throw new DrizzleQueryError(queryString, params, e);
-      }
-    }
-    if (this.cacheConfig && !this.cacheConfig.enable) {
-      try {
-        return await query();
-      } catch (e) {
-        throw new DrizzleQueryError(queryString, params, e);
-      }
-    }
-    if ((this.queryMetadata.type === "insert" || this.queryMetadata.type === "update" || this.queryMetadata.type === "delete") && this.queryMetadata.tables.length > 0) {
-      try {
-        const [res] = await Promise.all([
-          query(),
-          this.cache.onMutate({ tables: this.queryMetadata.tables })
-        ]);
-        return res;
-      } catch (e) {
-        throw new DrizzleQueryError(queryString, params, e);
-      }
-    }
-    if (!this.cacheConfig) {
-      try {
-        return await query();
-      } catch (e) {
-        throw new DrizzleQueryError(queryString, params, e);
-      }
-    }
-    if (this.queryMetadata.type === "select") {
-      const fromCache = await this.cache.get(
-        this.cacheConfig.tag ?? await hashQuery(queryString, params),
-        this.queryMetadata.tables,
-        this.cacheConfig.tag !== void 0,
-        this.cacheConfig.autoInvalidate
-      );
-      if (fromCache === void 0) {
-        let result;
-        try {
-          result = await query();
-        } catch (e) {
-          throw new DrizzleQueryError(queryString, params, e);
-        }
-        await this.cache.put(
-          this.cacheConfig.tag ?? await hashQuery(queryString, params),
-          result,
-          // make sure we send tables that were used in a query only if user wants to invalidate it on each write
-          this.cacheConfig.autoInvalidate ? this.queryMetadata.tables : [],
-          this.cacheConfig.tag !== void 0,
-          this.cacheConfig.config
-        );
-        return result;
-      }
-      return fromCache;
-    }
-    try {
-      return await query();
-    } catch (e) {
-      throw new DrizzleQueryError(queryString, params, e);
-    }
-  }
-};
-var PgSession = class {
-  constructor(dialect) {
-    this.dialect = dialect;
-  }
-  static [entityKind] = "PgSession";
-  /** @internal */
-  execute(query, token) {
-    return tracer.startActiveSpan("drizzle.operation", () => {
-      const prepared = tracer.startActiveSpan("drizzle.prepareQuery", () => {
-        return this.prepareQuery(
-          this.dialect.sqlToQuery(query),
-          void 0,
-          void 0,
-          false
-        );
-      });
-      return prepared.setToken(token).execute(void 0, token);
-    });
-  }
-  all(query) {
-    return this.prepareQuery(
-      this.dialect.sqlToQuery(query),
-      void 0,
-      void 0,
-      false
-    ).all();
-  }
-  /** @internal */
-  async count(sql2, token) {
-    const res = await this.execute(sql2, token);
-    return Number(
-      res[0]["count"]
-    );
-  }
-};
-var PgTransaction = class extends PgDatabase {
-  constructor(dialect, session, schema, nestedIndex = 0) {
-    super(dialect, session, schema);
-    this.schema = schema;
-    this.nestedIndex = nestedIndex;
-  }
-  static [entityKind] = "PgTransaction";
-  rollback() {
-    throw new TransactionRollbackError();
-  }
-  /** @internal */
-  getTransactionConfigSQL(config2) {
-    const chunks = [];
-    if (config2.isolationLevel) {
-      chunks.push(`isolation level ${config2.isolationLevel}`);
-    }
-    if (config2.accessMode) {
-      chunks.push(config2.accessMode);
-    }
-    if (typeof config2.deferrable === "boolean") {
-      chunks.push(config2.deferrable ? "deferrable" : "not deferrable");
-    }
-    return sql.raw(chunks.join(" "));
-  }
-  setTransaction(config2) {
-    return this.session.execute(sql`set transaction ${this.getTransactionConfigSQL(config2)}`);
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/node-postgres/session.js
-var { Pool: Pool2, types: types2 } = esm_default;
-var NodePgPreparedQuery = class extends PgPreparedQuery {
-  constructor(client3, queryString, params, logger2, cache, queryMetadata, cacheConfig, fields, name, _isResponseInArrayMode, customResultMapper) {
-    super({ sql: queryString, params }, cache, queryMetadata, cacheConfig);
-    this.client = client3;
-    this.queryString = queryString;
-    this.params = params;
-    this.logger = logger2;
-    this.fields = fields;
-    this._isResponseInArrayMode = _isResponseInArrayMode;
-    this.customResultMapper = customResultMapper;
-    this.rawQueryConfig = {
-      name,
-      text: queryString,
-      types: {
-        // @ts-ignore
-        getTypeParser: (typeId, format) => {
-          if (typeId === types2.builtins.TIMESTAMPTZ) {
-            return (val) => val;
-          }
-          if (typeId === types2.builtins.TIMESTAMP) {
-            return (val) => val;
-          }
-          if (typeId === types2.builtins.DATE) {
-            return (val) => val;
-          }
-          if (typeId === types2.builtins.INTERVAL) {
-            return (val) => val;
-          }
-          if (typeId === 1231) {
-            return (val) => val;
-          }
-          if (typeId === 1115) {
-            return (val) => val;
-          }
-          if (typeId === 1185) {
-            return (val) => val;
-          }
-          if (typeId === 1187) {
-            return (val) => val;
-          }
-          if (typeId === 1182) {
-            return (val) => val;
-          }
-          return types2.getTypeParser(typeId, format);
-        }
-      }
-    };
-    this.queryConfig = {
-      name,
-      text: queryString,
-      rowMode: "array",
-      types: {
-        // @ts-ignore
-        getTypeParser: (typeId, format) => {
-          if (typeId === types2.builtins.TIMESTAMPTZ) {
-            return (val) => val;
-          }
-          if (typeId === types2.builtins.TIMESTAMP) {
-            return (val) => val;
-          }
-          if (typeId === types2.builtins.DATE) {
-            return (val) => val;
-          }
-          if (typeId === types2.builtins.INTERVAL) {
-            return (val) => val;
-          }
-          if (typeId === 1231) {
-            return (val) => val;
-          }
-          if (typeId === 1115) {
-            return (val) => val;
-          }
-          if (typeId === 1185) {
-            return (val) => val;
-          }
-          if (typeId === 1187) {
-            return (val) => val;
-          }
-          if (typeId === 1182) {
-            return (val) => val;
-          }
-          return types2.getTypeParser(typeId, format);
-        }
-      }
-    };
-  }
-  static [entityKind] = "NodePgPreparedQuery";
-  rawQueryConfig;
-  queryConfig;
-  async execute(placeholderValues = {}) {
-    return tracer.startActiveSpan("drizzle.execute", async () => {
-      const params = fillPlaceholders(this.params, placeholderValues);
-      this.logger.logQuery(this.rawQueryConfig.text, params);
-      const { fields, rawQueryConfig: rawQuery, client: client3, queryConfig: query, joinsNotNullableMap, customResultMapper } = this;
-      if (!fields && !customResultMapper) {
-        return tracer.startActiveSpan("drizzle.driver.execute", async (span) => {
-          span?.setAttributes({
-            "drizzle.query.name": rawQuery.name,
-            "drizzle.query.text": rawQuery.text,
-            "drizzle.query.params": JSON.stringify(params)
-          });
-          return this.queryWithCache(rawQuery.text, params, async () => {
-            return await client3.query(rawQuery, params);
-          });
-        });
-      }
-      const result = await tracer.startActiveSpan("drizzle.driver.execute", (span) => {
-        span?.setAttributes({
-          "drizzle.query.name": query.name,
-          "drizzle.query.text": query.text,
-          "drizzle.query.params": JSON.stringify(params)
-        });
-        return this.queryWithCache(query.text, params, async () => {
-          return await client3.query(query, params);
-        });
-      });
-      return tracer.startActiveSpan("drizzle.mapResponse", () => {
-        return customResultMapper ? customResultMapper(result.rows) : result.rows.map((row) => mapResultRow(fields, row, joinsNotNullableMap));
-      });
-    });
-  }
-  all(placeholderValues = {}) {
-    return tracer.startActiveSpan("drizzle.execute", () => {
-      const params = fillPlaceholders(this.params, placeholderValues);
-      this.logger.logQuery(this.rawQueryConfig.text, params);
-      return tracer.startActiveSpan("drizzle.driver.execute", (span) => {
-        span?.setAttributes({
-          "drizzle.query.name": this.rawQueryConfig.name,
-          "drizzle.query.text": this.rawQueryConfig.text,
-          "drizzle.query.params": JSON.stringify(params)
-        });
-        return this.queryWithCache(this.rawQueryConfig.text, params, async () => {
-          return this.client.query(this.rawQueryConfig, params);
-        }).then((result) => result.rows);
-      });
-    });
-  }
-  /** @internal */
-  isResponseInArrayMode() {
-    return this._isResponseInArrayMode;
-  }
-};
-var NodePgSession = class _NodePgSession extends PgSession {
-  constructor(client3, dialect, schema, options = {}) {
-    super(dialect);
-    this.client = client3;
-    this.schema = schema;
-    this.options = options;
-    this.logger = options.logger ?? new NoopLogger();
-    this.cache = options.cache ?? new NoopCache();
-  }
-  static [entityKind] = "NodePgSession";
-  logger;
-  cache;
-  prepareQuery(query, fields, name, isResponseInArrayMode, customResultMapper, queryMetadata, cacheConfig) {
-    return new NodePgPreparedQuery(
-      this.client,
-      query.sql,
-      query.params,
-      this.logger,
-      this.cache,
-      queryMetadata,
-      cacheConfig,
-      fields,
-      name,
-      isResponseInArrayMode,
-      customResultMapper
-    );
-  }
-  async transaction(transaction, config2) {
-    const isPool = this.client instanceof Pool2 || Object.getPrototypeOf(this.client).constructor.name.includes("Pool");
-    const session = isPool ? new _NodePgSession(await this.client.connect(), this.dialect, this.schema, this.options) : this;
-    const tx = new NodePgTransaction(this.dialect, session, this.schema);
-    await tx.execute(sql`begin${config2 ? sql` ${tx.getTransactionConfigSQL(config2)}` : void 0}`);
-    try {
-      const result = await transaction(tx);
-      await tx.execute(sql`commit`);
-      return result;
-    } catch (error) {
-      await tx.execute(sql`rollback`);
-      throw error;
-    } finally {
-      if (isPool) session.client.release();
-    }
-  }
-  async count(sql2) {
-    const res = await this.execute(sql2);
-    return Number(
-      res["rows"][0]["count"]
-    );
-  }
-};
-var NodePgTransaction = class _NodePgTransaction extends PgTransaction {
-  static [entityKind] = "NodePgTransaction";
-  async transaction(transaction) {
-    const savepointName = `sp${this.nestedIndex + 1}`;
-    const tx = new _NodePgTransaction(
-      this.dialect,
-      this.session,
-      this.schema,
-      this.nestedIndex + 1
-    );
-    await tx.execute(sql.raw(`savepoint ${savepointName}`));
-    try {
-      const result = await transaction(tx);
-      await tx.execute(sql.raw(`release savepoint ${savepointName}`));
-      return result;
-    } catch (err) {
-      await tx.execute(sql.raw(`rollback to savepoint ${savepointName}`));
-      throw err;
-    }
-  }
-};
-
-// ../../node_modules/.pnpm/drizzle-orm@0.45.2_@types+pg@8.23.1_pg@8.23.0/node_modules/drizzle-orm/node-postgres/driver.js
-var NodePgDriver = class {
-  constructor(client3, dialect, options = {}) {
-    this.client = client3;
-    this.dialect = dialect;
-    this.options = options;
-  }
-  static [entityKind] = "NodePgDriver";
-  createSession(schema) {
-    return new NodePgSession(this.client, this.dialect, schema, {
-      logger: this.options.logger,
-      cache: this.options.cache
-    });
-  }
-};
-var NodePgDatabase = class extends PgDatabase {
-  static [entityKind] = "NodePgDatabase";
-};
-function construct(client3, config2 = {}) {
-  const dialect = new PgDialect({ casing: config2.casing });
-  let logger2;
-  if (config2.logger === true) {
-    logger2 = new DefaultLogger();
-  } else if (config2.logger !== false) {
-    logger2 = config2.logger;
-  }
-  let schema;
-  if (config2.schema) {
-    const tablesConfig = extractTablesRelationalConfig(
-      config2.schema,
-      createTableRelationsHelpers
-    );
-    schema = {
-      fullSchema: config2.schema,
-      schema: tablesConfig.tables,
-      tableNamesMap: tablesConfig.tableNamesMap
-    };
-  }
-  const driver = new NodePgDriver(client3, dialect, { logger: logger2, cache: config2.cache });
-  const session = driver.createSession(schema);
-  const db2 = new NodePgDatabase(dialect, session, schema);
-  db2.$client = client3;
-  db2.$cache = config2.cache;
-  if (db2.$cache) {
-    db2.$cache["invalidate"] = config2.cache?.onMutate;
-  }
-  return db2;
-}
-function drizzle(...params) {
-  if (typeof params[0] === "string") {
-    const instance = new esm_default.Pool({
-      connectionString: params[0]
-    });
-    return construct(instance, params[1]);
-  }
-  if (isConfig(params[0])) {
-    const { connection, client: client3, ...drizzleConfig } = params[0];
-    if (client3) return construct(client3, drizzleConfig);
-    const instance = typeof connection === "string" ? new esm_default.Pool({
-      connectionString: connection
-    }) : new esm_default.Pool(connection);
-    return construct(instance, drizzleConfig);
-  }
-  return construct(params[0], params[1]);
-}
-((drizzle2) => {
-  function mock(config2) {
-    return construct({}, config2);
-  }
-  drizzle2.mock = mock;
-})(drizzle || (drizzle = {}));
-
-// ../../lib/db/src/schema/index.ts
-var schema_exports = {};
-__export(schema_exports, {
-  activationPaymentsTable: () => activationPaymentsTable,
-  botPhaseEnum: () => botPhaseEnum,
-  botStatusEnum: () => botStatusEnum,
-  kasWithdrawalsTable: () => kasWithdrawalsTable,
-  managedLotsTable: () => managedLotsTable,
-  tradingBotsTable: () => tradingBotsTable,
-  walletUsersTable: () => walletUsersTable
-});
-
-// ../../lib/db/src/schema/trading-bots.ts
-var botStatusEnum = pgEnum("bot_status", [
-  "setup",
-  "ready",
-  "running",
-  "paused",
-  "stopped"
-]);
-var botPhaseEnum = pgEnum("bot_phase", ["buying", "selling"]);
-var walletUsersTable = pgTable(
-  "wallet_users",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    walletAddress: text("wallet_address").notNull(),
-    publicKey: text("public_key").notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => /* @__PURE__ */ new Date())
-  },
-  (table) => [uniqueIndex("wallet_users_address_unique").on(table.walletAddress)]
-);
-var tradingBotsTable = pgTable(
-  "trading_bots",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    userId: uuid("user_id").notNull().references(() => walletUsersTable.id, { onDelete: "cascade" }),
-    botAddress: text("bot_address").notNull(),
-    encryptedPrivateKey: text("encrypted_private_key").notNull(),
-    tokenId: text("token_id"),
-    tokenSymbol: text("token_symbol"),
-    activationTxId: text("activation_tx_id"),
-    activationVerifiedAt: timestamp("activation_verified_at", { withTimezone: true }),
-    configurationVersion: integer("configuration_version").notNull().default(1),
-    status: botStatusEnum("status").notNull().default("setup"),
-    phase: botPhaseEnum("phase").notNull().default("buying"),
-    completedBuys: integer("completed_buys").notNull().default(0),
-    completedSells: integer("completed_sells").notNull().default(0),
-    totalTrades: integer("total_trades").notNull().default(0),
-    lastTradeAt: timestamp("last_trade_at", { withTimezone: true }),
-    nextRunAt: timestamp("next_run_at", { withTimezone: true }),
-    inFlight: jsonb("in_flight"),
-    stopReason: text("stop_reason"),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => /* @__PURE__ */ new Date())
-  },
-  (table) => [
-    uniqueIndex("trading_bots_user_unique").on(table.userId),
-    uniqueIndex("trading_bots_address_unique").on(table.botAddress),
-    uniqueIndex("trading_bots_activation_tx_unique").on(table.activationTxId)
-  ]
-);
-var activationPaymentsTable = pgTable(
-  "activation_payments",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    botId: uuid("bot_id").notNull().references(() => tradingBotsTable.id, { onDelete: "cascade" }),
-    userId: uuid("user_id").notNull().references(() => walletUsersTable.id, { onDelete: "cascade" }),
-    configurationVersion: integer("configuration_version").notNull(),
-    tokenId: text("token_id").notNull(),
-    transactionId: text("transaction_id").notNull(),
-    verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull().defaultNow()
-  },
-  (table) => [
-    uniqueIndex("activation_payments_transaction_unique").on(table.transactionId),
-    uniqueIndex("activation_payments_configuration_unique").on(table.botId, table.configurationVersion)
-  ]
-);
-var kasWithdrawalsTable = pgTable(
-  "kas_withdrawals",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    botId: uuid("bot_id").notNull().references(() => tradingBotsTable.id, { onDelete: "cascade" }),
-    userId: uuid("user_id").notNull().references(() => walletUsersTable.id, { onDelete: "cascade" }),
-    transactionId: text("transaction_id").notNull(),
-    destinationAddress: text("destination_address").notNull(),
-    amountSompi: bigint("amount_sompi", { mode: "bigint" }).notNull(),
-    feeSompi: bigint("fee_sompi", { mode: "bigint" }).notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
-  },
-  (table) => [uniqueIndex("kas_withdrawals_transaction_unique").on(table.transactionId)]
-);
-var managedLotsTable = pgTable(
-  "managed_lots",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    botId: uuid("bot_id").notNull().references(() => tradingBotsTable.id, { onDelete: "cascade" }),
-    buyTransactionId: text("buy_transaction_id").notNull(),
-    outputIndex: integer("output_index").notNull(),
-    tokenAmount: bigint("token_amount", { mode: "bigint" }).notNull(),
-    costSompi: bigint("cost_sompi", { mode: "bigint" }).notNull(),
-    tokenId: text("token_id"),
-    tokenSymbol: text("token_symbol"),
-    sellTransactionId: text("sell_transaction_id"),
-    soldAt: timestamp("sold_at", { withTimezone: true }),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
-  },
-  (table) => [
-    uniqueIndex("managed_lots_outpoint_unique").on(
-      table.buyTransactionId,
-      table.outputIndex
-    )
-  ]
-);
-
-// ../../lib/db/src/index.ts
-var { Pool: Pool3 } = esm_default;
-if (!process.env.DATABASE_URL) {
-  throw new Error(
-    "DATABASE_URL must be set. Did you forget to provision a database?"
-  );
-}
-var pool = new Pool3({ connectionString: process.env.DATABASE_URL });
-var db = drizzle(pool, { schema: schema_exports });
-
-// src/lib/interrupted-trade-service.ts
-var STALE_IN_FLIGHT_MS = 10 * 6e4;
-var KASPA_REST_API = "https://api.kaspa.org";
-async function reconcileStaleInFlight(bot) {
-  const marker = bot.inFlight;
-  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return false;
-  const startedAtValue = "startedAt" in marker ? marker.startedAt : void 0;
-  if (typeof startedAtValue !== "string") return false;
-  const startedAt = new Date(startedAtValue);
-  if (!Number.isFinite(startedAt.getTime()) || Date.now() - startedAt.getTime() < STALE_IN_FLIGHT_MS) {
-    return false;
-  }
-  const after = startedAt.getTime() - 6e4;
-  let before;
-  let outgoing;
-  for (let page = 0; page < 100; page += 1) {
-    const url = new URL(
-      `/addresses/${encodeURIComponent(bot.botAddress)}/full-transactions-page`,
-      KASPA_REST_API
-    );
-    url.searchParams.set("limit", "500");
-    if (before === void 0) url.searchParams.set("after", String(after));
-    else url.searchParams.set("before", String(before));
-    url.searchParams.set("resolve_previous_outpoints", "light");
-    const response = await fetch(url, { signal: AbortSignal.timeout(15e3) });
-    if (!response.ok) {
-      throw new Error(`Kaspa history lookup failed with HTTP ${response.status}.`);
-    }
-    const transactions = await response.json();
-    if (!Array.isArray(transactions) || transactions.some(
-      (tx) => !Number.isFinite(tx.block_time) || !Array.isArray(tx.inputs) || typeof tx.is_accepted !== "boolean"
-    )) {
-      throw new Error("Kaspa history response is incomplete; reconciliation cannot proceed.");
-    }
-    outgoing = transactions.find(
-      (transaction) => transaction.is_accepted === true && typeof transaction.block_time === "number" && transaction.block_time >= startedAt.getTime() && transaction.inputs?.some((input) => input.previous_outpoint_address === bot.botAddress)
-    );
-    if (outgoing) break;
-    if (transactions.length === 0 || Math.min(...transactions.map((tx) => tx.block_time)) <= after) break;
-    const nextBefore = response.headers.get("x-next-page-before");
-    if (!nextBefore) {
-      throw new Error("Kaspa history pagination ended before the reconciliation window was covered.");
-    }
-    const parsedNextBefore = Number(nextBefore);
-    if (!Number.isFinite(parsedNextBefore) || parsedNextBefore <= after || before !== void 0 && parsedNextBefore >= before) {
-      throw new Error("Kaspa history pagination returned an invalid cursor.");
-    }
-    before = parsedNextBefore;
-    if (page === 99) {
-      throw new Error("Kaspa history is too large to reconcile safely.");
-    }
-  }
-  if (outgoing) {
-    await db.update(tradingBotsTable).set({
-      status: "paused",
-      nextRunAt: null,
-      stopReason: `Safety pause: transaction ${outgoing.transaction_id ?? "unknown"} reached the chain during an interrupted trade and requires reconciliation.`,
-      updatedAt: /* @__PURE__ */ new Date()
-    }).where(and(
-      eq(tradingBotsTable.id, bot.id),
-      eq(tradingBotsTable.inFlight, marker)
-    ));
-    logger.error(
-      { botId: bot.id, transactionId: outgoing.transaction_id },
-      "Interrupted user trade reached the chain; manual reconciliation required"
-    );
-    return false;
-  }
-  const cleared = await db.update(tradingBotsTable).set({
-    inFlight: null,
-    nextRunAt: bot.status === "running" ? /* @__PURE__ */ new Date() : null,
-    stopReason: null,
-    updatedAt: /* @__PURE__ */ new Date()
-  }).where(and(
-    eq(tradingBotsTable.id, bot.id),
-    eq(tradingBotsTable.inFlight, marker)
-  )).returning({ id: tradingBotsTable.id });
-  if (!cleared.length) return false;
-  logger.warn({ botId: bot.id }, "Cleared stale user trade after confirming no outgoing chain transaction");
-  return true;
-}
-
-// src/lib/user-app-service.ts
-var ACTIVATION_ADDRESS = "kaspa:qz6dltvkds80wf8raac504ze4nesgnk72n24jr7krum2m8dq34khvkevr88cc";
-var ACTIVATION_SOMPI = 10000000000n;
-var MINIMUM_BOT_FUNDING_SOMPI = 2275000000n;
-var SESSION_COOKIE = "kron_wallet_session";
-var API_URL2 = "https://api.kron.technology";
-var INDEXER_URL2 = "https://idx.kron.technology/v1/kcc20";
-var NODE_URL2 = "wss://node.kron.technology";
-var challenges = /* @__PURE__ */ new Map();
-function secret() {
-  const value = process.env.SESSION_SECRET;
-  if (!value) throw new Error("SESSION_SECRET is not configured.");
-  return value;
-}
-function encryptionKey() {
-  return createHash("sha256").update(secret()).digest();
-}
-function encryptPrivateKey(value) {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", encryptionKey(), iv);
-  const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
-  return [iv, cipher.getAuthTag(), encrypted].map((part) => part.toString("base64url")).join(".");
-}
-function decryptPrivateKey(value) {
-  const [ivText, tagText, encryptedText] = value.split(".");
-  if (!ivText || !tagText || !encryptedText) throw new Error("Stored signer is invalid.");
-  const decipher = createDecipheriv("aes-256-gcm", encryptionKey(), Buffer.from(ivText, "base64url"));
-  decipher.setAuthTag(Buffer.from(tagText, "base64url"));
-  return Buffer.concat([
-    decipher.update(Buffer.from(encryptedText, "base64url")),
-    decipher.final()
-  ]).toString("utf8");
-}
-function createSessionToken(userId2) {
-  const payload = Buffer.from(JSON.stringify({
-    userId: userId2,
-    expiresAt: Date.now() + 7 * 24 * 60 * 6e4
-  })).toString("base64url");
-  const signature = createHmac("sha256", secret()).update(payload).digest("base64url");
-  return `${payload}.${signature}`;
-}
-function readSessionToken(token) {
-  if (!token) return null;
-  const [payload, signature] = token.split(".");
-  if (!payload || !signature) return null;
-  const expected = createHmac("sha256", secret()).update(payload).digest();
-  const actual = Buffer.from(signature, "base64url");
-  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
-  const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-  return data.expiresAt > Date.now() ? data.userId : null;
-}
-function sessionCookieName() {
-  return SESSION_COOKIE;
-}
-function fixedStrategy() {
-  return {
-    orderSizeKas: 21,
-    buyCount: 5,
-    sellCount: 5,
-    tradesPerHour: 10,
-    activationFeeKas: 100,
-    activationAddress: ACTIVATION_ADDRESS
-  };
-}
-function getGuestDashboard() {
-  return {
-    authenticated: false,
-    walletAddress: "",
-    strategy: fixedStrategy(),
-    bot: null
-  };
-}
-async function createWalletChallenge(address, publicKey) {
-  const k = await loadKaspa2();
-  const derived = new k.PublicKey(publicKey).toAddress(k.NetworkType.Mainnet).toString();
-  if (derived !== address || !address.startsWith("kaspa:")) {
-    throw new Error("Public key does not match the supplied Kaspa mainnet address.");
-  }
-  const challengeId = randomUUID();
-  const expiresAt = Date.now() + 5 * 6e4;
-  const message = [
-    "Kron Bot wallet verification",
-    `Address: ${address}`,
-    `Challenge: ${randomBytes(24).toString("hex")}`,
-    `Expires: ${new Date(expiresAt).toISOString()}`,
-    "This signature does not authorize a transaction."
-  ].join("\n");
-  challenges.set(challengeId, { address, publicKey, message, expiresAt });
-  return { challengeId, message, expiresAt: new Date(expiresAt).toISOString() };
-}
-async function verifyWalletChallenge(input) {
-  const challenge = challenges.get(input.challengeId);
-  challenges.delete(input.challengeId);
-  if (!challenge || challenge.expiresAt < Date.now() || challenge.address !== input.walletAddress || challenge.publicKey !== input.publicKey) throw new Error("Wallet challenge is invalid or expired.");
-  const k = await loadKaspa2();
-  const signature = /^[a-fA-F0-9]+$/.test(input.signature) ? input.signature : Buffer.from(input.signature, "base64").toString("hex");
-  if (!k.verifyMessage({
-    message: challenge.message,
-    signature,
-    publicKey: input.publicKey
-  })) throw new Error("Wallet signature could not be verified.");
-  const [user] = await db.insert(walletUsersTable).values({ walletAddress: input.walletAddress, publicKey: input.publicKey }).onConflictDoUpdate({
-    target: walletUsersTable.walletAddress,
-    set: { publicKey: input.publicKey, updatedAt: /* @__PURE__ */ new Date() }
-  }).returning();
-  if (!user) throw new Error("Could not create wallet account.");
-  return { userId: user.id, token: createSessionToken(user.id) };
-}
-async function getUserDashboard(userId2) {
-  const [user] = await db.select().from(walletUsersTable).where(eq(walletUsersTable.id, userId2)).limit(1);
-  if (!user) throw new Error("Wallet session is no longer valid.");
-  const [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
-  const lots = bot ? await db.select().from(managedLotsTable).where(eq(managedLotsTable.botId, bot.id)).orderBy(desc(managedLotsTable.createdAt)).limit(50) : [];
-  const tradeHistory = lots.flatMap((lot) => [
-    ...lot.sellTransactionId && lot.soldAt ? [{
-      action: "sell",
-      transactionId: lot.sellTransactionId,
-      executedAt: lot.soldAt.toISOString(),
-      tokenAmount: lot.tokenAmount.toString(),
-      tokenId: lot.tokenId,
-      tokenSymbol: lot.tokenSymbol
-    }] : [],
-    {
-      action: "buy",
-      transactionId: lot.buyTransactionId,
-      executedAt: lot.createdAt.toISOString(),
-      tokenAmount: lot.tokenAmount.toString(),
-      tokenId: lot.tokenId,
-      tokenSymbol: lot.tokenSymbol
-    }
-  ]).sort((a, b) => Date.parse(b.executedAt) - Date.parse(a.executedAt));
-  let botKasBalance = 0;
-  let managedTokenAmount = "0";
-  if (bot) {
-    const k = await loadKaspa2();
-    const rpc = new k.RpcClient({ url: NODE_URL2, networkId: "mainnet", encoding: k.Encoding.Borsh });
-    const indexer = new kron2.client.IndexerClient(INDEXER_URL2);
-    await rpc.connect();
-    try {
-      const [{ entries }, tokenBalanceResponse] = await Promise.all([
-        rpc.getUtxosByAddresses({ addresses: [bot.botAddress] }),
-        bot.tokenSymbol ? indexer.balance(bot.tokenSymbol.toLowerCase(), bot.botAddress) : Promise.resolve([])
-      ]);
-      botKasBalance = entries.reduce((sum, entry) => sum + Number(entry.amount) / 1e8, 0);
-      const tokenBalanceData = tokenBalanceResponse;
-      const rawTokenBalance = Array.isArray(tokenBalanceData) ? tokenBalanceData[0]?.balance : tokenBalanceData?.balance;
-      managedTokenAmount = rawTokenBalance == null ? "0" : String(rawTokenBalance);
-    } finally {
-      await rpc.disconnect();
-    }
-  }
-  return {
-    authenticated: true,
-    walletAddress: user.walletAddress,
-    strategy: fixedStrategy(),
-    bot: bot ? {
-      id: bot.id,
-      botAddress: bot.botAddress,
-      tokenId: bot.tokenId,
-      tokenSymbol: bot.tokenSymbol,
-      configurationVersion: bot.configurationVersion,
-      activationPaid: Boolean(bot.activationVerifiedAt),
-      activationTxId: bot.activationTxId,
-      status: bot.status,
-      phase: bot.phase,
-      completedBuys: bot.completedBuys,
-      completedSells: bot.completedSells,
-      totalTrades: bot.totalTrades,
-      nextRunAt: bot.nextRunAt?.toISOString() ?? null,
-      lastTradeAt: bot.lastTradeAt?.toISOString() ?? null,
-      stopReason: bot.stopReason,
-      managedTokenAmount,
-      botKasBalance,
-      tradeHistory
-    } : null
-  };
-}
-async function setupUserBot(userId2, tokenId) {
-  const normalized = tokenId.toLowerCase();
-  const registry = new kron2.client.RegistryClient(API_URL2);
-  const entry = (await registry.tokenlist({ all: true })).tokens.find(
-    (token) => token.covenantId.toLowerCase() === normalized
-  );
-  if (!entry?.extensions.chainVerified || entry.network !== "mainnet") {
-    throw new Error("Token must be a chain-verified Kron mainnet KCC20 token.");
-  }
-  const [existing] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
-  if (existing) {
-    if (existing.tokenId !== normalized) {
-      throw new Error("Use Change Covenant to update an existing bot configuration.");
-    }
-  } else {
-    const k = await loadKaspa2();
-    let key;
-    do {
-      try {
-        key = new k.PrivateKey(randomBytes(32).toString("hex"));
-      } catch {
-        key = null;
-      }
-    } while (!key);
-    await db.insert(tradingBotsTable).values({
-      userId: userId2,
-      botAddress: key.toAddress(k.NetworkType.Mainnet).toString(),
-      encryptedPrivateKey: encryptPrivateKey(key.toString()),
-      tokenId: normalized,
-      tokenSymbol: entry.symbol
-    });
-  }
-  return getUserDashboard(userId2);
-}
-async function verifyActivation(userId2, transactionId) {
-  const normalizedTransactionId = transactionId.toLowerCase();
-  const [usedPayment] = await db.select({ id: activationPaymentsTable.id }).from(activationPaymentsTable).where(eq(activationPaymentsTable.transactionId, normalizedTransactionId)).limit(1);
-  if (usedPayment) throw new Error("This activation transaction has already been used.");
-  const k = await loadKaspa2();
-  const rpc = new k.RpcClient({ url: NODE_URL2, networkId: "mainnet", encoding: k.Encoding.Borsh });
-  await rpc.connect();
-  try {
-    const { entries } = await rpc.getUtxosByAddresses({ addresses: [ACTIVATION_ADDRESS] });
-    const payment = entries.find(
-      (entry) => entry.outpoint.transactionId === normalizedTransactionId && BigInt(entry.amount) >= ACTIVATION_SOMPI
-    );
-    if (!payment) throw new Error("Confirmed 100 KAS activation payment was not found.");
-  } finally {
-    await rpc.disconnect();
-  }
-  const [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
-  if (!bot?.tokenId) throw new Error("Set up the bot before verifying activation.");
-  const verifiedAt = /* @__PURE__ */ new Date();
-  await db.transaction(async (tx) => {
-    await tx.insert(activationPaymentsTable).values({
-      botId: bot.id,
-      userId: userId2,
-      configurationVersion: bot.configurationVersion,
-      tokenId: bot.tokenId,
-      transactionId: normalizedTransactionId,
-      verifiedAt
-    });
-    await tx.update(tradingBotsTable).set({
-      activationTxId: normalizedTransactionId,
-      activationVerifiedAt: verifiedAt,
-      status: "ready",
-      updatedAt: verifiedAt
-    }).where(eq(tradingBotsTable.id, bot.id));
-  });
-  return getUserDashboard(userId2);
-}
-async function changeUserBotCovenant(userId2, tokenId) {
-  const normalized = tokenId.toLowerCase();
-  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
-  if (!bot?.tokenId) throw new Error("Set up the bot before changing its covenant.");
-  if (bot.tokenId === normalized) throw new Error("Enter a different covenant ID.");
-  if (bot.status === "running") throw new Error("Stop the bot before changing its covenant.");
-  const originalTokenId = bot.tokenId;
-  const originalConfigurationVersion = bot.configurationVersion;
-  const pendingAction = bot.inFlight && typeof bot.inFlight === "object" && !Array.isArray(bot.inFlight) && "action" in bot.inFlight ? bot.inFlight.action : void 0;
-  if (bot.inFlight) {
-    if (pendingAction === "withdraw" && bot.stopReason !== "Withdrawal submission is awaiting reconciliation. Do not retry.") {
-      const [cleared] = await db.update(tradingBotsTable).set({
-        inFlight: null,
-        stopReason: null,
-        updatedAt: /* @__PURE__ */ new Date()
-      }).where(and(
-        eq(tradingBotsTable.id, bot.id),
-        eq(tradingBotsTable.inFlight, bot.inFlight)
-      )).returning({ id: tradingBotsTable.id });
-      if (!cleared) throw new Error("The bot operation changed. Refresh and try again.");
-    } else {
-      await reconcileStaleInFlight(bot);
-    }
-    [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
-    if (!bot || bot.inFlight) {
-      throw new Error("The interrupted operation requires reconciliation before changing the covenant.");
-    }
-  }
-  const [openLot] = await db.select({ id: managedLotsTable.id }).from(managedLotsTable).where(and(eq(managedLotsTable.botId, bot.id), isNull(managedLotsTable.soldAt))).limit(1);
-  if (openLot) throw new Error("All managed positions must be sold before changing the covenant.");
-  const registry = new kron2.client.RegistryClient(API_URL2);
-  const entry = (await registry.tokenlist({ all: true })).tokens.find(
-    (token) => token.covenantId.toLowerCase() === normalized
-  );
-  if (!entry?.extensions.chainVerified || entry.network !== "mainnet") {
-    throw new Error("Token must be a chain-verified Kron mainnet KCC20 token.");
-  }
-  await db.transaction(async (tx) => {
-    if (bot.activationTxId && bot.activationVerifiedAt) {
-      await tx.insert(activationPaymentsTable).values({
-        botId: bot.id,
-        userId: userId2,
-        configurationVersion: bot.configurationVersion,
-        tokenId: bot.tokenId,
-        transactionId: bot.activationTxId,
-        verifiedAt: bot.activationVerifiedAt
-      }).onConflictDoNothing();
-    }
-    await tx.update(managedLotsTable).set({
-      tokenId: bot.tokenId,
-      tokenSymbol: bot.tokenSymbol
-    }).where(and(eq(managedLotsTable.botId, bot.id), isNull(managedLotsTable.tokenId)));
-    const [updated] = await tx.update(tradingBotsTable).set({
-      tokenId: normalized,
-      tokenSymbol: entry.symbol,
-      configurationVersion: bot.configurationVersion + 1,
-      activationTxId: null,
-      activationVerifiedAt: null,
-      status: "setup",
-      phase: "buying",
-      completedBuys: 0,
-      completedSells: 0,
-      nextRunAt: null,
-      inFlight: null,
-      stopReason: null,
-      updatedAt: /* @__PURE__ */ new Date()
-    }).where(and(
-      eq(tradingBotsTable.id, bot.id),
-      ne(tradingBotsTable.status, "running"),
-      isNull(tradingBotsTable.inFlight),
-      eq(tradingBotsTable.configurationVersion, originalConfigurationVersion),
-      eq(tradingBotsTable.tokenId, originalTokenId)
-    )).returning({ id: tradingBotsTable.id });
-    if (!updated) throw new Error("The bot state changed. Refresh and try the covenant change again.");
-  });
-  return getUserDashboard(userId2);
-}
-async function setUserBotRunning(userId2, running) {
-  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
-  if (!bot?.activationVerifiedAt || !bot.tokenId) throw new Error("Complete setup and activation first.");
-  if (running) {
-    if (bot.inFlight) {
-      await reconcileStaleInFlight(bot);
-      [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
-      if (!bot || bot.inFlight) {
-        throw new Error("The interrupted trade requires reconciliation before the bot can restart.");
-      }
-    }
-    const k = await loadKaspa2();
-    const rpc = new k.RpcClient({ url: NODE_URL2, networkId: "mainnet", encoding: k.Encoding.Borsh });
-    await rpc.connect();
-    try {
-      const { entries } = await rpc.getUtxosByAddresses({ addresses: [bot.botAddress] });
-      const balance = entries.reduce((sum, entry) => sum + BigInt(entry.amount), 0n);
-      if (balance < MINIMUM_BOT_FUNDING_SOMPI) {
-        throw new Error("Fund the bot wallet with at least 22.75 KAS before starting.");
-      }
-    } finally {
-      await rpc.disconnect();
-    }
-  }
-  const update = db.update(tradingBotsTable).set({
-    status: running ? "running" : "stopped",
-    nextRunAt: running ? new Date(Date.now() + 6e4) : null,
-    stopReason: running ? null : "Stopped by user.",
-    updatedAt: /* @__PURE__ */ new Date()
-  });
-  const updated = running ? await update.where(and(eq(tradingBotsTable.id, bot.id), isNull(tradingBotsTable.inFlight))).returning({ id: tradingBotsTable.id }) : await update.where(eq(tradingBotsTable.id, bot.id)).returning({ id: tradingBotsTable.id });
-  if (!updated.length) throw new Error("Another bot operation is in progress. Wait before starting.");
-  return getUserDashboard(userId2);
-}
+init_user_app_service();
 
 // src/lib/bot-withdrawal-service.ts
+init_drizzle_orm();
+init_src();
+init_user_app_service();
+init_interrupted_trade_service();
 import * as kron3 from "@kronsdk/kron-sdk";
 import { loadKaspa as loadKaspa3 } from "@kronsdk/kron-sdk/wasm";
 var NODE_URL3 = "wss://node.kron.technology";
@@ -47484,261 +50056,8 @@ async function submitUserBotKasWithdrawal(userId2, signedTransaction) {
   }
 }
 
-// src/lib/bot-sell-all-service.ts
-var ACTIVE_SELL_ALL_MS = 2 * 6e4;
-var BETWEEN_LOTS_MS = 15e3;
-var RETRY_WAIT_MS = 2e4;
-var SELL_ALL_DEADLINE_MS = 25 * 6e4;
-var MAX_ATTEMPTS_PER_LOT = 12;
-var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function countOpenLots(botId) {
-  const [row] = await db.select({ value: count() }).from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt)));
-  return Number(row?.value ?? 0);
-}
-async function nextOpenLot(botId) {
-  const [lot] = await db.select().from(managedLotsTable).where(and(eq(managedLotsTable.botId, botId), isNull(managedLotsTable.soldAt))).orderBy(asc(managedLotsTable.createdAt)).limit(1);
-  return lot ?? null;
-}
-function isDefinitiveSubmissionRejection(message) {
-  return /orphan|is an orphan|rejected transaction|double.?spend|already spent|insufficient funds|utxo.*not found|no longer spendable/i.test(message);
-}
-function isRetryableFailure(error, message) {
-  if (error instanceof RetryableTradeStateError) return true;
-  return /orphan|is an orphan|curve is busy|in-flight sequenced|no longer spendable/i.test(message);
-}
-async function clearSellAllMarker(botId, marker) {
-  await db.update(tradingBotsTable).set({
-    inFlight: null,
-    stopReason: null,
-    updatedAt: /* @__PURE__ */ new Date()
-  }).where(and(
-    eq(tradingBotsTable.id, botId),
-    eq(tradingBotsTable.inFlight, marker)
-  ));
-}
-async function heartbeat(botId, base, patch = {}) {
-  const next = {
-    ...base,
-    ...patch,
-    heartbeatAt: (/* @__PURE__ */ new Date()).toISOString()
-  };
-  await db.update(tradingBotsTable).set({
-    inFlight: next,
-    updatedAt: /* @__PURE__ */ new Date()
-  }).where(eq(tradingBotsTable.id, botId));
-  return next;
-}
-async function sellAllUserBotManagedPositions(userId2) {
-  let [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.userId, userId2)).limit(1);
-  if (!bot) throw new Error("Bot wallet was not found.");
-  const tokenId = bot.tokenId;
-  if (!tokenId) throw new Error("Bot has no configured token to sell.");
-  if (bot.status === "running") {
-    throw new Error("Stop trading before selling remaining managed positions.");
-  }
-  if (bot.inFlight) {
-    const marker = bot.inFlight;
-    if (marker.action === "sell-all") {
-      const beat = typeof marker.heartbeatAt === "string" ? Date.parse(marker.heartbeatAt) : typeof marker.startedAt === "string" ? Date.parse(marker.startedAt) : Number.NaN;
-      const ageMs = Number.isFinite(beat) ? Date.now() - beat : Number.POSITIVE_INFINITY;
-      const activelyRunning = ageMs < ACTIVE_SELL_ALL_MS && !bot.stopReason;
-      if (activelyRunning) {
-        throw new Error("A sell-all operation is already in progress. Wait a moment and try again.");
-      }
-      await clearSellAllMarker(bot.id, bot.inFlight);
-      logger.warn({ botId: bot.id, ageMs, stopReason: bot.stopReason }, "Cleared stalled sell-all marker for retry");
-      [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
-      if (!bot) throw new Error("Bot wallet was not found.");
-      if (bot.inFlight) {
-        throw new Error("The bot operation changed. Refresh and try sell all again.");
-      }
-    } else {
-      await reconcileStaleInFlight(bot);
-      [bot] = await db.select().from(tradingBotsTable).where(eq(tradingBotsTable.id, bot.id)).limit(1);
-      if (!bot || bot.inFlight) {
-        throw new Error("The interrupted trade requires reconciliation before selling positions.");
-      }
-    }
-  }
-  const initialOpen = await countOpenLots(bot.id);
-  if (initialOpen === 0) {
-    return {
-      soldCount: 0,
-      remainingOpenLots: 0,
-      sellTransactionIds: [],
-      complete: true,
-      message: "No open managed token positions to sell."
-    };
-  }
-  const startedAt = /* @__PURE__ */ new Date();
-  let inFlight = {
-    action: "sell-all",
-    startedAt: startedAt.toISOString(),
-    heartbeatAt: startedAt.toISOString(),
-    soldCount: 0
-  };
-  const [claim] = await db.update(tradingBotsTable).set({
-    inFlight,
-    stopReason: null,
-    updatedAt: startedAt
-  }).where(and(
-    eq(tradingBotsTable.id, bot.id),
-    ne(tradingBotsTable.status, "running"),
-    isNull(tradingBotsTable.inFlight)
-  )).returning({ id: tradingBotsTable.id });
-  if (!claim) throw new Error("The bot state changed. Refresh and try sell all again.");
-  const credentials = {
-    privateKey: decryptPrivateKey(bot.encryptedPrivateKey),
-    tokenId
-  };
-  const sellTransactionIds = [];
-  let soldCount = 0;
-  const initialTotalTrades = bot.totalTrades;
-  const deadline = Date.now() + SELL_ALL_DEADLINE_MS;
-  try {
-    while (Date.now() < deadline) {
-      const remaining = await countOpenLots(bot.id);
-      if (remaining === 0) break;
-      const lot = await nextOpenLot(bot.id);
-      if (!lot) break;
-      inFlight = await heartbeat(bot.id, inFlight, {
-        currentLotId: lot.id,
-        soldCount
-      });
-      let lotSold = false;
-      let lastMessage = "Unknown sell failure";
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_LOT && Date.now() < deadline; attempt += 1) {
-        inFlight = await heartbeat(bot.id, inFlight, {
-          currentLotId: lot.id,
-          soldCount
-        });
-        let submissionAttempted = false;
-        try {
-          const result = await executeUserAutomatedSell({
-            transactionId: lot.buyTransactionId,
-            index: lot.outputIndex,
-            amount: lot.tokenAmount.toString()
-          }, credentials);
-          submissionAttempted = true;
-          if (!result.transactionId) {
-            throw new Error("Sell submission returned no transaction ID.");
-          }
-          await db.transaction(async (tx) => {
-            await tx.update(managedLotsTable).set({
-              sellTransactionId: result.transactionId,
-              soldAt: /* @__PURE__ */ new Date()
-            }).where(eq(managedLotsTable.id, lot.id));
-            await tx.update(tradingBotsTable).set({
-              totalTrades: initialTotalTrades + soldCount + 1,
-              lastTradeAt: /* @__PURE__ */ new Date(),
-              stopReason: null,
-              updatedAt: /* @__PURE__ */ new Date()
-            }).where(eq(tradingBotsTable.id, bot.id));
-          });
-          sellTransactionIds.push(result.transactionId);
-          soldCount += 1;
-          lotSold = true;
-          logger.info({
-            botId: bot.id,
-            lotId: lot.id,
-            transactionId: result.transactionId,
-            soldCount,
-            remainingAfter: remaining - 1
-          }, "Sell-all lot sold");
-          break;
-        } catch (error) {
-          submissionAttempted ||= error instanceof TradeSubmissionAttemptedError;
-          lastMessage = error instanceof Error ? error.message : "Unknown sell failure";
-          const definitiveReject = submissionAttempted && isDefinitiveSubmissionRejection(lastMessage);
-          const retryable = isRetryableFailure(error, lastMessage) || submissionAttempted && definitiveReject;
-          if (submissionAttempted && !definitiveReject) {
-            await db.update(tradingBotsTable).set({
-              status: "paused",
-              nextRunAt: null,
-              stopReason: `Sell-all paused after uncertain submission: ${lastMessage}`,
-              inFlight,
-              updatedAt: /* @__PURE__ */ new Date()
-            }).where(eq(tradingBotsTable.id, bot.id));
-            throw new Error(
-              `Sold ${soldCount} of ${initialOpen} position(s); a later sell may have been submitted and needs reconciliation. ${lastMessage}`
-            );
-          }
-          if (retryable && attempt < MAX_ATTEMPTS_PER_LOT && Date.now() + RETRY_WAIT_MS < deadline) {
-            logger.warn({
-              botId: bot.id,
-              lotId: lot.id,
-              attempt,
-              err: lastMessage
-            }, "Sell-all retrying lot after transient failure");
-            inFlight = await heartbeat(bot.id, inFlight, { soldCount });
-            await sleep(RETRY_WAIT_MS);
-            continue;
-          }
-          const remainingOpenLots2 = await countOpenLots(bot.id);
-          await db.update(tradingBotsTable).set({
-            inFlight: null,
-            stopReason: soldCount > 0 ? `Sell-all stopped after ${soldCount} of ${initialOpen} sale(s): ${lastMessage}` : `Sell-all failed: ${lastMessage}`,
-            phase: remainingOpenLots2 === 0 ? "buying" : "selling",
-            completedBuys: remainingOpenLots2 === 0 ? 0 : bot.completedBuys,
-            completedSells: remainingOpenLots2 === 0 ? 0 : bot.completedSells,
-            updatedAt: /* @__PURE__ */ new Date()
-          }).where(eq(tradingBotsTable.id, bot.id));
-          throw new Error(
-            `Sold ${soldCount} of ${initialOpen} position(s), then failed: ${lastMessage}` + (remainingOpenLots2 > 0 ? ` ${remainingOpenLots2} remain \u2014 retry Sell all.` : "")
-          );
-        }
-      }
-      if (!lotSold) {
-        const remainingOpenLots2 = await countOpenLots(bot.id);
-        await db.update(tradingBotsTable).set({
-          inFlight: null,
-          stopReason: `Sell-all timed out after ${soldCount} of ${initialOpen} sale(s).`,
-          phase: remainingOpenLots2 === 0 ? "buying" : "selling",
-          updatedAt: /* @__PURE__ */ new Date()
-        }).where(eq(tradingBotsTable.id, bot.id));
-        throw new Error(
-          `Sold ${soldCount} of ${initialOpen} position(s), then timed out. ${remainingOpenLots2} remain \u2014 retry Sell all.`
-        );
-      }
-      if (await countOpenLots(bot.id) > 0) {
-        inFlight = await heartbeat(bot.id, inFlight, { soldCount });
-        await sleep(BETWEEN_LOTS_MS);
-      }
-    }
-    const remainingOpenLots = await countOpenLots(bot.id);
-    if (remainingOpenLots > 0) {
-      await db.update(tradingBotsTable).set({
-        inFlight: null,
-        stopReason: `Sell-all reached time limit after ${soldCount} of ${initialOpen} sale(s).`,
-        phase: "selling",
-        updatedAt: /* @__PURE__ */ new Date()
-      }).where(eq(tradingBotsTable.id, bot.id));
-      throw new Error(
-        `Sold ${soldCount} of ${initialOpen} position(s) before the time limit. ${remainingOpenLots} remain \u2014 retry Sell all.`
-      );
-    }
-    await db.update(tradingBotsTable).set({
-      phase: "buying",
-      completedBuys: 0,
-      completedSells: 0,
-      nextRunAt: null,
-      inFlight: null,
-      stopReason: null,
-      updatedAt: /* @__PURE__ */ new Date()
-    }).where(eq(tradingBotsTable.id, bot.id));
-    return {
-      soldCount,
-      remainingOpenLots: 0,
-      sellTransactionIds,
-      complete: true,
-      message: `Sold all ${soldCount} managed position(s). You can withdraw KAS now.`
-    };
-  } catch (error) {
-    throw error;
-  }
-}
-
 // src/routes/user-app.ts
+init_bot_sell_all_service();
 var router3 = (0, import_express3.Router)();
 var cookie = (req) => req.cookies?.[sessionCookieName()];
 var userId = (req) => {
@@ -47746,12 +50065,22 @@ var userId = (req) => {
   if (!id) throw new Error("Connect and verify your wallet first.");
   return id;
 };
+function publicErrorMessage(error) {
+  if (!(error instanceof Error)) return "Request failed";
+  const cause = error.cause;
+  const causeMessage = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : cause && typeof cause === "object" && "message" in cause ? String(cause.message) : null;
+  if (causeMessage && error.message.startsWith("Failed query:")) {
+    return `${error.message}
+Cause: ${causeMessage}`;
+  }
+  return error.message;
+}
 var handler = (fn) => async (req, res) => {
   try {
     await fn(req, res);
   } catch (error) {
     req.log.warn({ err: error }, "User bot request blocked");
-    res.status(400).json({ error: error instanceof Error ? error.message : "Request failed" });
+    res.status(400).json({ error: publicErrorMessage(error) });
   }
 };
 router3.post("/app/auth/challenge", handler(async (req, res) => {
@@ -47825,6 +50154,7 @@ router4.use(user_app_default);
 var routes_default = router4;
 
 // src/app.ts
+init_logger();
 var app = (0, import_express5.default)();
 app.use(
   (0, import_pino_http.default)({
@@ -47861,6 +50191,7 @@ app.use((0, import_cookie_parser.default)());
 app.use(import_express5.default.json({ limit: "1mb" }));
 app.use(import_express5.default.urlencoded({ extended: true }));
 app.use("/api", routes_default);
+app.use("/volume-bot/api", routes_default);
 var app_default = app;
 export {
   app_default as default
